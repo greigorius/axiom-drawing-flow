@@ -128,8 +128,8 @@ function parsePath(filePath) {
   const parts = filePath.replace(/\\/g, "/").split("/").filter(Boolean);
   const pendingIdx = parts.findIndex((p) => p.toLowerCase() === "pending");
   if (pendingIdx < 3 || pendingIdx >= parts.length - 1) return null;
-  const projectNo = parts[pendingIdx - 2];
-  const stage     = parts[pendingIdx - 1];
+  const projectNo = parts[pendingIdx - 2].toUpperCase();
+  const stage     = parts[pendingIdx - 1].toUpperCase();
   const filename  = parts[pendingIdx + 1];
   if (!VALID_STAGES.includes(stage)) return null;
   return { projectNo, stage, filename };
@@ -141,8 +141,10 @@ function parseFilename(filename) {
   const base  = filename.slice(0, -(ext.length + 1));
   const parts = base.split("_");
   if (parts.length < 4) return null;
-  const [itemNo, drawingNo, revision, ...dtParts] = parts;
-  const dtInitials = dtParts.join("_");
+  const [itemNo, drawingNoRaw, revisionRaw, ...dtParts] = parts;
+  const drawingNo  = drawingNoRaw?.toUpperCase();
+  const revision   = revisionRaw?.toUpperCase();
+  const dtInitials = dtParts.join("_").toUpperCase();
   if (!itemNo || !drawingNo || !revision || !dtInitials) return null;
   return { itemNo, drawingNo, revision, dtInitials };
 }
