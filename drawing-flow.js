@@ -110,9 +110,11 @@ function computeDropboxMove(rawPath, action, qaRound) {
   const before  = fullPath.slice(0, idx);          // everything before /Pending/
   const filename = fullPath.slice(idx + "/pending/".length); // filename after /Pending/
   if (action === "bounce") {
-    const toFolder = `${before}/Rejected/R${qaRound}`;
-    const to       = `${toFolder}/${filename}`;
-    return { from: fullPath, to, toFolder };
+    const toFolderParent = `${before}/Rejected`;
+    const toFolderName   = `R${qaRound}`;
+    const toFolder       = `${toFolderParent}/${toFolderName}`;
+    const to             = `${toFolder}/${filename}`;
+    return { from: fullPath, to, toFolder, toFolderParent, toFolderName };
   }
   if (action === "approve") {
     const toFolder = before;
