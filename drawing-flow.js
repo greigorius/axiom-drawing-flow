@@ -97,7 +97,8 @@ const DROPBOX_ROOT = "/DESIGN KNOW HOW/TMJ Interiors";
 
 function toFullDropboxPath(rawPath) {
   if (!rawPath) return null;
-  if (rawPath.startsWith(DROPBOX_ROOT)) return rawPath;
+  // Case-insensitive check — path_lower from Make will be lowercase
+  if (rawPath.toLowerCase().startsWith(DROPBOX_ROOT.toLowerCase())) return rawPath;
   return `${DROPBOX_ROOT}/${rawPath.replace(/^\//, "")}`;
 }
 
@@ -414,8 +415,9 @@ module.exports = function mountDrawingFlow(app, notion) {
     };
     if (dropboxPath || filePath) {
       // Strip DROPBOX_ROOT prefix — stored path is relative to Drawing Submissions for tidiness.
+      // Case-insensitive comparison since path_lower from Make will be lowercase.
       const fullRaw = dropboxPath ?? filePath;
-      const shortPath = fullRaw.startsWith(DROPBOX_ROOT)
+      const shortPath = fullRaw.toLowerCase().startsWith(DROPBOX_ROOT.toLowerCase())
         ? fullRaw.slice(DROPBOX_ROOT.length).replace(/^\//, "")
         : fullRaw;
       submissionProps["Dropbox Path"] = { url: shortPath };
