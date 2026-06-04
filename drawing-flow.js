@@ -663,10 +663,15 @@ module.exports = function mountDrawingFlow(app, notion) {
   });
 
   // PATCH /api/df/submissions/:id/bounce
-  // After Notion writes: fires Make Scenario 3 (Dropbox move + Gmail to DT with comments).
+  // Body (optional): { annotatedPdfBase64, annotatedPdfFilename }
+  //   When provided by DT Drawing Checker: Make uploads annotated PDF to R{n}/ folder,
+  //   deletes the original from /Pending/, and emails it to the DT as an attachment.
+  //   Without it: Make moves the original PDF (legacy behaviour).
 
   app.patch("/api/df/submissions/:id/bounce", async (req, res) => {
     const { id } = req.params;
+    const { annotatedPdfBase64, annotatedPdfFilename } = req.body || {};
+
     let submissionPage;
     try { submissionPage = await notion.pages.retrieve({ page_id: id }); }
     catch { return res.status(404).json({ ok: false, error: "Submission not found" }); }
@@ -694,14 +699,18 @@ module.exports = function mountDrawingFlow(app, notion) {
     const taskIds         = getProp(submissionPage, "Item",        "relation");
     const dt              = await resolveDT(notion, dtIds);
 
-    // Update Dropbox Path in Notion to reflect the new location after move
-    if (dropboxMove?.to) {
-      const newShortPath = dropboxMove.to.startsWith(DROPBOX_ROOT)
-        ? dropboxMove.to.slice(DROPBOX_ROOT.length).replace(/^\//, "")
-        : dropboxMove.to;
-      notion.pages.update({ page_id: id, properties: {
-        "Dropbox Path": { url: newShortPath }
-      }}).catch(e => console.warn("[bounce] Dropbox Path update failed:", e.message));
+    // Update stored Dropbox Path to the annotated PDF's destination
+    if (dropboxMove?.toFolder) {
+      const pdfFilename    = annotatedPdfFilename || (dropboxMove.to ? dropboxMove.to.split("/").pop() : null);
+      const newFullPath    = pdfFilename ? `${dropboxMove.toFolder}/${pdfFilename}` : dropboxMove.to;
+      const newShortPath   = newFullPath?.startsWith(DROPBOX_ROOT)
+        ? newFullPath.slice(DROPBOX_ROOT.length).replace(/^\//, "")
+        : newFullPath;
+      if (newShortPath) {
+        notion.pages.update({ page_id: id, properties: {
+          "Dropbox Path": { url: newShortPath }
+        }}).catch(e => console.warn("[bounce] Dropbox Path update failed:", e.message));
+      }
     }
 
     // Fetch Miro Board Link from the linked Task
@@ -713,7 +722,9 @@ module.exports = function mountDrawingFlow(app, notion) {
       } catch { /* non-fatal */ }
     }
 
-    // Make Scenario 2 (Actions Hub): Dropbox move to /Rejected/R{n}/ + Gmail to DT with Miro link
+    // Make Scenario 2 (Actions Hub):
+    //   With annotated PDF → upload PDF to R{n}/, delete original from Pending, email PDF to DT
+    //   Without             → move original PDF to R{n}/ (legacy)
     fireWebhook(process.env.MAKE_ACTIONS_WEBHOOK, {
       action: "bounce",
       submissionId: id,
@@ -721,13 +732,16 @@ module.exports = function mountDrawingFlow(app, notion) {
       stage,
       qaRound,
       bouncedAt,
-      ...(miroLink ? { miroLink } : {}),
+      ...(miroLink              ? { miroLink }                                          : {}),
+      ...(annotatedPdfBase64    ? { annotatedPdfBase64, annotatedPdfFilename }          : {}),
+      ...(dropboxMove           ? { dropboxMove }                                       : {}),
+      // hasAnnotatedPdf lets Make Router branch: true = upload+delete, false = move
+      hasAnnotatedPdf: !!annotatedPdfBase64,
       dtName:  dt.name,
       dtEmail: dt.email,
-      ...(dropboxMove ? { dropboxMove } : {}),
     });
 
-    console.log(`[bounce] ${id}`);
+    console.log(`[bounce] ${id} (annotated PDF: ${annotatedPdfBase64 ? 'yes' : 'no'})`);
     res.json({ ok: true, bouncedAt, ...(dropboxMove ? { dropboxMove } : {}) });
   });
 
@@ -910,29 +924,4 @@ module.exports = function mountDrawingFlow(app, notion) {
         projectName = getProp(projPage, "Project Name", "title") ?? projectId;
       } catch { /* fall back to ID */ }
 
-      let rowName = `${projectName} — Project defaults`;
-      if (resolvedScope === "Task" && taskId) {
-        try {
-          const taskPageData = await notion.pages.retrieve({ page_id: taskId });
-          rowName = `${projectName} — ${getProp(taskPageData, "Item Name", "title") ?? taskId}`;
-        } catch { rowName = `${projectName} — Task`; }
-      }
-
-      const createProps = {
-        "Name":    { title:    [{ text: { content: rowName } }] },
-        "Scope":   { select:   { name: resolvedScope } },
-        "Project": { relation: [{ id: projectId }] },
-        ...inputProps,
-      };
-      if (resolvedScope === "Task" && taskId) createProps["Task"] = { relation: [{ id: taskId }] };
-
-      const newPage = await notion.pages.create({ parent: { database_id: db }, properties: createProps });
-      return res.json({ ok: true, id: newPage.id, created: true });
-
-    } catch (err) {
-      console.error("POST /api/df/inputs", err);
-      res.status(500).json({ ok: false, error: err.message });
-    }
-  });
-
-};
+      
