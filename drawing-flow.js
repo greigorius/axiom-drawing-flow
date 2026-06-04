@@ -118,9 +118,17 @@ function computeDropboxMove(rawPath, action, qaRound) {
     return { from: fullPath, to, toFolder, toFolderParent, toFolderName };
   }
   if (action === "approve") {
-    const toFolder = before;
-    const to       = `${toFolder}/${filename}`;
-    return { from: fullPath, to, toFolder };
+    // Filename format: {itemNo}_{drawingNo}_{revision}_{dtInitials}.pdf
+    const fileParts    = filename.split("_");
+    const itemNo       = fileParts[0] ?? "";
+    const drawingNo    = fileParts[1] ?? "";
+    const ext          = filename.split(".").pop().toLowerCase();
+    const toFolderParent = before;
+    const toFolderName   = `Suffix ${itemNo}`;
+    const toFolder       = `${toFolderParent}/${toFolderName}`;
+    const newFilename    = drawingNo ? `${drawingNo}.${ext}` : filename;
+    const to             = `${toFolder}/${newFilename}`;
+    return { from: fullPath, to, toFolder, toFolderParent, toFolderName, newFilename, itemNo, drawingNo };
   }
   return null;
 }
@@ -518,28 +526,72 @@ module.exports = function mountDrawingFlow(app, notion) {
     const dropboxMove     = computeDropboxMove(rawPath, "approve", null);
     const submissionTitle = getProp(submissionPage, "Submission", "title");
     const dtIds           = getProp(submissionPage, "DT",         "relation");
+    const taskIds         = getProp(submissionPage, "Item",        "relation");
     const dt              = await resolveDT(notion, dtIds);
 
-    // Compute upload path so the DT knows where to save production files
-    const { taskCode }  = parseSubmissionTitle(submissionTitle, stage);
-    const projectNo     = taskCode ? taskCode.split("-").slice(0, 2).join("-") : "";
-    const uploadPath    = projectNo ? `${DROPBOX_ROOT}/Drawing Submissions/${projectNo}/${stage}/` : null;
+    const { taskCode } = parseSubmissionTitle(submissionTitle, stage);
+    const taskParts    = taskCode ? taskCode.split("-") : [];
+    const projectNo    = taskParts.slice(0, -1).join("-");           // "24-367"
+    const itemNo       = dropboxMove?.itemNo ?? taskParts[taskParts.length - 1]; // "022"
+    const suffixRef    = projectNo && itemNo ? `${projectNo}-${itemNo}` : submissionTitle;
+    const uploadPath   = projectNo && stage && itemNo
+      ? `${DROPBOX_ROOT}/Drawing Submissions/${projectNo}/${stage}/Suffix ${itemNo}`
+      : null;
 
-    // Make Scenario 2 (Actions Hub): Dropbox move + Gmail to DT with production instructions
+    // Update Dropbox Path in Notion to reflect the new location after move
+    if (dropboxMove?.to) {
+      const newShortPath = dropboxMove.to.toLowerCase().startsWith(DROPBOX_ROOT.toLowerCase())
+        ? dropboxMove.to.slice(DROPBOX_ROOT.length).replace(/^\//, "")
+        : dropboxMove.to;
+      notion.pages.update({ page_id: id, properties: {
+        "Dropbox Path": { url: newShortPath }
+      }}).catch(e => console.warn("[approve] Dropbox Path update failed:", e.message));
+    }
+
+    // Collect all drawing numbers approved so far in this suffix
+    let approvedDrawingNos = [dropboxMove?.drawingNo].filter(Boolean);
+    if (taskIds?.length) {
+      try {
+        const siblings = await notion.databases.query({
+          database_id: SUBMISSIONS_DB,
+          filter: {
+            and: [
+              { property: "Item",   relation: { contains: taskIds[0] } },
+              { property: "Stage",  select:   { equals: stage        } },
+              { property: "Status", select:   { equals: "Approved"   } },
+            ]
+          }
+        });
+        const siblingNos = siblings.results.map(page => {
+          const t = getProp(page, "Submission", "title") ?? "";
+          return parseSubmissionTitle(t, stage).drawingNo;
+        }).filter(Boolean);
+        // Merge with current drawing (Notion update may not be reflected yet)
+        approvedDrawingNos = [...new Set([...siblingNos, ...(dropboxMove?.drawingNo ? [dropboxMove.drawingNo] : [])])];
+      } catch (err) {
+        console.warn("[approve] Drawing list lookup failed:", err.message);
+      }
+    }
+
+    // Make Scenario 2 (Actions Hub): create Suffix folder, move file, email DT
     fireWebhook(process.env.MAKE_ACTIONS_WEBHOOK, {
       action: "approve",
       submissionId: id,
       submissionTitle,
       stage,
+      projectNo,
+      itemNo,
+      suffixRef,
       reviewedAt,
-      ...(uploadPath    ? { uploadPath }    : {}),
-      ...(dropboxMove   ? { dropboxMove }   : {}),
+      approvedDrawingNos,
+      ...(uploadPath  ? { uploadPath }  : {}),
+      ...(dropboxMove ? { dropboxMove } : {}),
       dtName:  dt.name,
       dtEmail: dt.email,
     });
 
-    console.log(`[approve] ${id} => Awaiting Issue`);
-    res.json({ ok: true, reviewedAt, ...(dropboxMove ? { dropboxMove } : {}) });
+    console.log(`[approve] ${id} => Awaiting Issue (suffix ${suffixRef})`);
+    res.json({ ok: true, reviewedAt, suffixRef, ...(dropboxMove ? { dropboxMove } : {}) });
   });
 
   // PATCH /api/df/submissions/:id/issue
