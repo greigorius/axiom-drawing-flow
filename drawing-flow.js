@@ -371,7 +371,7 @@ module.exports = function mountDrawingFlow(app, notion) {
   // Triggered by Make Scenario 1: Make watches Dropbox /Pending/ and calls this endpoint.
 
   app.post("/api/df/ingest", async (req, res) => {
-    const { filePath, dropboxLink, dropboxPath } = req.body;
+    const { filePath, dropboxLink, dropboxPath, shareLink } = req.body;
     if (!filePath) return res.status(400).json({ ok: false, error: "Missing filePath" });
 
     const pathParts = parsePath(filePath);
@@ -431,6 +431,7 @@ module.exports = function mountDrawingFlow(app, notion) {
       submissionProps["Dropbox Path"] = { url: shortPath };
     }
     if (dtPage) submissionProps["DT"] = { relation: [{ id: dtPage.id }] };
+    if (shareLink) submissionProps["Share Link"] = { url: shareLink };
 
     let newSubmission;
     try {
@@ -483,6 +484,7 @@ module.exports = function mountDrawingFlow(app, notion) {
           submitted:   getProp(page, "Submitted",    "date"),
           reviewed:    getProp(page, "Reviewed",     "date"),
           dropboxPath: getProp(page, "Dropbox Path", "url"),
+          shareLink:   getProp(page, "Share Link",   "url"),
           drawingIds:  getProp(page, "Drawing",      "relation"),
           taskIds:     getProp(page, "Item",         "relation"),
         };
