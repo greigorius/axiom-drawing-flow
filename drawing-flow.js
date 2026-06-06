@@ -717,14 +717,35 @@ module.exports = function mountDrawingFlow(app, notion) {
   });
 
   // PATCH /api/df/submissions/:id/bounce
-  // After Notion writes: fires Make Scenario 3 (Dropbox move + Gmail to DT with comments).
+  // After Notion writes: fires Make Scenario 2 (Dropbox move + Gmail share link to DT).
+  //
+  // Body: { annotatedDropboxPath, annotatedPdfFilename }
+  //   annotatedDropboxPath: full Dropbox path of the pre-uploaded annotated PDF
+  //   Make moves the file from that path to R{n}/, creates a share link, emails it to DT.
+  //   No PDF bytes transmitted — works for any file size.
+  // GET /api/df/submissions/:id/bounce-dest
+  // Returns the computed Dropbox destination paths for a bounce without committing any changes.
+  // Used by DT Checker to upload the annotated PDF directly to R{n}/ before calling /bounce.
+  app.get("/api/df/submissions/:id/bounce-dest", async (req, res) => {
+    const { id } = req.params;
+    let submissionPage;
+    try { submissionPage = await notion.pages.retrieve({ page_id: id }); }
+    catch { return res.status(404).json({ ok: false, error: "Submission not found" }); }
 
-  // Body (optional): { annotatedPdfBase64, annotatedPdfFilename }
-  //   With PDF: Make uploads annotated PDF to R{n}/, deletes original from Pending, emails it attached.
-  //   Without:  Make moves the original PDF to R{n}/ (legacy behaviour).
+    const qaRound    = getProp(submissionPage, "QA Round",     "number") ?? 1;
+    const rawPath    = getProp(submissionPage, "Dropbox Path", "url");
+    const dropboxMove = computeDropboxMove(rawPath, "bounce", qaRound);
+
+    if (!dropboxMove) return res.status(400).json({ ok: false, error: "Could not compute bounce destination — check Dropbox Path in Notion" });
+
+    res.json({ ok: true, dropboxMove });
+  });
+
   app.patch("/api/df/submissions/:id/bounce", async (req, res) => {
     const { id } = req.params;
-    const { annotatedPdfBase64, annotatedPdfFilename } = req.body || {};
+    const { annotatedDropboxPath, annotatedPdfFilename,
+            annotatedPdfBase64 } = req.body || {};  // base64 kept for legacy/small-file fallback
+    const hasAnnotatedPdf = !!(annotatedDropboxPath || annotatedPdfBase64);
 
     let submissionPage;
     try { submissionPage = await notion.pages.retrieve({ page_id: id }); }
@@ -783,15 +804,18 @@ module.exports = function mountDrawingFlow(app, notion) {
       stage,
       qaRound,
       bouncedAt,
-      hasAnnotatedPdf: !!annotatedPdfBase64,
-      ...(miroLink           ? { miroLink }                               : {}),
-      ...(annotatedPdfBase64 ? { annotatedPdfBase64, annotatedPdfFilename } : {}),
-      ...(dropboxMove        ? { dropboxMove }                            : {}),
+      hasAnnotatedPdf,
+      ...(miroLink              ? { miroLink }                                    : {}),
+      // Preferred: Dropbox path — Make moves the pre-uploaded file (any size)
+      ...(annotatedDropboxPath  ? { annotatedDropboxPath, annotatedPdfFilename }  : {}),
+      // Legacy fallback: base64 in payload (small files only, < 4 MB)
+      ...(annotatedPdfBase64 && !annotatedDropboxPath ? { annotatedPdfBase64, annotatedPdfFilename } : {}),
+      ...(dropboxMove           ? { dropboxMove }                                 : {}),
       dtName:  dt.name,
       dtEmail: dt.email,
     });
 
-    console.log(`[bounce] ${id} (annotated PDF: ${annotatedPdfBase64 ? "yes" : "no"})`);
+    console.log(`[bounce] ${id} (path: ${annotatedDropboxPath || "none"}, base64: ${annotatedPdfBase64 ? "yes" : "no"})`);
     res.json({ ok: true, bouncedAt, ...(dropboxMove ? { dropboxMove } : {}) });
   });
 
