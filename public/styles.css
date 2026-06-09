@@ -168,7 +168,7 @@ main {
 
 .queue-row {
   display: grid;
-  grid-template-columns: 1fr 70px 60px 44px 100px 120px auto;
+  grid-template-columns: 20px 1fr 70px 60px 44px 100px 120px auto;
   align-items: center;
   gap: 12px;
   padding: 10px 14px;
@@ -177,6 +177,21 @@ main {
 }
 
 .queue-row:hover { background: var(--bg2); }
+.queue-row.selected { background: rgba(79,127,255,0.07); }
+.queue-row.selected:hover { background: rgba(79,127,255,0.11); }
+
+.queue-row-check {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.queue-row-check input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
 
 .queue-row-drawing {
   font-family: var(--font-mono);
@@ -438,6 +453,82 @@ main {
 
 .save-result.ok    { color: var(--success); background: rgba(34,197,94,0.1); }
 .save-result.error { color: var(--danger);  background: rgba(239,68,68,0.1); }
+
+/* ─── Batch action bar ───────────────────────────────────────────────── */
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px;
+  background: rgba(79,127,255,0.08);
+  border: 1px solid rgba(79,127,255,0.2);
+  border-radius: var(--radius);
+  margin: 4px 0 8px;
+}
+
+.batch-bar-count {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  margin-right: 4px;
+}
+
+/* ─── Pending DT notification section ───────────────────────────────── */
+.pending-notif-section {
+  background: rgba(239,68,68,0.04);
+  border: 1px solid rgba(239,68,68,0.18);
+  border-radius: var(--radius2);
+  padding: 4px 14px 12px;
+  margin-bottom: 20px;
+}
+
+.pending-count {
+  background: rgba(239,68,68,0.18);
+  color: var(--danger);
+}
+
+.pending-row {
+  display: grid;
+  grid-template-columns: 1fr 70px 140px 1fr;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 2px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.pending-row:last-child { border-bottom: none; }
+
+/* ─── Send DT Emails result flash ────────────────────────────────────── */
+.send-result {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: var(--radius);
+}
+
+.send-result.ok    { color: var(--success); background: rgba(34,197,94,0.12); }
+.send-result.error { color: var(--danger);  background: rgba(239,68,68,0.12); }
+
+/* ─── Pending email badge in page header ─────────────────────────────── */
+.pending-email-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(239,68,68,0.18);
+  color: var(--danger);
+  letter-spacing: 0.02em;
+}
+
+/* ─── Section select-all checkbox ────────────────────────────────────── */
+.section-select-all {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+  cursor: pointer;
+  flex-shrink: 0;
+}
 
 /* ─── Misc ───────────────────────────────────────────────────────────── */
 .section-header {

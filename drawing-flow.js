@@ -3,10 +3,12 @@
 //
 // Routes:
 //   POST   /api/df/ingest
-//   GET    /api/df/submissions          ?status=Submitted|Issued|Graded|Rejected (default: Submitted)
+//   GET    /api/df/submissions          ?status=Submitted|Issued|Graded|Rejected|pending-notification
 //   PATCH  /api/df/submissions/:id/approve
+//   PATCH  /api/df/submissions/:id/issue
 //   PATCH  /api/df/submissions/:id/bounce
 //   PATCH  /api/df/submissions/:id/log-status
+//   POST   /api/df/send-dt-emails       batch DT notification — fires action=dt-summary webhook per DT
 //   GET    /api/df/drawings             ?taskId&stage&status
 //   GET    /api/df/inputs/:projectId
 //   GET    /api/df/inputs/:projectId/:taskId
@@ -14,8 +16,9 @@
 //
 // Make.com integration:
 //   Scenario 1 (Ingest):      Make watches Dropbox /Pending/ and calls POST /api/df/ingest
-//   Scenario 2 (Actions Hub): backend fires MAKE_ACTIONS_WEBHOOK with action=approve|bounce|log-status
-//                             Make Router branches by action → Dropbox move + Gmail
+//   Scenario 2 (Actions Hub): backend fires MAKE_ACTIONS_WEBHOOK with action=dt-summary (batch email)
+//                             or action=approve|bounce (Dropbox moves only — no immediate email)
+//                             See docs/MAKE-CONFIG-GUIDE.md for full configuration steps
 
 "use strict";
 
@@ -482,9 +485,70 @@ module.exports = function mountDrawingFlow(app, notion) {
   });
 
   // GET /api/df/submissions
+  // ?status=Submitted|Approved|Awaiting Issue|Issued|Rejected|Graded
+  // ?status=pending-notification  → actioned items where DT Notified = false
 
   app.get("/api/df/submissions", async (req, res) => {
     const statusFilter = req.query.status || "Submitted";
+
+    // ── pending-notification filter ────────────────────────────────────────
+    // Returns all submissions that have been actioned (Approved/Rejected/Issued/Graded)
+    // but where DT Notified checkbox is still false — i.e. DT hasn't been emailed yet.
+    if (statusFilter === "pending-notification") {
+      try {
+        const NOTIFIABLE_STATUSES = ["Approved", "Rejected", "Issued", "Graded"];
+        const results = (await Promise.all(
+          NOTIFIABLE_STATUSES.map((s) =>
+            queryAll(notion, SUBMISSIONS_DB, {
+              and: [
+                { property: "Status",       select:   { equals: s     } },
+                { property: "DT Notified",  checkbox: { equals: false } },
+              ]
+            }, [{ property: "BIC Since", direction: "ascending" }])
+          )
+        )).flat();
+
+        const submissions = await Promise.all(results.map(async (page) => {
+          const title  = getProp(page, "Submission", "title");
+          const stage  = getProp(page, "Stage",      "select");
+          const dtIds  = getProp(page, "DT",         "relation");
+          const status = getProp(page, "Status",     "select");
+          const dmAction = getProp(page, "DM Action","select");
+          const { taskCode, drawingNo } = parseSubmissionTitle(title, stage);
+          const dtName  = await resolveDTName(notion, dtIds);
+          const dt      = await resolveDT(notion, dtIds);
+          const rawPath = getProp(page, "Dropbox Path", "url");
+          // Reconstruct folder path from current stored Dropbox Path for bounce items.
+          // For approved items it's the Suffix folder; for bounced it's the Rejected/Rn/Suffix folder.
+          // These are already the post-move paths stored by approve/bounce routes.
+          const folderPath = rawPath
+            ? toFullDropboxPath(rawPath).split("/").slice(0, -1).join("/")
+            : null;
+          return {
+            id: page.id, title, taskCode, drawingNo, dtName, dtEmail: dt.email, stage,
+            status,
+            dmAction,
+            revision:    getProp(page, "Revision",     "select"),
+            qaRound:     getProp(page, "QA Round",     "number"),
+            grade:       getProp(page, "Client Grade", "select"),
+            bic:         getProp(page, "Ball In Court","select"),
+            bicSince:    getProp(page, "BIC Since",    "date"),
+            reviewed:    getProp(page, "Reviewed",     "date"),
+            dropboxPath: rawPath,
+            folderPath,
+            shareLink:   getProp(page, "Share Link",   "url"),
+            taskIds:     getProp(page, "Item",         "relation"),
+          };
+        }));
+
+        return res.json({ submissions });
+      } catch (err) {
+        console.error("GET /api/df/submissions pending-notification", err);
+        return res.status(500).json({ error: err.message });
+      }
+    }
+
+    // ── standard status filter ─────────────────────────────────────────────
     const validStatuses = ["Submitted", "Approved", "Awaiting Issue", "Issued", "Rejected", "Graded"];
     if (!validStatuses.includes(statusFilter)) return res.status(400).json({ error: `Invalid status: ${statusFilter}` });
 
@@ -520,6 +584,112 @@ module.exports = function mountDrawingFlow(app, notion) {
     } catch (err) {
       console.error("GET /api/df/submissions", err);
       res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/df/send-dt-emails
+  // Groups all pending-notification submissions by DT, fires one webhook per DT
+  // with the full list, then marks each submission DT Notified = true in Notion.
+
+  app.post("/api/df/send-dt-emails", async (req, res) => {
+    try {
+      const NOTIFIABLE_STATUSES = ["Approved", "Rejected", "Issued", "Graded"];
+      const results = (await Promise.all(
+        NOTIFIABLE_STATUSES.map((s) =>
+          queryAll(notion, SUBMISSIONS_DB, {
+            and: [
+              { property: "Status",       select:   { equals: s     } },
+              { property: "DT Notified",  checkbox: { equals: false } },
+            ]
+          })
+        )
+      )).flat();
+
+      if (!results.length) {
+        return res.json({ ok: true, emailsSent: 0, submissionsNotified: 0, message: "Nothing pending" });
+      }
+
+      // Resolve DT info + build per-submission summary
+      const enriched = await Promise.all(results.map(async (page) => {
+        const title    = getProp(page, "Submission", "title");
+        const stage    = getProp(page, "Stage",      "select");
+        const status   = getProp(page, "Status",     "select");
+        const dmAction = getProp(page, "DM Action",  "select");
+        const dtIds    = getProp(page, "DT",         "relation");
+        const rawPath  = getProp(page, "Dropbox Path", "url");
+        const { drawingNo } = parseSubmissionTitle(title, stage);
+        const dt = await resolveDT(notion, dtIds);
+
+        // Derive the folder path from the stored post-move Dropbox Path
+        const fullPath = toFullDropboxPath(rawPath);
+        const folderPath = fullPath ? fullPath.split("/").slice(0, -1).join("/") : null;
+
+        // Human-readable action label for the email
+        const actionLabel = (() => {
+          if (dmAction === "Bounce")     return "Bounce — returned for revision";
+          if (dmAction === "Approve")    return status === "Issued" ? "Issued to client" : "QA Approved";
+          if (dmAction === "Log Status") return `Grade received: ${getProp(page, "Client Grade", "select") ?? "—"}`;
+          return dmAction ?? status;
+        })();
+
+        return {
+          pageId: page.id,
+          dtName:  dt.name,
+          dtEmail: dt.email,
+          submission: {
+            submissionTitle: title,
+            drawingNo,
+            stage,
+            status,
+            dmAction,
+            actionLabel,
+            qaRound:     getProp(page, "QA Round",     "number"),
+            grade:       getProp(page, "Client Grade", "select"),
+            reviewed:    getProp(page, "Reviewed",     "date"),
+            folderPath,
+          },
+        };
+      }));
+
+      // Group by DT email
+      const byDT = {};
+      for (const item of enriched) {
+        const key = item.dtEmail || item.dtName || "unknown";
+        if (!byDT[key]) byDT[key] = { dtName: item.dtName, dtEmail: item.dtEmail, submissions: [], pageIds: [] };
+        byDT[key].submissions.push(item.submission);
+        byDT[key].pageIds.push(item.pageId);
+      }
+
+      // Fire one webhook per DT
+      let emailsSent = 0;
+      for (const group of Object.values(byDT)) {
+        if (!group.dtEmail) {
+          console.warn(`[send-dt-emails] No email for DT "${group.dtName}" — skipping`);
+          continue;
+        }
+        fireWebhook(process.env.MAKE_ACTIONS_WEBHOOK, {
+          action:      "dt-summary",
+          dtName:      group.dtName,
+          dtEmail:     group.dtEmail,
+          submissions: group.submissions,
+          count:       group.submissions.length,
+        });
+        emailsSent++;
+      }
+
+      // Mark all included submissions as DT Notified = true
+      const allPageIds = enriched.map((e) => e.pageId);
+      await Promise.all(allPageIds.map((pid) =>
+        notion.pages.update({ page_id: pid, properties: {
+          "DT Notified": { checkbox: true },
+        }}).catch((e) => console.warn(`[send-dt-emails] Notion update failed ${pid}:`, e.message))
+      ));
+
+      console.log(`[send-dt-emails] Fired ${emailsSent} webhook(s) for ${allPageIds.length} submission(s)`);
+      res.json({ ok: true, emailsSent, submissionsNotified: allPageIds.length });
+    } catch (err) {
+      console.error("[send-dt-emails]", err);
+      res.status(500).json({ ok: false, error: err.message });
     }
   });
 
@@ -601,22 +771,7 @@ module.exports = function mountDrawingFlow(app, notion) {
       }
     }
 
-    // Make Scenario 2 (Actions Hub): create Suffix folder, move file, email DT
-    fireWebhook(process.env.MAKE_ACTIONS_WEBHOOK, {
-      action: "approve",
-      submissionId: id,
-      submissionTitle,
-      stage,
-      projectNo,
-      itemNo,
-      suffixRef,
-      reviewedAt,
-      approvedDrawingNos,
-      ...(uploadPath  ? { uploadPath }  : {}),
-      ...(dropboxMove ? { dropboxMove } : {}),
-      dtName:  dt.name,
-      dtEmail: dt.email,
-    });
+    // NOTE: fireWebhook removed — DT email now batched via POST /api/df/send-dt-emails
 
     console.log(`[approve] ${id} => Awaiting Issue (suffix ${suffixRef})`);
     res.json({ ok: true, reviewedAt, suffixRef, ...(dropboxMove ? { dropboxMove } : {}) });
@@ -671,20 +826,8 @@ module.exports = function mountDrawingFlow(app, notion) {
     }
 
     const submissionTitle = getProp(submissionPage, "Submission", "title");
-    const dtIds           = getProp(submissionPage, "DT",         "relation");
-    const dt              = await resolveDT(notion, dtIds);
 
-    fireWebhook(process.env.MAKE_ACTIONS_WEBHOOK, {
-      action: "issue",
-      submissionId: id,
-      submissionTitle,
-      stage,
-      issuedDate,
-      drawingStatus,
-      dtName:  dt.name,
-      dtEmail: dt.email,
-    });
-
+    // NOTE: fireWebhook removed — DT email now batched via POST /api/df/send-dt-emails
     console.log(`[issue] ${id} => ${drawingStatus}`);
     res.json({ ok: true, issuedDate, drawingStatus, ...(errors.length ? { errors } : {}) });
   });
@@ -831,24 +974,9 @@ module.exports = function mountDrawingFlow(app, notion) {
       } catch { /* non-fatal */ }
     }
 
-    fireWebhook(process.env.MAKE_ACTIONS_WEBHOOK, {
-      action: "bounce",
-      submissionId: id,
-      submissionTitle,
-      stage,
-      qaRound,
-      bouncedAt,
-      hasAnnotatedPdf,
-      ...(miroLink              ? { miroLink }                                    : {}),
-      // Preferred: Dropbox path — Make moves the pre-uploaded file (any size)
-      ...(annotatedDropboxPath  ? { annotatedDropboxPath, annotatedPdfFilename }  : {}),
-      // Legacy fallback: base64 in payload (small files only, < 4 MB)
-      ...(annotatedPdfBase64 && !annotatedDropboxPath ? { annotatedPdfBase64, annotatedPdfFilename } : {}),
-      ...(dropboxMove           ? { dropboxMove }                                 : {}),
-      dtName:  dt.name,
-      dtEmail: dt.email,
-    });
-
+    // NOTE: fireWebhook removed — DT email now batched via POST /api/df/send-dt-emails
+    // bounceFolderPath is stored on the Submission page via Dropbox Path update above;
+    // the send-dt-emails endpoint computes it from dropboxMove.toFolder at send time.
     console.log(`[bounce] ${id} (path: ${annotatedDropboxPath || "none"}, base64: ${annotatedPdfBase64 ? "yes" : "no"})`);
     res.json({ ok: true, bouncedAt, ...(dropboxMove ? { dropboxMove } : {}) });
   });
@@ -911,24 +1039,8 @@ module.exports = function mountDrawingFlow(app, notion) {
     }
 
     const submissionTitle = getProp(submissionPage, "Submission", "title");
-    const dtIds           = getProp(submissionPage, "DT",         "relation");
-    const dt              = await resolveDT(notion, dtIds);
 
-    // Make Scenario 2 (Actions Hub): Gmail to DT — router branches by stage + grade
-    fireWebhook(process.env.MAKE_ACTIONS_WEBHOOK, {
-      action: "log-status",
-      submissionId: id,
-      submissionTitle,
-      stage,
-      grade,
-      gradedAt,
-      drawingStatus,
-      isTerminal:    isTerminalAB,
-      isA45Approved,
-      dtName:  dt.name,
-      dtEmail: dt.email,
-    });
-
+    // NOTE: fireWebhook removed — DT email now batched via POST /api/df/send-dt-emails
     console.log(`[log-status] ${id} => ${grade} => ${drawingStatus}`);
     res.json({ ok: true, grade, gradedAt, drawingStatus, submissionStatus, isTerminal: isTerminalAB, isA45Approved });
   });

@@ -2,6 +2,8 @@
 // Polls /api/df/submissions every 30s.
 // Shows Status=Submitted queue (grouped by task/item) with Approve + Bounce actions.
 // Shows Status=Issued section with Log Status (A/B/C/NA) action.
+// Shows Pending DT Notification section — actioned items awaiting batch email send.
+// Multi-select batch actions per queue section.
 // Desktop notifications on new arrivals.
 
 const { useState, useEffect, useRef, useCallback } = React;
@@ -161,7 +163,7 @@ const IssueModal = ({ submission, onConfirm, onClose }) => {
 
 // ─── Submission row ───────────────────────────────────────────────────────────
 
-const SubmissionRow = ({ sub, onApprove, onBounce, onLogStatus, onIssue, busy }) => {
+const SubmissionRow = ({ sub, onApprove, onBounce, onLogStatus, onIssue, busy, selected, onToggleSelect }) => {
   const isBusy = busy === sub.id;
   const isApproved      = sub.status === "Approved";
   const isAwaitingIssue = sub.status === "Awaiting Issue";
@@ -200,7 +202,16 @@ const SubmissionRow = ({ sub, onApprove, onBounce, onLogStatus, onIssue, busy })
   };
 
   return (
-    <div className="queue-row">
+    <div className={`queue-row${selected ? " selected" : ""}`}>
+      <div className="queue-row-check">
+        <input
+          type="checkbox"
+          checked={!!selected}
+          onChange={() => onToggleSelect(sub.id)}
+          onClick={(e) => e.stopPropagation()}
+          title="Select for batch action"
+        />
+      </div>
       <div>
         <div className="queue-row-drawing">{sub.drawingNo || sub.title}</div>
         <div className="queue-row-sub">
@@ -228,18 +239,73 @@ const SubmissionRow = ({ sub, onApprove, onBounce, onLogStatus, onIssue, busy })
   );
 };
 
+// ─── Batch action bar ─────────────────────────────────────────────────────────
+
+const BatchBar = ({ count, label, onAction, onClear, busy }) => {
+  if (count === 0) return null;
+  return (
+    <div className="batch-bar">
+      <span className="batch-bar-count">{count} selected</span>
+      <button className="btn btn-sm btn-primary" onClick={onAction} disabled={busy}>
+        {busy ? "Working…" : `${label} ${count}`}
+      </button>
+      <button className="btn btn-sm btn-ghost" onClick={onClear} disabled={busy}>
+        Clear
+      </button>
+    </div>
+  );
+};
+
 // ─── Queue section ────────────────────────────────────────────────────────────
 
-const QueueSection = ({ title, submissions, onApprove, onBounce, onLogStatus, onIssue, busy }) => {
+const QueueSection = ({
+  title, submissions, onApprove, onBounce, onLogStatus, onIssue, busy,
+  selectedIds, onToggleSelect, batchLabel, onBatchAction, batchBusy,
+}) => {
   if (!submissions.length) return null;
   const groups = groupByTask(submissions);
+
+  // IDs of all submissions in this section
+  const sectionIds = submissions.map((s) => s.id);
+  const selectedInSection = sectionIds.filter((id) => selectedIds.has(id));
+  const allSelected = sectionIds.length > 0 && selectedInSection.length === sectionIds.length;
+  const someSelected = selectedInSection.length > 0;
+
+  const toggleAll = () => {
+    if (allSelected) {
+      // deselect all in this section
+      sectionIds.forEach((id) => selectedIds.has(id) && onToggleSelect(id));
+    } else {
+      // select all in this section that aren't already selected
+      sectionIds.forEach((id) => !selectedIds.has(id) && onToggleSelect(id));
+    }
+  };
 
   return (
     <div>
       <div className="section-header">
+        <input
+          type="checkbox"
+          className="section-select-all"
+          checked={allSelected}
+          ref={(el) => { if (el) el.indeterminate = someSelected && !allSelected; }}
+          onChange={toggleAll}
+          title="Select all in section"
+        />
         <span className="section-title">{title}</span>
         <span className="count-pill">{submissions.length}</span>
       </div>
+
+      {batchLabel && (
+        <BatchBar
+          count={selectedInSection.length}
+          label={batchLabel}
+          onAction={() => onBatchAction(selectedInSection)}
+          onClear={() => sectionIds.forEach((id) => selectedIds.has(id) && onToggleSelect(id))}
+          busy={batchBusy}
+        />
+      )}
+
       {Object.entries(groups).map(([taskCode, rows]) => (
         <div key={taskCode} className="queue-group">
           <div className="queue-group-header">{taskCode}</div>
@@ -252,7 +318,76 @@ const QueueSection = ({ title, submissions, onApprove, onBounce, onLogStatus, on
               onLogStatus={onLogStatus}
               onIssue={onIssue}
               busy={busy}
+              selected={selectedIds.has(sub.id)}
+              onToggleSelect={onToggleSelect}
             />
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+};
+
+// ─── Pending DT Notification section ─────────────────────────────────────────
+// Read-only list of actioned submissions awaiting the batch DT email send.
+
+const PendingNotificationRow = ({ sub }) => {
+  const actionColor = sub.dmAction === "Bounce" ? "var(--danger)"
+    : sub.dmAction === "Log Status" ? "var(--warning)"
+    : "var(--success)";
+
+  return (
+    <div className="pending-row">
+      <div>
+        <div className="queue-row-drawing">{sub.drawingNo || sub.title}</div>
+        <div className="queue-row-sub">
+          {sub.stage} · R{sub.qaRound}
+          {sub.dtName ? ` · ${sub.dtName}` : ""}
+        </div>
+      </div>
+      <div>
+        <span className={`badge ${stageBadgeClass(sub.stage)}`}>{sub.stage}</span>
+      </div>
+      <div style={{ fontSize: 12, color: actionColor, fontWeight: 600 }}>
+        {sub.dmAction === "Bounce"     ? `Bounced R${sub.qaRound}`
+         : sub.dmAction === "Log Status" ? `Grade: ${sub.grade || "—"}`
+         : sub.status === "Issued"    ? "Issued"
+         : "Approved"}
+      </div>
+      <div className="queue-row-link" style={{ fontSize: 11, color: "var(--text3)" }}>
+        {sub.folderPath
+          ? sub.folderPath.split("/").slice(-2).join("/")
+          : "—"}
+      </div>
+    </div>
+  );
+};
+
+const PendingNotificationSection = ({ submissions }) => {
+  if (!submissions.length) return null;
+
+  // Group by DT name
+  const byDT = {};
+  for (const s of submissions) {
+    const key = s.dtName || "Unknown DT";
+    if (!byDT[key]) byDT[key] = [];
+    byDT[key].push(s);
+  }
+
+  return (
+    <div className="pending-notif-section">
+      <div className="section-header" style={{ marginTop: 8 }}>
+        <span className="section-title">Pending DT Notification</span>
+        <span className="count-pill pending-count">{submissions.length}</span>
+        <span style={{ fontSize: 11, color: "var(--text3)", marginLeft: 6 }}>
+          — click "Send DT Emails" to notify
+        </span>
+      </div>
+      {Object.entries(byDT).map(([dtName, rows]) => (
+        <div key={dtName} className="queue-group">
+          <div className="queue-group-header">{dtName}</div>
+          {rows.map((sub) => (
+            <PendingNotificationRow key={sub.id} sub={sub} />
           ))}
         </div>
       ))}
@@ -263,19 +398,36 @@ const QueueSection = ({ title, submissions, onApprove, onBounce, onLogStatus, on
 // ─── Cockpit root ─────────────────────────────────────────────────────────────
 
 const Cockpit = () => {
-  const [submitted,      setSubmitted]      = useState([]);
-  const [awaitingIssue,  setAwaitingIssue]  = useState([]);
-  const [issued,         setIssued]         = useState([]);
-  const [loading,        setLoading]        = useState(true);
-  const [error,          setError]          = useState(null);
-  const [lastPoll,       setLastPoll]       = useState(null);
-  const [busy,           setBusy]           = useState(null);
-  const [bounceTarget,    setBounceTarget]    = useState(null);
-  const [issueTarget,     setIssueTarget]     = useState(null);
-  const [logStatusTarget, setLogStatusTarget] = useState(null);
+  const [submitted,            setSubmitted]            = useState([]);
+  const [awaitingIssue,        setAwaitingIssue]        = useState([]);
+  const [issued,               setIssued]               = useState([]);
+  const [pendingNotification,  setPendingNotification]  = useState([]);
+  const [loading,              setLoading]              = useState(true);
+  const [error,                setError]                = useState(null);
+  const [lastPoll,             setLastPoll]             = useState(null);
+  const [busy,                 setBusy]                 = useState(null);
+  const [batchBusy,            setBatchBusy]            = useState(false);
+  const [sendEmailBusy,        setSendEmailBusy]        = useState(false);
+  const [sendEmailResult,      setSendEmailResult]      = useState(null); // "ok" | "error" | null
+  const [bounceTarget,         setBounceTarget]         = useState(null);
+  const [issueTarget,          setIssueTarget]          = useState(null);
+  const [logStatusTarget,      setLogStatusTarget]      = useState(null);
+
+  // Multi-select: single Set shared across all sections; sections filter to their own IDs
+  const [selectedIds, setSelectedIds] = useState(new Set());
 
   const knownIds = useRef(new Set());
   const notifGranted = useRef(false);
+
+  const toggleSelect = useCallback((id) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const clearSelection = useCallback(() => setSelectedIds(new Set()), []);
 
   // ── Notification permission ──────────────────────────────────────────────
   useEffect(() => {
@@ -303,19 +455,23 @@ const Cockpit = () => {
     if (!silent) setLoading(true);
     setError(null);
     try {
-      const [subRes, approvedRes, awaitRes, issRes] = await Promise.all([
+      const [subRes, approvedRes, awaitRes, issRes, pendingRes] = await Promise.all([
         fetch("/api/df/submissions?status=Submitted"),
         fetch("/api/df/submissions?status=Approved"),
         fetch("/api/df/submissions?status=Awaiting%20Issue"),
         fetch("/api/df/submissions?status=Issued"),
+        fetch("/api/df/submissions?status=pending-notification"),
       ]);
 
-      if (!subRes.ok || !approvedRes.ok || !awaitRes.ok || !issRes.ok) throw new Error("API error");
+      if (!subRes.ok || !approvedRes.ok || !awaitRes.ok || !issRes.ok || !pendingRes.ok) {
+        throw new Error("API error");
+      }
 
-      const { submissions: subs     } = await subRes.json();
+      const { submissions: subs      } = await subRes.json();
       const { submissions: approved_ } = await approvedRes.json();
-      const { submissions: await_   } = await awaitRes.json();
-      const { submissions: iss      } = await issRes.json();
+      const { submissions: await_    } = await awaitRes.json();
+      const { submissions: iss       } = await issRes.json();
+      const { submissions: pending   } = await pendingRes.json();
 
       const newOnes = subs.filter((s) => !knownIds.current.has(s.id));
       if (newOnes.length && knownIds.current.size > 0) notify(newOnes.length);
@@ -324,6 +480,7 @@ const Cockpit = () => {
       setSubmitted(subs);
       setAwaitingIssue([...approved_, ...await_]);
       setIssued(iss);
+      setPendingNotification(pending);
       setLastPoll(new Date());
     } catch (err) {
       setError(err.message);
@@ -338,7 +495,7 @@ const Cockpit = () => {
     return () => clearInterval(interval);
   }, [fetchQueue]);
 
-  // ── Actions ──────────────────────────────────────────────────────────────
+  // ── Individual actions ───────────────────────────────────────────────────
   const handleApprove = async (id) => {
     setBusy(id);
     try {
@@ -415,21 +572,99 @@ const Cockpit = () => {
     }
   };
 
+  // ── Batch actions ────────────────────────────────────────────────────────
+  const runBatch = async (ids, apiPath, method = "PATCH", body = null) => {
+    setBatchBusy(true);
+    try {
+      const results = await Promise.allSettled(
+        ids.map((id) =>
+          fetch(`/api/df/submissions/${id}/${apiPath}`, {
+            method,
+            headers: body ? { "Content-Type": "application/json" } : undefined,
+            body:    body ? JSON.stringify(body) : undefined,
+          })
+        )
+      );
+      const failed = results.filter((r) => r.status === "rejected" || (r.value && !r.value.ok));
+      if (failed.length) alert(`${failed.length} of ${ids.length} actions failed. Check console.`);
+      clearSelection();
+      await fetchQueue(true);
+    } catch (err) {
+      alert(`Batch error: ${err.message}`);
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const handleBatchApprove = (ids) => runBatch(ids, "approve");
+  const handleBatchBounce  = (ids) => runBatch(ids, "bounce", "PATCH", {});
+  const handleBatchIssue   = (ids) => runBatch(ids, "issue");
+
+  // ── Send DT emails ───────────────────────────────────────────────────────
+  const handleSendDTEmails = async () => {
+    setSendEmailBusy(true);
+    setSendEmailResult(null);
+    try {
+      const res = await fetch("/api/df/send-dt-emails", { method: "POST" });
+      const body = await res.json();
+      if (!res.ok) {
+        alert(`Send emails failed: ${body.error || res.statusText}`);
+        setSendEmailResult("error");
+      } else {
+        setSendEmailResult("ok");
+        // Remove notified items from pending list immediately (no wait for next poll)
+        setPendingNotification([]);
+        // Refresh queue in background to catch any state changes
+        fetchQueue(true);
+      }
+    } catch (err) {
+      alert(`Send emails error: ${err.message}`);
+      setSendEmailResult("error");
+    } finally {
+      setSendEmailBusy(false);
+      // Clear "Sent!" confirmation after 4s
+      setTimeout(() => setSendEmailResult(null), 4000);
+    }
+  };
+
   // ── Render ───────────────────────────────────────────────────────────────
   const total = submitted.length + awaitingIssue.length + issued.length;
-  // awaitingIssue combines "Approved" (DT uploading) + "Awaiting Issue" (DM action required)
 
   return (
     <div>
       <div className="page-header">
-        <h1 className="page-title">Submissions Queue</h1>
-        <div className="page-meta">
-          {lastPoll
-            ? `Updated ${lastPoll.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · auto-refresh 30s`
-            : "Loading…"
-          }
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <h1 className="page-title">Submissions Queue</h1>
+          {pendingNotification.length > 0 && (
+            <span className="pending-email-badge">{pendingNotification.length} pending email</span>
+          )}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          {sendEmailResult === "ok" && (
+            <span className="send-result ok">Emails sent!</span>
+          )}
+          {sendEmailResult === "error" && (
+            <span className="send-result error">Send failed</span>
+          )}
+          <button
+            className="btn btn-primary"
+            onClick={handleSendDTEmails}
+            disabled={sendEmailBusy || pendingNotification.length === 0}
+            title={pendingNotification.length === 0 ? "No pending notifications" : `Send DT emails for ${pendingNotification.length} item(s)`}
+          >
+            {sendEmailBusy ? "Sending…" : `Send DT Emails${pendingNotification.length > 0 ? ` (${pendingNotification.length})` : ""}`}
+          </button>
+          <div className="page-meta">
+            {lastPoll
+              ? `Updated ${lastPoll.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · auto-refresh 30s`
+              : "Loading…"
+            }
+          </div>
         </div>
       </div>
+
+      {/* Pending DT Notification — shown first so DM sees outstanding emails before acting */}
+      <PendingNotificationSection submissions={pendingNotification} />
 
       {loading && !total && (
         <div className="state-loading">
@@ -444,7 +679,7 @@ const Cockpit = () => {
         </div>
       )}
 
-      {!loading && !error && total === 0 && (
+      {!loading && !error && total === 0 && pendingNotification.length === 0 && (
         <div className="state-empty">
           No submissions waiting — queue clear.
         </div>
@@ -459,7 +694,25 @@ const Cockpit = () => {
           onLogStatus={(sub) => setLogStatusTarget(sub)}
           onIssue={(sub) => setIssueTarget(sub)}
           busy={busy}
+          selectedIds={selectedIds}
+          onToggleSelect={toggleSelect}
+          batchLabel="Approve"
+          onBatchAction={handleBatchApprove}
+          batchBusy={batchBusy}
         />
+      )}
+
+      {/* Bounce batch is separate so its button label differs */}
+      {submitted.length > 0 && (
+        <div style={{ marginTop: -8 }}>
+          <BatchBar
+            count={submitted.filter((s) => selectedIds.has(s.id)).length}
+            label="Bounce"
+            onAction={() => handleBatchBounce(submitted.filter((s) => selectedIds.has(s.id)).map((s) => s.id))}
+            onClear={() => submitted.forEach((s) => selectedIds.has(s.id) && toggleSelect(s.id))}
+            busy={batchBusy}
+          />
+        </div>
       )}
 
       {awaitingIssue.length > 0 && (
@@ -471,6 +724,11 @@ const Cockpit = () => {
           onLogStatus={(sub) => setLogStatusTarget(sub)}
           onIssue={(sub) => setIssueTarget(sub)}
           busy={busy}
+          selectedIds={selectedIds}
+          onToggleSelect={toggleSelect}
+          batchLabel="Issue"
+          onBatchAction={handleBatchIssue}
+          batchBusy={batchBusy}
         />
       )}
 
@@ -483,6 +741,9 @@ const Cockpit = () => {
           onLogStatus={(sub) => setLogStatusTarget(sub)}
           onIssue={(sub) => setIssueTarget(sub)}
           busy={busy}
+          selectedIds={selectedIds}
+          onToggleSelect={toggleSelect}
+          batchBusy={batchBusy}
         />
       )}
 
@@ -495,6 +756,9 @@ const Cockpit = () => {
           onLogStatus={(sub) => setLogStatusTarget(sub)}
           onIssue={(sub) => setIssueTarget(sub)}
           busy={busy}
+          selectedIds={selectedIds}
+          onToggleSelect={toggleSelect}
+          batchBusy={batchBusy}
         />
       )}
 
@@ -524,5 +788,3 @@ const Cockpit = () => {
     </div>
   );
 };
-
-window.Cockpit = Cockpit;
