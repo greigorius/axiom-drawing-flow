@@ -474,10 +474,22 @@ const Cockpit = () => {
         />
       )}
 
-      {issued.length > 0 && (
+      {issued.filter((s) => s.stage !== "A4.5").length > 0 && (
         <QueueSection
           title="Issued — Awaiting Client Grade"
-          submissions={issued}
+          submissions={issued.filter((s) => s.stage !== "A4.5")}
+          onApprove={handleApprove}
+          onBounce={(sub) => setBounceTarget(sub)}
+          onLogStatus={(sub) => setLogStatusTarget(sub)}
+          onIssue={(sub) => setIssueTarget(sub)}
+          busy={busy}
+        />
+      )}
+
+      {issued.filter((s) => s.stage === "A4.5").length > 0 && (
+        <QueueSection
+          title="Issued — Awaiting Sign Off"
+          submissions={issued.filter((s) => s.stage === "A4.5")}
           onApprove={handleApprove}
           onBounce={(sub) => setBounceTarget(sub)}
           onLogStatus={(sub) => setLogStatusTarget(sub)}

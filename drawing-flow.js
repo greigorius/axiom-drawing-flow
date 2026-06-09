@@ -769,9 +769,9 @@ module.exports = function mountDrawingFlow(app, notion) {
 
   app.patch("/api/df/submissions/:id/bounce", async (req, res) => {
     const { id } = req.params;
-    const { annotatedDropboxPath, annotatedPdfFilename,
+    const { annotatedPdfFilename,
             annotatedPdfBase64 } = req.body || {};  // base64 kept for legacy/small-file fallback
-    const hasAnnotatedPdf = !!(annotatedDropboxPath || annotatedPdfBase64);
+    let { annotatedDropboxPath } = req.body || {};
 
     let submissionPage;
     try { submissionPage = await notion.pages.retrieve({ page_id: id }); }
@@ -779,6 +779,14 @@ module.exports = function mountDrawingFlow(app, notion) {
 
     const qaRound   = getProp(submissionPage, "QA Round",     "number") ?? 1;
     const rawPath   = getProp(submissionPage, "Dropbox Path", "url");
+
+    // If DT Checker pre-uploaded the file but didn't send annotatedDropboxPath,
+    // reconstruct it so Make receives hasAnnotatedPdf=true and doesn't overwrite the annotated file.
+    if (!annotatedDropboxPath && !annotatedPdfBase64 && annotatedPdfFilename) {
+      const dm = computeDropboxMove(rawPath, "bounce", qaRound);
+      if (dm?.toFolder) annotatedDropboxPath = `${dm.toFolder}/${annotatedPdfFilename}`;
+    }
+    const hasAnnotatedPdf = !!(annotatedDropboxPath || annotatedPdfBase64);
     const bouncedAt = now();
 
     try {

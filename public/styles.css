@@ -317,10 +317,12 @@ main {
 }
 
 .grade-btn:hover { background: var(--bg4); border-color: var(--text3); }
-.grade-btn.A:hover { border-color: var(--success); color: var(--success); }
-.grade-btn.B:hover { border-color: var(--warning); color: var(--warning); }
-.grade-btn.C:hover { border-color: var(--danger);  color: var(--danger); }
-.grade-btn.NA:hover { border-color: var(--text2);  color: var(--text2); font-size: 13px; }
+.grade-btn.A:hover        { border-color: var(--success); color: var(--success); }
+.grade-btn.B:hover        { border-color: var(--warning); color: var(--warning); }
+.grade-btn.C:hover        { border-color: var(--danger);  color: var(--danger);  }
+.grade-btn.NA:hover       { border-color: var(--text2);   color: var(--text2);   font-size: 13px; }
+.grade-btn.Approved:hover { border-color: var(--success); color: var(--success); }
+.grade-btn.Rejected:hover { border-color: var(--danger);  color: var(--danger);  }
 
 /* ─── Inputs form ────────────────────────────────────────────────────── */
 .form-card {
