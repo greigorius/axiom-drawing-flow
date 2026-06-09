@@ -881,12 +881,14 @@ module.exports = function mountDrawingFlow(app, notion) {
     // Terminal AB → clear BIC; A4.5 Approved → back to DM; all others → DT
     const newBIC        = isTerminalAB ? null : isA45Approved ? "DM" : BIC.GRADED;
 
+    const submissionStatus = isA45Approved ? "Schedule" : isTerminalAB ? "Complete" : "Graded";
+
     try {
       await notion.pages.update({ page_id: id, properties: {
-        "Status":        { select: { name: "Graded"     } },
-        "DM Action":     { select: { name: "Log Status" } },
-        "Client Grade":  { select: { name: grade        } },
-        "Reviewed":      { date:   { start: gradedAt    } },
+        "Status":        { select: { name: submissionStatus } },
+        "DM Action":     { select: { name: "Log Status"     } },
+        "Client Grade":  { select: { name: grade            } },
+        "Reviewed":      { date:   { start: gradedAt        } },
         "Ball In Court": newBIC ? { select: { name: newBIC    } } : { select: null },
         "BIC Since":     newBIC ? { date:   { start: gradedAt } } : { date:   null },
       }});
@@ -928,7 +930,7 @@ module.exports = function mountDrawingFlow(app, notion) {
     });
 
     console.log(`[log-status] ${id} => ${grade} => ${drawingStatus}`);
-    res.json({ ok: true, grade, gradedAt, drawingStatus, isTerminal: isTerminalAB, isA45Approved });
+    res.json({ ok: true, grade, gradedAt, drawingStatus, submissionStatus, isTerminal: isTerminalAB, isA45Approved });
   });
 
   // GET /api/df/drawings
