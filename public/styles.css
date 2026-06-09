@@ -112,10 +112,12 @@ main {
   text-transform: uppercase;
 }
 
-.badge-submitted { background: rgba(79,127,255,0.18); color: var(--accent); }
-.badge-issued    { background: rgba(34,197,94,0.18);  color: var(--success); }
-.badge-rejected  { background: rgba(239,68,68,0.18);  color: var(--danger); }
-.badge-graded    { background: rgba(168,85,247,0.18); color: var(--purple); }
+.badge-submitted      { background: rgba(79,127,255,0.18);  color: var(--accent); }
+.badge-approved       { background: rgba(34,197,94,0.14);   color: #4ade80; }
+.badge-awaiting-issue { background: rgba(245,158,11,0.18);  color: var(--warning); }
+.badge-issued         { background: rgba(34,197,94,0.18);   color: var(--success); }
+.badge-rejected       { background: rgba(239,68,68,0.18);   color: var(--danger); }
+.badge-graded         { background: rgba(168,85,247,0.18);  color: var(--purple); }
 
 .badge-s4  { background: rgba(79,127,255,0.14); color: #7aa4ff; }
 .badge-s5  { background: rgba(34,197,94,0.14);  color: #4ade80; }

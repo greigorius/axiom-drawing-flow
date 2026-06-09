@@ -58,9 +58,9 @@ const STAGE_APPROVE_DRAWING_STATUS = {
 //       then change "AB" entry from "Project Team" to "Document Control".
 const STAGE_APPROVE_BIC = {
   "S3":   "Architect",
-  "S4":   "Architect",
-  "S5":   "Architect",
-  "A4.5": "Contractor",
+  "S4":   "Contractor",   // MC & consultants review
+  "S5":   "Architect",    // Client review
+  "A4.5": "Contractor",   // MC sign-off
   "AB":   "Project Team",
 };
 
@@ -68,7 +68,7 @@ const STAGE_LOG_STATUS_MAP = {
   "S3":   { supported: false, statusField: null,        dateField: null,             grades: []                       },
   "S4":   { supported: true,  statusField: "S4 Status", dateField: "S4 Status Date", grades: ["A","B","C","NA"]      },
   "S5":   { supported: true,  statusField: "S5 Status", dateField: "S5 Status Date", grades: ["A","B","C","NA"]      },
-  "A4.5": { supported: false, statusField: null,        dateField: null,             grades: []                       },
+  "A4.5": { supported: true,  statusField: null,        dateField: "C01 Sign Off",   grades: ["Approved","Rejected"]  },
   "AB":   { supported: true,  statusField: "AB Status", dateField: "AB Status Date", grades: ["Approved","Rejected"] },
 };
 
@@ -111,11 +111,14 @@ function computeDropboxMove(rawPath, action, qaRound) {
   const before  = fullPath.slice(0, idx);          // everything before /Pending/
   const filename = fullPath.slice(idx + "/pending/".length); // filename after /Pending/
   if (action === "bounce") {
+    const fileParts      = filename.split("_");
+    const itemNo         = fileParts[0] ?? "";
     const toFolderParent = `${before}/Rejected`;
     const toFolderName   = `R${qaRound}`;
-    const toFolder       = `${toFolderParent}/${toFolderName}`;
+    const rFolder        = `${toFolderParent}/${toFolderName}`;
+    const toFolder       = itemNo ? `${rFolder}/Suffix ${itemNo}` : rFolder;
     const to             = `${toFolder}/${filename}`;
-    return { from: fullPath, to, toFolder, toFolderParent, toFolderName };
+    return { from: fullPath, to, toFolder, rFolder, toFolderParent, toFolderName, itemNo };
   }
   if (action === "approve") {
     // Filename format: {itemNo}_{drawingNo}_{revision}_{dtInitials}.pdf
@@ -130,6 +133,20 @@ function computeDropboxMove(rawPath, action, qaRound) {
     const to             = `${toFolder}/${newFilename}`;
     return { from: fullPath, to, toFolder, toFolderParent, toFolderName, newFilename, itemNo, drawingNo };
   }
+  return null;
+}
+
+// --- Drawing type inference ---
+
+// Infers the Dwg No. Assigned value from the drawing number pattern.
+// -SK- checked before -S- to avoid partial matches.
+function inferDwgType(drawingNo) {
+  if (!drawingNo) return null;
+  const n = drawingNo.toUpperCase();
+  if (n.includes("-SK-")) return "Sketch";
+  if (n.includes("-D-"))  return "Drawing";
+  if (n.includes("-M-"))  return "Model";
+  if (n.includes("-L-"))  return "Schedule";
   return null;
 }
 
@@ -282,17 +299,19 @@ async function findDT(notion, initials) {
   }) ?? null;
 }
 
-async function findOpenSubmission(notion, drawingPageId, stage) {
+// Returns the most recent submission for this drawing+stage regardless of status.
+// Used in ingest to determine the current QA round and whether a supersede is needed.
+async function findLatestSubmission(notion, drawingPageId, stage) {
   const res = await notion.databases.query({
     database_id: SUBMISSIONS_DB,
     filter: {
       and: [
         { property: "Drawing", relation: { contains: drawingPageId } },
         { property: "Stage",   select:   { equals: stage }          },
-        { property: "Status",  select:   { equals: "Submitted" }    },
       ],
     },
-    page_size: 10,
+    sorts: [{ property: "QA Round", direction: "descending" }],
+    page_size: 1,
   });
   return res.results[0] ?? null;
 }
@@ -399,11 +418,15 @@ module.exports = function mountDrawingFlow(app, notion) {
 
     let qaRound = 1;
     try {
-      const prev = await findOpenSubmission(notion, drawingPage.id, stage);
+      const prev = await findLatestSubmission(notion, drawingPage.id, stage);
       if (prev) {
         qaRound = (getProp(prev, "QA Round", "number") ?? 1) + 1;
-        notion.pages.update({ page_id: prev.id, properties: { "Status": { select: { name: "Rejected" } } } })
-          .catch((e) => console.warn("[ingest] Supersede failed:", e.message));
+        // Only supersede a still-open submission — a Rejected one is already closed
+        const prevStatus = getProp(prev, "Status", "select");
+        if (prevStatus === "Submitted") {
+          notion.pages.update({ page_id: prev.id, properties: { "Status": { select: { name: "Rejected" } } } })
+            .catch((e) => console.warn("[ingest] Supersede failed:", e.message));
+        }
       }
     } catch (err) { console.warn("[ingest] Resubmission check:", err.message); }
 
@@ -441,14 +464,17 @@ module.exports = function mountDrawingFlow(app, notion) {
     }
 
     try {
-      await notion.pages.update({
-        page_id: drawingPage.id,
-        properties: {
-          "Drawing Status":   { select: { name: "DM Review"       } },
-          "Submission Stage": { select: { name: STAGE_LABEL[stage] } },
-          "Rev":              { select: { name: revision           } },
-        },
-      });
+      const mdsProps = {
+        "Drawing Status":   { select: { name: "DM Review"        } },
+        "Submission Stage": { select: { name: STAGE_LABEL[stage]  } },
+        "Rev":              { select: { name: revision            } },
+      };
+      // Populate Dwg No. Assigned if empty — infer from drawing number pattern
+      if (!getProp(drawingPage, "Dwg No. Assigned", "select")) {
+        const inferred = inferDwgType(drawingNo);
+        if (inferred) mdsProps["Dwg No. Assigned"] = { select: { name: inferred } };
+      }
+      await notion.pages.update({ page_id: drawingPage.id, properties: mdsProps });
     } catch (err) { console.warn("[ingest] MDS update failed:", err.message); }
 
     console.log(`[ingest] created ${submissionTitle} (${newSubmission.id})`);
@@ -677,7 +703,7 @@ module.exports = function mountDrawingFlow(app, notion) {
     if (dsIdx < 0) return res.status(400).json({ ok: false, error: "Path not under Drawing Submissions" });
 
     const projectNo = parts[dsIdx + 1];
-    const stage     = parts[dsIdx + 2];
+    const stage     = parts[dsIdx + 2]?.toUpperCase();  // path_lower from Dropbox/Make is all lowercase
     if (!projectNo || !stage) return res.status(400).json({ ok: false, error: "Could not parse project/stage" });
     if (!VALID_STAGES.includes(stage)) return res.status(400).json({ ok: false, error: `Unknown stage: ${stage}` });
 
@@ -841,9 +867,11 @@ module.exports = function mountDrawingFlow(app, notion) {
 
     const drawingIds    = getProp(submissionPage, "Drawing", "relation");
     const gradedAt      = now();
-    const isTerminal    = stage === "AB" && grade === "Approved";
-    const returnsToDT   = !isTerminal;
-    const drawingStatus = isTerminal ? "Complete" : "Approval Updates";
+    const isTerminalAB  = stage === "AB"   && grade === "Approved";
+    const isA45Approved = stage === "A4.5" && grade === "Approved";
+    const drawingStatus = isTerminalAB ? "Complete" : isA45Approved ? "Schedule" : "Approval Updates";
+    // Terminal AB → clear BIC; A4.5 Approved → back to DM; all others → DT
+    const newBIC        = isTerminalAB ? null : isA45Approved ? "DM" : BIC.GRADED;
 
     try {
       await notion.pages.update({ page_id: id, properties: {
@@ -851,8 +879,8 @@ module.exports = function mountDrawingFlow(app, notion) {
         "DM Action":     { select: { name: "Log Status" } },
         "Client Grade":  { select: { name: grade        } },
         "Reviewed":      { date:   { start: gradedAt    } },
-        "Ball In Court": returnsToDT ? { select: { name: BIC.GRADED } } : { select: null },
-        "BIC Since":     returnsToDT ? { date:   { start: gradedAt  } } : { date:   null },
+        "Ball In Court": newBIC ? { select: { name: newBIC    } } : { select: null },
+        "BIC Since":     newBIC ? { date:   { start: gradedAt } } : { date:   null },
       }});
     } catch (err) {
       return res.status(500).json({ ok: false, error: "Submission update failed", detail: err.message });
@@ -861,8 +889,11 @@ module.exports = function mountDrawingFlow(app, notion) {
     for (const drawingId of drawingIds) {
       try {
         const mdsProps = { "Drawing Status": { select: { name: drawingStatus } } };
-        if (stageMap.statusField) mdsProps[stageMap.statusField] = { select: { name: grade     } };
-        if (stageMap.dateField)   mdsProps[stageMap.dateField]   = { date:   { start: gradedAt } };
+        if (stageMap.statusField) mdsProps[stageMap.statusField] = { select: { name: grade } };
+        // A4.5: only set C01 Sign Off date when Approved (not when Rejected)
+        if (stageMap.dateField && !(stage === "A4.5" && grade !== "Approved")) {
+          mdsProps[stageMap.dateField] = { date: { start: gradedAt } };
+        }
         await notion.pages.update({ page_id: drawingId, properties: mdsProps });
       } catch (err) {
         console.warn(`[log-status] MDS failed for ${drawingId}:`, err.message);
@@ -882,13 +913,14 @@ module.exports = function mountDrawingFlow(app, notion) {
       grade,
       gradedAt,
       drawingStatus,
-      isTerminal,
+      isTerminal:    isTerminalAB,
+      isA45Approved,
       dtName:  dt.name,
       dtEmail: dt.email,
     });
 
     console.log(`[log-status] ${id} => ${grade} => ${drawingStatus}`);
-    res.json({ ok: true, grade, gradedAt, drawingStatus, isTerminal });
+    res.json({ ok: true, grade, gradedAt, drawingStatus, isTerminal: isTerminalAB, isA45Approved });
   });
 
   // GET /api/df/drawings

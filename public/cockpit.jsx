@@ -86,11 +86,12 @@ const BounceModal = ({ submission, onConfirm, onClose }) => {
 const LogStatusModal = ({ submission, onConfirm, onClose }) => {
   const [busy, setBusy] = useState(false);
 
-  const isAB = submission.stage === "AB";
-  const grades = isAB ? ["Approved", "Rejected"] : ["A", "B", "C", "NA"];
-  const hint   = isAB
-    ? "Approved = As Built accepted · Rejected = revision required"
-    : "A = accepted · B = minor revision · C = major revision · NA = not applicable";
+  const isAB  = submission.stage === "AB";
+  const isA45 = submission.stage === "A4.5";
+  const grades = (isAB || isA45) ? ["Approved", "Rejected"] : ["A", "B", "C", "NA"];
+  const hint   = isAB  ? "Approved = As Built accepted · Rejected = revision required"
+               : isA45 ? "Approved = Contractor sign-off · Rejected = revision required"
+               : "A = accepted · B = minor revision · C = major revision · NA = not applicable";
 
   const select = async (grade) => {
     setBusy(true);
