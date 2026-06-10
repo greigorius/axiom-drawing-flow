@@ -492,52 +492,69 @@ module.exports = function mountDrawingFlow(app, notion) {
     const statusFilter = req.query.status || "Submitted";
 
     // ── pending-notification filter ────────────────────────────────────────
-    // Returns all submissions that have been actioned (Approved/Rejected/Issued/Graded)
-    // but where DT Notified checkbox is still false — i.e. DT hasn't been emailed yet.
+    // Returns actioned submissions (DT Notified = false) ready for the batch email.
+    //
+    // Gating logic:
+    //   Approved / Rejected  → only shown once Make has written Folder Link back via
+    //                          PATCH /api/df/submissions/:id/folder-link. This ensures
+    //                          the Suffix/Rejected folder is live before the DM can send.
+    //   Issued / Graded      → no folder involved, shown immediately (DT Notified = false).
     if (statusFilter === "pending-notification") {
       try {
-        const NOTIFIABLE_STATUSES = ["Approved", "Rejected", "Issued", "Graded"];
-        const results = (await Promise.all(
-          NOTIFIABLE_STATUSES.map((s) =>
+        // Approved + Rejected: gate on Folder Link being populated
+        const FOLDER_STATUSES  = ["Approved", "Rejected"];
+        // Issued + Graded: no folder, show immediately
+        const INSTANT_STATUSES = ["Issued", "Graded"];
+
+        const [folderResults, instantResults] = await Promise.all([
+          Promise.all(FOLDER_STATUSES.map((s) =>
             queryAll(notion, SUBMISSIONS_DB, {
               and: [
-                { property: "Status",       select:   { equals: s     } },
-                { property: "DT Notified",  checkbox: { equals: false } },
+                { property: "Status",      select:   { equals: s     } },
+                { property: "DT Notified", checkbox: { equals: false } },
+                { property: "Folder Link", url:      { is_not_empty: true } },
               ]
             }, [{ property: "BIC Since", direction: "ascending" }])
-          )
-        )).flat();
+          )).then((r) => r.flat()),
+          Promise.all(INSTANT_STATUSES.map((s) =>
+            queryAll(notion, SUBMISSIONS_DB, {
+              and: [
+                { property: "Status",      select:   { equals: s     } },
+                { property: "DT Notified", checkbox: { equals: false } },
+              ]
+            }, [{ property: "BIC Since", direction: "ascending" }])
+          )).then((r) => r.flat()),
+        ]);
+
+        const results = [...folderResults, ...instantResults];
 
         const submissions = await Promise.all(results.map(async (page) => {
-          const title  = getProp(page, "Submission", "title");
-          const stage  = getProp(page, "Stage",      "select");
-          const dtIds  = getProp(page, "DT",         "relation");
-          const status = getProp(page, "Status",     "select");
-          const dmAction = getProp(page, "DM Action","select");
+          const title    = getProp(page, "Submission", "title");
+          const stage    = getProp(page, "Stage",      "select");
+          const dtIds    = getProp(page, "DT",         "relation");
+          const status   = getProp(page, "Status",     "select");
+          const dmAction = getProp(page, "DM Action",  "select");
           const { taskCode, drawingNo } = parseSubmissionTitle(title, stage);
-          const dtName  = await resolveDTName(notion, dtIds);
-          const dt      = await resolveDT(notion, dtIds);
-          const rawPath = getProp(page, "Dropbox Path", "url");
-          // Reconstruct folder path from current stored Dropbox Path for bounce items.
-          // For approved items it's the Suffix folder; for bounced it's the Rejected/Rn/Suffix folder.
-          // These are already the post-move paths stored by approve/bounce routes.
+          const dtName   = await resolveDTName(notion, dtIds);
+          const dt       = await resolveDT(notion, dtIds);
+          const rawPath  = getProp(page, "Dropbox Path", "url");
+          const folderLink = getProp(page, "Folder Link", "url");
           const folderPath = rawPath
             ? toFullDropboxPath(rawPath).split("/").slice(0, -1).join("/")
             : null;
+          const folderSegs = folderPath ? folderPath.split("/").filter(Boolean) : [];
+          const folderName = folderSegs.slice(-1).join("") || null;
           return {
             id: page.id, title, taskCode, drawingNo, dtName, dtEmail: dt.email, stage,
-            status,
-            dmAction,
+            status, dmAction,
             revision:    getProp(page, "Revision",     "select"),
             qaRound:     getProp(page, "QA Round",     "number"),
             grade:       getProp(page, "Client Grade", "select"),
-            bic:         getProp(page, "Ball In Court","select"),
             bicSince:    getProp(page, "BIC Since",    "date"),
             reviewed:    getProp(page, "Reviewed",     "date"),
-            dropboxPath: rawPath,
             folderPath,
-            shareLink:   getProp(page, "Share Link",   "url"),
-            taskIds:     getProp(page, "Item",         "relation"),
+            folderName,
+            folderLink,
           };
         }));
 
@@ -587,6 +604,63 @@ module.exports = function mountDrawingFlow(app, notion) {
     }
   });
 
+  // PATCH /api/df/submissions/:id/folder-link
+  // Called by Make after it creates a Dropbox shared link for the Suffix/Rejected folder.
+  // Writes the URL to Folder Link on this submission AND all siblings in the same folder
+  // (same task + stage + DM action) so all drawings in a Suffix appear together in the
+  // pending-notification queue once the folder is confirmed live.
+
+  app.patch("/api/df/submissions/:id/folder-link", async (req, res) => {
+    const { id } = req.params;
+    const { folderLink } = req.body || {};
+    if (!folderLink) return res.status(400).json({ ok: false, error: "Missing folderLink in body" });
+
+    let submissionPage;
+    try { submissionPage = await notion.pages.retrieve({ page_id: id }); }
+    catch { return res.status(404).json({ ok: false, error: "Submission not found" }); }
+
+    const stage    = getProp(submissionPage, "Stage",    "select");
+    const dmAction = getProp(submissionPage, "DM Action","select");
+    const taskIds  = getProp(submissionPage, "Item",     "relation");
+
+    // Write to this submission first
+    try {
+      await notion.pages.update({ page_id: id, properties: {
+        "Folder Link": { url: folderLink },
+      }});
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: "Notion update failed", detail: err.message });
+    }
+
+    // Write to all siblings in the same Suffix folder:
+    // same task relation + same stage + same DM action + DT Notified = false
+    let siblingsUpdated = 0;
+    if (taskIds?.length) {
+      try {
+        const siblings = await queryAll(notion, SUBMISSIONS_DB, {
+          and: [
+            { property: "Item",        relation: { contains: taskIds[0] } },
+            { property: "Stage",       select:   { equals: stage        } },
+            { property: "DM Action",   select:   { equals: dmAction     } },
+            { property: "DT Notified", checkbox: { equals: false        } },
+          ]
+        });
+        const others = siblings.filter((p) => p.id !== id);
+        await Promise.all(others.map((p) =>
+          notion.pages.update({ page_id: p.id, properties: {
+            "Folder Link": { url: folderLink },
+          }}).catch((e) => console.warn(`[folder-link] sibling update failed ${p.id}:`, e.message))
+        ));
+        siblingsUpdated = others.length;
+      } catch (err) {
+        console.warn("[folder-link] sibling lookup failed:", err.message);
+      }
+    }
+
+    console.log(`[folder-link] ${id} + ${siblingsUpdated} sibling(s) → ${folderLink}`);
+    res.json({ ok: true, siblingsUpdated });
+  });
+
   // POST /api/df/send-dt-emails
   // Groups all pending-notification submissions by DT, fires one webhook per DT
   // with the full list, then marks each submission DT Notified = true in Notion.
@@ -609,7 +683,7 @@ module.exports = function mountDrawingFlow(app, notion) {
         return res.json({ ok: true, emailsSent: 0, submissionsNotified: 0, message: "Nothing pending" });
       }
 
-      // Resolve DT info + build per-submission summary
+      // Resolve DT info + build per-submission data
       const enriched = await Promise.all(results.map(async (page) => {
         const title    = getProp(page, "Submission", "title");
         const stage    = getProp(page, "Stage",      "select");
@@ -617,55 +691,93 @@ module.exports = function mountDrawingFlow(app, notion) {
         const dmAction = getProp(page, "DM Action",  "select");
         const dtIds    = getProp(page, "DT",         "relation");
         const rawPath  = getProp(page, "Dropbox Path", "url");
+        const folderLink = getProp(page, "Folder Link", "url");
         const { drawingNo } = parseSubmissionTitle(title, stage);
         const dt = await resolveDT(notion, dtIds);
 
-        // Derive the folder path from the stored post-move Dropbox Path
-        const fullPath = toFullDropboxPath(rawPath);
+        // Derive folder path and name
+        const fullPath   = toFullDropboxPath(rawPath);
         const folderPath = fullPath ? fullPath.split("/").slice(0, -1).join("/") : null;
+        const folderSegs = folderPath ? folderPath.split("/").filter(Boolean) : [];
+        const folderName = folderSegs.slice(-1)[0] || null;
 
-        // Last segment of the path — used as the hyperlink label in the email
-        // e.g. "/DESIGN KNOW HOW/.../Rejected/R1/Suffix 112" → "Suffix 112"
-        // Make uses folderName as the anchor label after generating a proper shared link.
-        const folderName = folderPath
-          ? folderPath.split("/").filter(Boolean).pop() ?? folderPath
-          : null;
-
-        // Human-readable action label for the email
+        // Human-readable action label
         const actionLabel = (() => {
-          if (dmAction === "Bounce")     return "Bounce — returned for revision";
+          if (dmAction === "Bounce")     return "Bounced — returned for revision";
           if (dmAction === "Approve")    return status === "Issued" ? "Issued to client" : "QA Approved";
-          if (dmAction === "Log Status") return `Grade received: ${getProp(page, "Client Grade", "select") ?? "—"}`;
+          if (dmAction === "Log Status") return `Grade: ${getProp(page, "Client Grade", "select") ?? "—"}`;
           return dmAction ?? status;
         })();
 
         return {
-          pageId: page.id,
-          dtName:  dt.name,
-          dtEmail: dt.email,
-          submission: {
-            submissionTitle: title,
-            drawingNo,
-            stage,
-            status,
-            dmAction,
-            actionLabel,
-            qaRound:     getProp(page, "QA Round",     "number"),
-            grade:       getProp(page, "Client Grade", "select"),
-            reviewed:    getProp(page, "Reviewed",     "date"),
-            folderPath,
-            folderName,
-          },
+          pageId:    page.id,
+          dtName:    dt.name,
+          dtEmail:   dt.email,
+          folderPath,
+          folderName,
+          folderLink,  // real Dropbox shared link written back by Make
+          drawingNo,
+          stage,
+          status,
+          dmAction,
+          actionLabel,
+          qaRound:   getProp(page, "QA Round",     "number"),
+          grade:     getProp(page, "Client Grade", "select"),
+          reviewed:  getProp(page, "Reviewed",     "date"),
         };
       }));
 
-      // Group by DT email
+      // Group by DT → then by folder within each DT
+      // Structure: byDT[dtEmail] = { dtName, dtEmail, folders: { folderKey: { folderName, folderLink, drawings[] } }, pageIds[] }
       const byDT = {};
       for (const item of enriched) {
-        const key = item.dtEmail || item.dtName || "unknown";
-        if (!byDT[key]) byDT[key] = { dtName: item.dtName, dtEmail: item.dtEmail, submissions: [], pageIds: [] };
-        byDT[key].submissions.push(item.submission);
-        byDT[key].pageIds.push(item.pageId);
+        const dtKey = item.dtEmail || item.dtName || "unknown";
+        if (!byDT[dtKey]) byDT[dtKey] = { dtName: item.dtName, dtEmail: item.dtEmail, folders: {}, pageIds: [] };
+
+        // Folder key: use folderPath if available, else a per-action fallback key
+        const folderKey = item.folderPath || `_no_folder_${item.dmAction}_${item.stage}`;
+        if (!byDT[dtKey].folders[folderKey]) {
+          byDT[dtKey].folders[folderKey] = {
+            folderName:  item.folderName || null,
+            folderLink:  item.folderLink || null,
+            drawings:    [],
+          };
+        }
+        byDT[dtKey].folders[folderKey].drawings.push({
+          drawingNo:    item.drawingNo,
+          stage:        item.stage,
+          actionLabel:  item.actionLabel,
+          qaRound:      item.qaRound,
+          grade:        item.grade,
+        });
+        byDT[dtKey].pageIds.push(item.pageId);
+      }
+
+      // Build the folders array for each DT group, with pre-rendered folderHtml
+      // and a drawingsHtml block listing all drawings under that folder.
+      // All HTML is built here — the Text Aggregator receives a single folderBlockHtml token.
+      for (const group of Object.values(byDT)) {
+        group.folderBlocks = Object.values(group.folders).map((folder) => {
+          const linkHtml = folder.folderLink
+            ? `<a href="${folder.folderLink}" style="color:#4f7fff;font-weight:600;">${folder.folderName || "Open folder"}</a>`
+            : folder.folderName
+              ? `<strong>${folder.folderName}</strong>`
+              : "<em>No folder</em>";
+
+          const drawingRows = folder.drawings.map((d) =>
+            `<tr>
+              <td style="padding:4px 8px;color:#333;">${d.drawingNo || "—"}</td>
+              <td style="padding:4px 8px;color:#555;">${d.stage}</td>
+              <td style="padding:4px 8px;color:#555;">${d.actionLabel}</td>
+            </tr>`
+          ).join("");
+
+          return {
+            folderHtml: linkHtml,
+            drawingsHtml: drawingRows,
+            drawingCount: folder.drawings.length,
+          };
+        });
       }
 
       // Fire one webhook per DT — awaited so we can log Make's response status
@@ -682,12 +794,14 @@ module.exports = function mountDrawingFlow(app, notion) {
           webhookResults.push({ dtName: group.dtName, skipped: true, reason: "no email" });
           continue;
         }
+        // Total drawing count across all folder groups for this DT
+        const totalCount = group.folderBlocks.reduce((n, b) => n + b.drawingCount, 0);
         const payload = {
-          action:      "dt-summary",
-          dtName:      group.dtName,
-          dtEmail:     group.dtEmail,
-          submissions: group.submissions,
-          count:       group.submissions.length,
+          action:       "dt-summary",
+          dtName:       group.dtName,
+          dtEmail:      group.dtEmail,
+          folderBlocks: group.folderBlocks,  // array of { folderHtml, drawingsHtml, drawingCount }
+          count:        totalCount,
         };
         console.log(`[send-dt-emails] Firing webhook → ${group.dtEmail} (${group.submissions.length} submission(s))`);
         try {
@@ -707,7 +821,7 @@ module.exports = function mountDrawingFlow(app, notion) {
       }
 
       // Mark all included submissions as DT Notified = true
-      const allPageIds = enriched.map((e) => e.pageId);
+      const allPageIds = Object.values(byDT).flatMap((g) => g.pageIds);
       await Promise.all(allPageIds.map((pid) =>
         notion.pages.update({ page_id: pid, properties: {
           "DT Notified": { checkbox: true },
@@ -733,24 +847,22 @@ module.exports = function mountDrawingFlow(app, notion) {
     if (!webhookUrl) return res.status(500).json({ ok: false, error: "MAKE_ACTIONS_WEBHOOK env var not set" });
 
     const testPayload = {
-      action:      "dt-summary",
-      dtName:      "Test DT",
-      dtEmail:     req.body?.testEmail || "test@example.com",
-      submissions: [
+      action:       "dt-summary",
+      dtName:       req.body?.testName  || "Test DT",
+      dtEmail:      req.body?.testEmail || "test@example.com",
+      folderBlocks: [
         {
-          submissionTitle: "TEST-001_A-101_S4_R1",
-          drawingNo:       "A-101",
-          stage:           "S4",
-          status:          "Approved",
-          dmAction:        "Approve",
-          actionLabel:     "QA Approved",
-          qaRound:         1,
-          grade:           null,
-          folderPath:      "/DESIGN KNOW HOW/TMJ Interiors/Drawing Submissions/TEST/S4/Suffix 001",
-          folderName:      "Suffix 001",
+          folderHtml:   "<a href=\"https://www.dropbox.com/sh/test\" style=\"color:#4f7fff;font-weight:600;\">Suffix 001</a>",
+          drawingsHtml: "<tr><td style=\"padding:4px 8px;color:#333;\">A-101</td><td style=\"padding:4px 8px;color:#555;\">S4</td><td style=\"padding:4px 8px;color:#555;\">QA Approved</td></tr><tr><td style=\"padding:4px 8px;color:#333;\">A-102</td><td style=\"padding:4px 8px;color:#555;\">S4</td><td style=\"padding:4px 8px;color:#555;\">QA Approved</td></tr>",
+          drawingCount: 2,
+        },
+        {
+          folderHtml:   "<a href=\"https://www.dropbox.com/sh/test2\" style=\"color:#4f7fff;font-weight:600;\">Rejected/R1</a>",
+          drawingsHtml: "<tr><td style=\"padding:4px 8px;color:#333;\">A-103</td><td style=\"padding:4px 8px;color:#555;\">S5</td><td style=\"padding:4px 8px;color:#555;\">Bounced — returned for revision</td></tr>",
+          drawingCount: 1,
         },
       ],
-      count: 1,
+      count: 3,
     };
 
     try {

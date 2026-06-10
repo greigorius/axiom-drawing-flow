@@ -38,9 +38,9 @@ Click **Edit** to enter the scenario editor.
 
 | Route | Folder link approach | Shareable? |
 |-------|---------------------|------------|
-| `approve` | Make creates shared link on `suffixFolderPath` after file move | ✅ Yes — if 1A complete |
-| `bounce` | Make creates shared link on `bounceFolderPath` via module 19 | ✅ Yes — already in place |
-| `dt-summary` | Make creates shared link per row via Iterator → Dropbox module | ✅ Yes — after Part 2 |
+| `approve` | Make creates shared link → **POSTs URL back to backend** → backend writes to Notion | ✅ Yes — after 1A update |
+| `bounce` | Make creates shared link (module 19) → **POSTs URL back to backend** → backend writes to Notion | ✅ Yes — after 1B update |
+| `dt-summary` | Backend reads `Folder Link` from Notion (written by above) → pre-builds HTML anchor | ✅ Yes — no Make Dropbox module needed |
 | `issue` | No folder link — notification only | N/A |
 | `log-status` | No folder link — grade notification only | N/A |
 
@@ -57,35 +57,47 @@ The backend now sends two new fields in the webhook payload:
 
 ---
 
-### 1A — Approve route: add shared link module
+### 1A — Approve route: add folder-link callback
+
+The approve route already has a **Dropbox: Create/Update a Shared Link** module that generates
+the Suffix folder shared link. You now need to add one more module after it: an **HTTP POST**
+that sends the generated URL back to the backend. The backend writes it to the `Folder Link`
+property on the Submission in Notion — and to all sibling drawings in the same Suffix folder.
+This is what gates the drawings appearing in the "Pending DT Notification" cockpit section.
+
+**Current module order:**
+```
+Dropbox: Move a File → Dropbox: Create Shared Link → Gmail
+```
+
+**New module order:**
+```
+Dropbox: Move a File → Dropbox: Create Shared Link → HTTP: POST folder link → Gmail
+```
+
+**Steps:**
 
 1. In the Router, find the **Approve** route.
-2. The route currently has two modules: **Dropbox: Move a File** → **Gmail: Send an Email**.
-3. Click the **+** button between "Move a File" and "Gmail" to insert a new module.
-4. Search for **Dropbox** → select **Create/Update a Shared Link**.
-5. Configure:
-   - **Connection:** your existing Dropbox connection
-   - **File Path:** `{{1.suffixFolderPath}}`
-   - **Shared link type:** `Preview` (or `Direct` — either works for a folder link)
-6. Click **OK** to save the module. Make assigns it a number (e.g. module 5).
-7. Open the **Gmail: Send an Email** module in this route.
-8. Update the **Body** to include the folder link. Replace the current body with:
+2. Click **+** between the "Create Shared Link" module and the Gmail module.
+3. Search for **HTTP** → select **Make a request**.
+4. Configure:
+   - **URL:** `https://your-site.netlify.app/api/df/submissions/{{1.submissionId}}/folder-link`
+   - **Method:** `PATCH`
+   - **Headers:** Add one header — `Content-Type` : `application/json`
+   - **Body type:** `Raw`
+   - **Content type:** `application/json`
+   - **Request content:**
+     ```json
+     {"folderLink": "{{N.url}}"}
+     ```
+     Replace `N` with the module number of your "Create Shared Link" module.
+5. Click **OK**.
 
-```
-Hi {{1.dtName}},
+> The `{{1.submissionId}}` token comes from the original webhook payload (module 1).
+> This is already included in the approve payload the backend sends.
 
-Drawing {{1.submissionTitle}} has passed QA review ({{1.stage}}).
-
-Your upload folder for final DWGs:
-{{5.url}}
-
-Suffix ref: {{1.suffixRef}}
-Reviewed: {{formatDate(1.reviewedAt; "D MMM YYYY")}}
-
-— Axiom Drawing Management
-```
-
-> Replace `{{5.url}}` with the actual module number assigned to your "Create/Update a Shared Link" module. If Make assigned it module 6, use `{{6.url}}`.
+**Gmail module — no change needed.** The individual approve email (if you kept it) can
+remain as-is. The folder link for the DT batch summary email is now handled via Notion.
 
 ---
 
@@ -136,8 +148,40 @@ the actual folder path so the DT sees exactly where their annotated file is.
 
 4. Click **OK** to save.
 
-**No other changes needed to the bounce route** — module 19 is already correctly generating
-the shared link from the bounce destination folder.
+**Additional change — add folder-link callback after module 19:**
+
+Module 19 already generates the shared link. You now need to add an HTTP POST after it to
+send the URL back to the backend, exactly as in the approve route above.
+
+**Current module order:**
+```
+Dropbox: Move a File → Dropbox: Create Shared Link (19) → Gmail
+```
+
+**New module order:**
+```
+Dropbox: Move a File → Dropbox: Create Shared Link (19) → HTTP: POST folder link → Gmail
+```
+
+**Steps:**
+
+1. Click **+** between module 19 and the Gmail module.
+2. Search **HTTP** → select **Make a request**.
+3. Configure:
+   - **URL:** `https://your-site.netlify.app/api/df/submissions/{{1.submissionId}}/folder-link`
+   - **Method:** `PATCH`
+   - **Headers:** `Content-Type` : `application/json`
+   - **Body type:** `Raw`
+   - **Content type:** `application/json`
+   - **Request content:**
+     ```json
+     {"folderLink": "{{19.url}}"}
+     ```
+4. Click **OK**.
+
+The bounce route's Gmail module (individual bounce email to DT) is unchanged — it still
+uses `19.url` directly for the link in that email. The callback just additionally writes
+the same URL to Notion so the dt-summary batch email can use it.
 
 ---
 
@@ -151,150 +195,110 @@ You need to add a new route to the Router for this action.
 
 ### 2A — Add the dt-summary Router route
 
-1. In the Router module, click **Add route**.
-2. Set the **Filter** for this route:
+1. In the Router module, click **Add route** (if not already present).
+2. Set the **Filter**:
    - Label: `DT Summary Email`
    - Condition: `{{1.action}}` **Equal to (text)** `dt-summary`
 
 ---
 
-### 2B — Add an Iterator module
+### 2B — How the dt-summary email works (revised)
 
-The payload contains a `submissions` array. Make's `map()` function can only extract **one field at a time** — it cannot concatenate multiple fields into an HTML string inside a single expression. To build a multi-column HTML table row per submission, you need an **Iterator + Text Aggregator** pipeline.
-
-**Module order for the dt-summary route:**
+**Email structure — grouped by Suffix folder, not by individual drawing:**
 
 ```
-Router (dt-summary filter)
-  → Iterator
-  → Text Aggregator (HTML rows)
-  → Gmail: Send an Email
+Hi Greig Fensome,
+
+Suffix 112          ← clickable shared link (real dropbox.com/sh/... URL)
+  EIT-TMJ-AA-B2-D-I-45120   S4   Bounced — returned for revision
+  EIT-TMJ-AA-B2-D-I-45121   S4   Bounced — returned for revision
+
+Suffix 155          ← clickable shared link
+  EIT-TMJ-AA-B2-D-I-43202   A4.5  Issued to client
+  EIT-TMJ-AA-B2-D-I-43201   A4.5  Issued to client
 ```
+
+**How the folder link is generated:**
+1. Make's approve/bounce routes already create a Dropbox shared link
+2. The new HTTP callback module in those routes POSTs the URL back to the backend
+3. Backend writes the URL to `Folder Link` on the Submission in Notion
+4. When the DM clicks "Send DT Emails", the backend reads `Folder Link` from Notion
+   and pre-builds `folderHtml` (a real `<a href="...">` anchor) before sending the webhook
+5. The Text Aggregator in the dt-summary route receives `folderHtml` as a single token
+
+**No Dropbox module needed in the dt-summary route.** Delete it if previously added.
+
+**Re-determine data structure — required after deploying the backend:**
+
+The payload shape has changed (now sends `folderBlocks` instead of `submissions`).
+Before remapping the Iterator and Aggregator:
+
+1. Click the **Webhook** trigger module (module 1) → **Re-determine data structure**
+2. Leave it listening
+3. In the cockpit, ensure at least one approved/bounced submission has its `Folder Link`
+   populated in Notion (i.e. Make has already run the approve/bounce callback at least once)
+4. Click **Send DT Emails** in the cockpit
+5. Make captures the new structure → click **OK**
 
 ---
 
-#### Why the table may be empty — re-ingest the data structure first
-
-Make learns the shape of a webhook payload the **first time it receives it**. If the scenario
-was built before `send-dt-emails` existed, Make does not yet know that module 1 outputs a
-`submissions` array of objects. The Iterator therefore has nothing to unpack and the Text
-Aggregator produces empty rows.
-
-**You must re-teach Make the data structure before mapping the Iterator fields:**
-
-1. In the scenario editor, click on the **Webhook** trigger module (module 1).
-2. Click **Re-determine data structure**.
-3. Leave this dialog open — Make is now listening.
-4. Go to the cockpit, uncheck `DT Notified` on one or two Submissions in Notion, then click
-   **Send DT Emails**. This fires a live `dt-summary` webhook payload to Make.
-5. Make detects the payload and shows "Successfully determined" — click **OK**.
-6. Module 1 now knows the full structure including `submissions[]` with all its child fields.
-
-After this, open the **Iterator** module — the `Array` field dropdown will now show
-`1.submissions` as a selectable mapped array. Select it and save.
-
-Then open the **Text Aggregator** — the field picker will show the Iterator's output fields
-(`drawingNo`, `stage`, `actionLabel`, `folderPath`, etc.) as selectable tokens. Re-map them.
-
----
-
-#### Why `/home/` links break when forwarded
-
-`https://www.dropbox.com/home/PATH` is a personal navigation URL — it opens a path within
-the **authenticated user's own** Dropbox. Forwarded recipients see their own root or an
-access error because Dropbox resolves the path against whoever is logged in.
-
-The correct link type is a **Dropbox shared link** (`dropbox.com/sh/...` or `dropbox.com/scl/fo/...`),
-which is access-controlled but works for any recipient regardless of which Dropbox account
-they are logged into.
-
-The module chain for the dt-summary route is therefore:
+### 2C — Module chain
 
 ```
 Router (dt-summary filter)
-  → Iterator                          module 29
-  → Dropbox: Create a Shared Link     module 30  ← generates proper shared link per row
-  → Text Aggregator                   module 31
-  → Gmail: Send an Email
+  → Iterator          iterates over 1.folderBlocks
+  → Text Aggregator   builds one HTML block per folder group
+  → Gmail
 ```
 
 ---
 
 #### Step 1 — Iterator
 
-1. Open the existing **Iterator** module (module 29).
-2. Confirm **Array** is set to `{{1.submissions}}`.
+1. Open the **Iterator** module.
+2. Update **Array** to `{{1.folderBlocks}}` (was previously `1.submissions`).
 3. Click **OK**.
 
----
-
-#### Step 2 — Dropbox: Create a Shared Link  *(insert between Iterator and Text Aggregator)*
-
-1. Click the **+** between the Iterator and the Text Aggregator to insert a new module.
-2. Search **Dropbox** → select **Create/Update a Shared Link**.
-3. Configure:
-   - **Connection:** your existing Dropbox connection
-   - **File Path:** select the `{{29.folderPath}}` token pill from the mapped data panel
-   - **Shared link type:** `Preview`
-4. Click **OK**. Make assigns this a new module number (e.g. `30`) — note it for Step 3.
-
-This module fires once per Iterator bundle — i.e. once per submission row — and outputs
-a `url` field containing the proper shareable Dropbox link for that folder.
-
-> If Make shows "link already exists" that is fine — it returns the existing shared link.
+Each bundle from the Iterator represents one Suffix/Rejected folder group and has:
+- `folderHtml` — pre-built `<a href="...">Suffix 112</a>` anchor (or plain text fallback)
+- `drawingsHtml` — pre-built `<tr>` rows for all drawings in that folder
+- `drawingCount` — number of drawings
 
 ---
 
-#### Step 3 — Text Aggregator (builds the table rows)
+#### Step 2 — Text Aggregator
 
-1. Open the existing **Text Aggregator** module.
-2. Update **Source module** to still be the Iterator (module 29) — this controls how many
-   times the aggregator runs, not where field values come from.
-3. Update the **Text** field. The fourth `<td>` (Folder column) now uses the shared link
-   URL from the Dropbox module (`30.url`) and the label from the Iterator (`29.folderName`).
-
-   Replace the entire contents of the fourth `<td>` with:
-
-   ```
-   <a href="[30.url]" style="color:#4f7fff;">[29.folderName]</a>
-   ```
-
-   Where `[30.url]` and `[29.folderName]` are **token pills** selected from the mapped
-   data panel — not typed literally. `30` is the Dropbox module, `29` is the Iterator.
-
-   The full completed Text field:
+1. Open the **Text Aggregator**.
+2. **Source module:** Iterator (module 29).
+3. Replace the entire **Text** field with:
 
 ```html
 <tr>
-  <td style="padding:8px;border:1px solid #ddd;">{{29.drawingNo}}</td>
-  <td style="padding:8px;border:1px solid #ddd;">{{29.stage}}</td>
-  <td style="padding:8px;border:1px solid #ddd;">{{29.actionLabel}}</td>
-  <td style="padding:8px;border:1px solid #ddd;"><a href="{{30.url}}" style="color:#4f7fff;">{{29.folderName}}</a></td>
+  <td colspan="3" style="padding:10px 8px 4px;font-weight:600;border-top:2px solid #4f7fff;">
+    {{29.folderHtml}}
+  </td>
 </tr>
+{{29.drawingsHtml}}
 ```
 
+   - `{{29.folderHtml}}` — the folder name as a clickable link (token pill, not typed)
+   - `{{29.drawingsHtml}}` — the pre-built drawing rows (token pill, not typed)
+   - Replace `29` with your actual Iterator module number
+
    - **Row separator:** leave blank
-   - **Do not use `if()` or any Make function** — functions do not evaluate in Text
-     Aggregator text blocks; they render as literal text in the email.
 
 4. Click **OK**.
-
-> **After deploying the backend** re-run **Re-determine data structure** on the webhook
-> trigger (fire one Send DT Emails from the cockpit) so Make learns the updated payload
-> fields `folderPath` and `folderName` before selecting them as token pills.
 
 ---
 
 #### Step 3 — Gmail: Send an Email
 
-1. Add **Gmail → Send an Email** after the Text Aggregator (or open the existing one).
+1. Open the **Gmail** module.
 2. Configure:
    - **To:** `{{1.dtEmail}}`
    - **Subject:** `Drawing Flow Update — {{1.count}} drawing(s) actioned`
    - **Content type:** HTML
-   - **Body:** Build the body, inserting the Text Aggregator's `text` output token into
-     the `<tbody>`. The Text Aggregator's output appears in the mapped data panel under
-     its module number.
+   - **Body:**
 
 ```html
 <p>Hi {{1.dtName}},</p>
@@ -307,11 +311,10 @@ a `url` field containing the proper shareable Dropbox link for that folder.
       <th style="padding:8px;border:1px solid #ddd;text-align:left;">Drawing</th>
       <th style="padding:8px;border:1px solid #ddd;text-align:left;">Stage</th>
       <th style="padding:8px;border:1px solid #ddd;text-align:left;">Action</th>
-      <th style="padding:8px;border:1px solid #ddd;text-align:left;">Folder</th>
     </tr>
   </thead>
   <tbody>
-    {{TextAggregator.text}}
+    {{N.text}}
   </tbody>
 </table>
 
@@ -321,10 +324,8 @@ a `url` field containing the proper shareable Dropbox link for that folder.
 </p>
 ```
 
-   > `{{TextAggregator.text}}` is a placeholder — select the actual `text` token from the
-   > Text Aggregator module in the mapped data panel. Do not type it literally.
-   > `{{1.dtName}}` and `{{1.count}}` reference the original webhook payload (module 1) and
-   > are typed/selected normally.
+   > Replace `{{N.text}}` with the Text Aggregator's `text` token pill (your module number).
+   > `{{1.dtName}}` and `{{1.count}}` reference the original webhook payload (module 1).
 
 3. Click **OK**.
 
