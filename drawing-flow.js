@@ -508,14 +508,17 @@ module.exports = function mountDrawingFlow(app, notion) {
 
         const [folderResults, instantResults] = await Promise.all([
           Promise.all(FOLDER_STATUSES.map((s) =>
+            // Note: Notion API does not support is_not_empty filter on URL properties.
+            // Fetch all with DT Notified=false and filter client-side for Folder Link presence.
             queryAll(notion, SUBMISSIONS_DB, {
               and: [
                 { property: "Status",      select:   { equals: s     } },
                 { property: "DT Notified", checkbox: { equals: false } },
-                { property: "Folder Link", url:      { is_not_empty: true } },
               ]
             }, [{ property: "BIC Since", direction: "ascending" }])
-          )).then((r) => r.flat()),
+          )).then((r) => r.flat()
+            .filter((page) => !!getProp(page, "Folder Link", "url"))  // gate: Folder Link must be populated
+          ),
           Promise.all(INSTANT_STATUSES.map((s) =>
             queryAll(notion, SUBMISSIONS_DB, {
               and: [
@@ -959,7 +962,25 @@ module.exports = function mountDrawingFlow(app, notion) {
       }
     }
 
-    // NOTE: fireWebhook removed — DT email now batched via POST /api/df/send-dt-emails
+    // Fire webhook so Make can: (1) move the file, (2) create shared link,
+    // (3) POST the link back via /api/df/submissions/:id/folder-link.
+    // Email is NOT sent here — handled by POST /api/df/send-dt-emails.
+    fireWebhook(process.env.MAKE_ACTIONS_WEBHOOK, {
+      action:       "approve",
+      submissionId: id,
+      submissionTitle,
+      stage,
+      projectNo,
+      itemNo,
+      suffixRef,
+      reviewedAt,
+      approvedDrawingNos,
+      suffixFolderPath: dropboxMove?.toFolder ?? null,
+      ...(uploadPath  ? { uploadPath }  : {}),
+      ...(dropboxMove ? { dropboxMove } : {}),
+      dtName:  dt.name,
+      dtEmail: dt.email,
+    });
 
     console.log(`[approve] ${id} => Awaiting Issue (suffix ${suffixRef})`);
     res.json({ ok: true, reviewedAt, suffixRef, ...(dropboxMove ? { dropboxMove } : {}) });
@@ -1162,9 +1183,26 @@ module.exports = function mountDrawingFlow(app, notion) {
       } catch { /* non-fatal */ }
     }
 
-    // NOTE: fireWebhook removed — DT email now batched via POST /api/df/send-dt-emails
-    // bounceFolderPath is stored on the Submission page via Dropbox Path update above;
-    // the send-dt-emails endpoint computes it from dropboxMove.toFolder at send time.
+    // Fire webhook so Make can: (1) move the file, (2) create shared link on the Rejected folder,
+    // (3) POST the link back via /api/df/submissions/:id/folder-link.
+    // Email is NOT sent here — handled by POST /api/df/send-dt-emails.
+    fireWebhook(process.env.MAKE_ACTIONS_WEBHOOK, {
+      action:           "bounce",
+      submissionId:     id,
+      submissionTitle,
+      stage,
+      qaRound,
+      bouncedAt,
+      hasAnnotatedPdf,
+      bounceFolderPath: dropboxMove?.toFolder ?? null,
+      ...(miroLink             ? { miroLink }                                   : {}),
+      ...(annotatedDropboxPath ? { annotatedDropboxPath, annotatedPdfFilename } : {}),
+      ...(annotatedPdfBase64 && !annotatedDropboxPath ? { annotatedPdfBase64, annotatedPdfFilename } : {}),
+      ...(dropboxMove          ? { dropboxMove }                                : {}),
+      dtName:  dt.name,
+      dtEmail: dt.email,
+    });
+
     console.log(`[bounce] ${id} (path: ${annotatedDropboxPath || "none"}, base64: ${annotatedPdfBase64 ? "yes" : "no"})`);
     res.json({ ok: true, bouncedAt, ...(dropboxMove ? { dropboxMove } : {}) });
   });
