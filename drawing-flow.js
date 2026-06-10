@@ -624,6 +624,18 @@ module.exports = function mountDrawingFlow(app, notion) {
         const fullPath = toFullDropboxPath(rawPath);
         const folderPath = fullPath ? fullPath.split("/").slice(0, -1).join("/") : null;
 
+        // Dropbox web URL: https://www.dropbox.com/home + folderPath
+        // Opens the folder directly in the Dropbox web UI when clicked.
+        const folderLink = folderPath
+          ? `https://www.dropbox.com/home${folderPath}`
+          : null;
+
+        // Last segment of the path — used as the hyperlink label in the email
+        // e.g. "/DESIGN KNOW HOW/.../Rejected/R1/Suffix 112" → "Suffix 112"
+        const folderName = folderPath
+          ? folderPath.split("/").filter(Boolean).pop() ?? folderPath
+          : null;
+
         // Human-readable action label for the email
         const actionLabel = (() => {
           if (dmAction === "Bounce")     return "Bounce — returned for revision";
@@ -647,6 +659,8 @@ module.exports = function mountDrawingFlow(app, notion) {
             grade:       getProp(page, "Client Grade", "select"),
             reviewed:    getProp(page, "Reviewed",     "date"),
             folderPath,
+            folderLink,
+            folderName,
           },
         };
       }));

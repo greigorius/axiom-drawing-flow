@@ -132,27 +132,107 @@ You need to add a new route to the Router for this action.
 
 ### 2B — Add an Iterator module
 
-The payload contains a `submissions` array. You need an Iterator to loop over it and build the email body.
+The payload contains a `submissions` array. Make's `map()` function can only extract **one field at a time** — it cannot concatenate multiple fields into an HTML string inside a single expression. To build a multi-column HTML table row per submission, you need an **Iterator + Text Aggregator** pipeline.
 
-1. Add a module to the new route: search for **Flow Control** → **Iterator**.
-2. Configure:
-   - **Array:** `{{1.submissions}}`
-3. Click **OK**. This feeds one submission object at a time to the next module.
+**Module order for the dt-summary route:**
 
-However — for a **single email with multiple rows**, you do NOT want one email per submission. Instead, use Make's **Text aggregator** to build one combined email body, then send it once.
-
-**Alternative approach (simpler):** Skip the Iterator and use Make's `join()` function directly in the Gmail body to render all submissions inline.
+```
+Router (dt-summary filter)
+  → Iterator
+  → Text Aggregator (HTML rows)
+  → Gmail: Send an Email
+```
 
 ---
 
-### 2C — Add Gmail: Send an Email module
+#### Why the table may be empty — re-ingest the data structure first
 
-1. Add a **Gmail: Send an Email** module directly on the `dt-summary` route (no Iterator needed — use the approach below).
+Make learns the shape of a webhook payload the **first time it receives it**. If the scenario
+was built before `send-dt-emails` existed, Make does not yet know that module 1 outputs a
+`submissions` array of objects. The Iterator therefore has nothing to unpack and the Text
+Aggregator produces empty rows.
+
+**You must re-teach Make the data structure before mapping the Iterator fields:**
+
+1. In the scenario editor, click on the **Webhook** trigger module (module 1).
+2. Click **Re-determine data structure**.
+3. Leave this dialog open — Make is now listening.
+4. Go to the cockpit, uncheck `DT Notified` on one or two Submissions in Notion, then click
+   **Send DT Emails**. This fires a live `dt-summary` webhook payload to Make.
+5. Make detects the payload and shows "Successfully determined" — click **OK**.
+6. Module 1 now knows the full structure including `submissions[]` with all its child fields.
+
+After this, open the **Iterator** module — the `Array` field dropdown will now show
+`1.submissions` as a selectable mapped array. Select it and save.
+
+Then open the **Text Aggregator** — the field picker will show the Iterator's output fields
+(`drawingNo`, `stage`, `actionLabel`, `folderPath`, etc.) as selectable tokens. Re-map them.
+
+---
+
+#### Step 1 — Iterator
+
+1. Add **Flow Control → Iterator** to the dt-summary route (or open the existing one).
+2. Configure:
+   - **Array:** click the field, select `{{1.submissions}}` from the mapped data panel
+     (only visible after re-ingesting the data structure above)
+3. Click **OK**.
+
+The Iterator outputs one submission bundle at a time. Note the module number Make assigned
+(visible in the top-left corner of the module bubble) — you'll use it in the next step.
+
+---
+
+#### Step 2 — Text Aggregator (builds the table rows)
+
+1. Add **Flow Control → Text Aggregator** after the Iterator (or open the existing one).
+2. Configure:
+   - **Source module:** select the Iterator module from the dropdown
+   - **Text:** Build the row by clicking into the field and selecting each token from the
+     mapped data panel. The Iterator's output fields (`drawingNo`, `stage`, `actionLabel`,
+     `folderPath`) will appear under the Iterator's module number in the panel.
+
+     The completed Text field should look like this (using the Iterator's module number,
+     shown here as `N`):
+
+```html
+<tr>
+  <td style="padding:8px;border:1px solid #ddd;">{{N.drawingNo}}</td>
+  <td style="padding:8px;border:1px solid #ddd;">{{N.stage}}</td>
+  <td style="padding:8px;border:1px solid #ddd;">{{N.actionLabel}}</td>
+  <td style="padding:8px;border:1px solid #ddd;">
+    {{if(N.folderLink; "<a href=\"" + N.folderLink + "\">" + N.folderName + "</a>"; "—")}}
+  </td>
+</tr>
+```
+
+   The Folder column renders as a hyperlink labelled with just the last folder segment
+   (e.g. **Suffix 112**, **R1**, **Suffix 022**) linking to the Dropbox web URL.
+   If no folder path exists the cell shows `—`.
+
+   - **Row separator:** leave blank
+
+3. Click **OK**. The aggregator outputs a single `text` variable.
+
+> **Do not type `N` literally.** Select each field as a token pill from the mapped data panel.
+> The number Make shows (e.g. `20`, `21`) is auto-assigned and varies per scenario.
+>
+> **After the backend deploys** you must re-run **Re-determine data structure** on the webhook
+> trigger once more — the payload now includes two new fields (`folderLink`, `folderName`) that
+> Make needs to learn before they appear as selectable tokens in the Iterator output.
+
+---
+
+#### Step 3 — Gmail: Send an Email
+
+1. Add **Gmail → Send an Email** after the Text Aggregator (or open the existing one).
 2. Configure:
    - **To:** `{{1.dtEmail}}`
    - **Subject:** `Drawing Flow Update — {{1.count}} drawing(s) actioned`
    - **Content type:** HTML
-   - **Body:**
+   - **Body:** Build the body, inserting the Text Aggregator's `text` output token into
+     the `<tbody>`. The Text Aggregator's output appears in the mapped data panel under
+     its module number.
 
 ```html
 <p>Hi {{1.dtName}},</p>
@@ -165,11 +245,11 @@ However — for a **single email with multiple rows**, you do NOT want one email
       <th style="padding:8px;border:1px solid #ddd;text-align:left;">Drawing</th>
       <th style="padding:8px;border:1px solid #ddd;text-align:left;">Stage</th>
       <th style="padding:8px;border:1px solid #ddd;text-align:left;">Action</th>
-      <th style="padding:8px;border:1px solid #ddd;text-align:left;">Folder / Notes</th>
+      <th style="padding:8px;border:1px solid #ddd;text-align:left;">Folder</th>
     </tr>
   </thead>
   <tbody>
-    {{join(map(1.submissions; "<tr><td style='padding:8px;border:1px solid #ddd;'>" + item.drawingNo + "</td><td style='padding:8px;border:1px solid #ddd;'>" + item.stage + "</td><td style='padding:8px;border:1px solid #ddd;'>" + item.actionLabel + "</td><td style='padding:8px;border:1px solid #ddd;'>" + ifempty(item.folderPath; "—") + "</td></tr>"); "")}}
+    {{TextAggregator.text}}
   </tbody>
 </table>
 
@@ -179,35 +259,12 @@ However — for a **single email with multiple rows**, you do NOT want one email
 </p>
 ```
 
-> **Note on the `map()` / `join()` approach:** Make supports mapping over arrays in text fields using the `map()` function. If your Make plan does not support this function, use the **Iterator + Text Aggregator + Gmail** three-module approach instead (see below).
+   > `{{TextAggregator.text}}` is a placeholder — select the actual `text` token from the
+   > Text Aggregator module in the mapped data panel. Do not type it literally.
+   > `{{1.dtName}}` and `{{1.count}}` reference the original webhook payload (module 1) and
+   > are typed/selected normally.
 
----
-
-### 2D — Iterator + Text Aggregator approach (if map/join not available)
-
-If the `map()` function doesn't work in your Make plan:
-
-1. Add **Flow Control: Iterator** — Array: `{{1.submissions}}`
-2. Add **Flow Control: Text Aggregator** after the iterator:
-   - Source module: the Iterator module
-   - Text: 
-     ```
-     {{iterator.drawingNo}} | {{iterator.stage}} | {{iterator.actionLabel}} | {{iterator.folderPath}}
-     ```
-   - Row separator: `\n`
-3. Add **Gmail: Send an Email** after the Text Aggregator:
-   - **To:** `{{1.dtEmail}}`
-   - **Subject:** `Drawing Flow Update — {{1.count}} drawing(s) actioned`
-   - **Body:** 
-     ```
-     Hi {{1.dtName}},
-
-     The following drawings have been actioned:
-
-     {{aggregator.text}}
-
-     — Axiom Drawing Management
-     ```
+3. Click **OK**.
 
 ---
 
