@@ -624,17 +624,27 @@ module.exports = function mountDrawingFlow(app, notion) {
         const fullPath = toFullDropboxPath(rawPath);
         const folderPath = fullPath ? fullPath.split("/").slice(0, -1).join("/") : null;
 
-        // Dropbox web URL: https://www.dropbox.com/home + folderPath
-        // Opens the folder directly in the Dropbox web UI when clicked.
-        const folderLink = folderPath
-          ? `https://www.dropbox.com/home${folderPath}`
-          : null;
-
         // Last segment of the path — used as the hyperlink label in the email
         // e.g. "/DESIGN KNOW HOW/.../Rejected/R1/Suffix 112" → "Suffix 112"
         const folderName = folderPath
           ? folderPath.split("/").filter(Boolean).pop() ?? folderPath
           : null;
+
+        // Dropbox web URL with each path segment individually encoded so spaces
+        // become %20 and the URL doesn't break in email clients.
+        // encodeURIComponent encodes each segment; the slashes are added back manually.
+        const folderLink = folderPath
+          ? "https://www.dropbox.com/home" +
+            folderPath.split("/")
+              .map((seg) => seg ? encodeURIComponent(seg) : "")
+              .join("/")
+          : null;
+
+        // Pre-built HTML anchor — the Text Aggregator drops this in as a single token,
+        // no Make if() function needed (functions don't evaluate in Aggregator text blocks).
+        const folderHtml = folderLink && folderName
+          ? `<a href="${folderLink}" style="color:#4f7fff;">${folderName}</a>`
+          : "—";
 
         // Human-readable action label for the email
         const actionLabel = (() => {
@@ -658,9 +668,7 @@ module.exports = function mountDrawingFlow(app, notion) {
             qaRound:     getProp(page, "QA Round",     "number"),
             grade:       getProp(page, "Client Grade", "select"),
             reviewed:    getProp(page, "Reviewed",     "date"),
-            folderPath,
-            folderLink,
-            folderName,
+            folderHtml,
           },
         };
       }));

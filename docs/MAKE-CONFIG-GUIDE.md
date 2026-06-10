@@ -193,33 +193,40 @@ The Iterator outputs one submission bundle at a time. Note the module number Mak
      `folderPath`) will appear under the Iterator's module number in the panel.
 
      The completed Text field should look like this (using the Iterator's module number,
-     shown here as `N`):
+     shown here as `N` — yours is `29`):
 
 ```html
 <tr>
   <td style="padding:8px;border:1px solid #ddd;">{{N.drawingNo}}</td>
   <td style="padding:8px;border:1px solid #ddd;">{{N.stage}}</td>
   <td style="padding:8px;border:1px solid #ddd;">{{N.actionLabel}}</td>
-  <td style="padding:8px;border:1px solid #ddd;">
-    {{if(N.folderLink; "<a href=\"" + N.folderLink + "\">" + N.folderName + "</a>"; "—")}}
-  </td>
+  <td style="padding:8px;border:1px solid #ddd;">{{N.folderHtml}}</td>
 </tr>
 ```
 
-   The Folder column renders as a hyperlink labelled with just the last folder segment
-   (e.g. **Suffix 112**, **R1**, **Suffix 022**) linking to the Dropbox web URL.
-   If no folder path exists the cell shows `—`.
+   **The fourth `<td>` is the Folder column.** Replace everything between `>` and `</td>`
+   in that cell with a single `{{N.folderHtml}}` token pill.
+
+   - `folderHtml` is a pre-built HTML anchor string from the backend, e.g.:
+     `<a href="https://www.dropbox.com/home/DESIGN%20KNOW%20HOW/...">Suffix 112</a>`
+   - The link label is just the last folder segment (**Suffix 112**, **R1**, etc.)
+   - The URL has all spaces encoded as `%20` so it doesn't break in email clients
+   - If no folder exists the backend sends `—` so no Make `if()` function is needed
+
+   **Do not use `if()`, `ifempty()`, or any Make function in this cell.** Make functions
+   do not evaluate inside Text Aggregator text blocks — they render as literal text.
+   All logic is handled in the backend before the webhook fires.
 
    - **Row separator:** leave blank
 
 3. Click **OK**. The aggregator outputs a single `text` variable.
 
 > **Do not type `N` literally.** Select each field as a token pill from the mapped data panel.
-> The number Make shows (e.g. `20`, `21`) is auto-assigned and varies per scenario.
+> The number Make shows is auto-assigned — based on your scenario it is `29`.
 >
-> **After the backend deploys** you must re-run **Re-determine data structure** on the webhook
-> trigger once more — the payload now includes two new fields (`folderLink`, `folderName`) that
-> Make needs to learn before they appear as selectable tokens in the Iterator output.
+> **After deploying the backend** re-run **Re-determine data structure** on the webhook trigger
+> (fire one Send DT Emails from the cockpit) so Make learns the new `folderHtml` field.
+> Then come back and replace the fourth `<td>` content with the `29.folderHtml` token pill.
 
 ---
 
