@@ -626,25 +626,10 @@ module.exports = function mountDrawingFlow(app, notion) {
 
         // Last segment of the path — used as the hyperlink label in the email
         // e.g. "/DESIGN KNOW HOW/.../Rejected/R1/Suffix 112" → "Suffix 112"
+        // Make uses folderName as the anchor label after generating a proper shared link.
         const folderName = folderPath
           ? folderPath.split("/").filter(Boolean).pop() ?? folderPath
           : null;
-
-        // Dropbox web URL with each path segment individually encoded so spaces
-        // become %20 and the URL doesn't break in email clients.
-        // encodeURIComponent encodes each segment; the slashes are added back manually.
-        const folderLink = folderPath
-          ? "https://www.dropbox.com/home" +
-            folderPath.split("/")
-              .map((seg) => seg ? encodeURIComponent(seg) : "")
-              .join("/")
-          : null;
-
-        // Pre-built HTML anchor — the Text Aggregator drops this in as a single token,
-        // no Make if() function needed (functions don't evaluate in Aggregator text blocks).
-        const folderHtml = folderLink && folderName
-          ? `<a href="${folderLink}" style="color:#4f7fff;">${folderName}</a>`
-          : "—";
 
         // Human-readable action label for the email
         const actionLabel = (() => {
@@ -668,7 +653,8 @@ module.exports = function mountDrawingFlow(app, notion) {
             qaRound:     getProp(page, "QA Round",     "number"),
             grade:       getProp(page, "Client Grade", "select"),
             reviewed:    getProp(page, "Reviewed",     "date"),
-            folderHtml,
+            folderPath,
+            folderName,
           },
         };
       }));
@@ -682,21 +668,42 @@ module.exports = function mountDrawingFlow(app, notion) {
         byDT[key].pageIds.push(item.pageId);
       }
 
-      // Fire one webhook per DT
+      // Fire one webhook per DT — awaited so we can log Make's response status
       let emailsSent = 0;
+      const webhookResults = [];
+      const webhookUrl = process.env.MAKE_ACTIONS_WEBHOOK;
+
+      console.log(`[send-dt-emails] Webhook URL: ${webhookUrl ? webhookUrl.slice(0, 60) + "…" : "NOT SET"}`);
+      console.log(`[send-dt-emails] DT groups: ${Object.keys(byDT).join(", ") || "none"}`);
+
       for (const group of Object.values(byDT)) {
         if (!group.dtEmail) {
-          console.warn(`[send-dt-emails] No email for DT "${group.dtName}" — skipping`);
+          console.warn(`[send-dt-emails] Skipping DT "${group.dtName}" — no email address resolved`);
+          webhookResults.push({ dtName: group.dtName, skipped: true, reason: "no email" });
           continue;
         }
-        fireWebhook(process.env.MAKE_ACTIONS_WEBHOOK, {
+        const payload = {
           action:      "dt-summary",
           dtName:      group.dtName,
           dtEmail:     group.dtEmail,
           submissions: group.submissions,
           count:       group.submissions.length,
-        });
-        emailsSent++;
+        };
+        console.log(`[send-dt-emails] Firing webhook → ${group.dtEmail} (${group.submissions.length} submission(s))`);
+        try {
+          const r = await fetch(webhookUrl, {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify(payload),
+          });
+          const responseText = await r.text().catch(() => "");
+          console.log(`[send-dt-emails] Make response: ${r.status} — "${responseText}"`);
+          webhookResults.push({ dtEmail: group.dtEmail, status: r.status, response: responseText, ok: r.ok });
+          if (r.ok) emailsSent++;
+        } catch (err) {
+          console.error(`[send-dt-emails] Webhook POST failed for ${group.dtEmail}:`, err.message);
+          webhookResults.push({ dtEmail: group.dtEmail, error: err.message });
+        }
       }
 
       // Mark all included submissions as DT Notified = true
@@ -707,10 +714,57 @@ module.exports = function mountDrawingFlow(app, notion) {
         }}).catch((e) => console.warn(`[send-dt-emails] Notion update failed ${pid}:`, e.message))
       ));
 
-      console.log(`[send-dt-emails] Fired ${emailsSent} webhook(s) for ${allPageIds.length} submission(s)`);
-      res.json({ ok: true, emailsSent, submissionsNotified: allPageIds.length });
+      console.log(`[send-dt-emails] Done — ${emailsSent} webhook(s) accepted, ${allPageIds.length} submission(s) marked notified`);
+      res.json({ ok: true, emailsSent, submissionsNotified: allPageIds.length, webhookResults });
     } catch (err) {
       console.error("[send-dt-emails]", err);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // POST /api/df/test-webhook
+  // Diagnostic endpoint — fires a minimal dt-summary test payload to MAKE_ACTIONS_WEBHOOK
+  // and returns Make's raw response. Use to confirm the webhook URL and Make route are working
+  // independently of real submission data.
+  // Usage: POST /api/df/test-webhook   (no body required)
+
+  app.post("/api/df/test-webhook", async (req, res) => {
+    const webhookUrl = process.env.MAKE_ACTIONS_WEBHOOK;
+    if (!webhookUrl) return res.status(500).json({ ok: false, error: "MAKE_ACTIONS_WEBHOOK env var not set" });
+
+    const testPayload = {
+      action:      "dt-summary",
+      dtName:      "Test DT",
+      dtEmail:     req.body?.testEmail || "test@example.com",
+      submissions: [
+        {
+          submissionTitle: "TEST-001_A-101_S4_R1",
+          drawingNo:       "A-101",
+          stage:           "S4",
+          status:          "Approved",
+          dmAction:        "Approve",
+          actionLabel:     "QA Approved",
+          qaRound:         1,
+          grade:           null,
+          folderPath:      "/DESIGN KNOW HOW/TMJ Interiors/Drawing Submissions/TEST/S4/Suffix 001",
+          folderName:      "Suffix 001",
+        },
+      ],
+      count: 1,
+    };
+
+    try {
+      console.log(`[test-webhook] Firing test payload to ${webhookUrl.slice(0, 60)}…`);
+      const r = await fetch(webhookUrl, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify(testPayload),
+      });
+      const responseText = await r.text().catch(() => "");
+      console.log(`[test-webhook] Make response: ${r.status} — "${responseText}"`);
+      res.json({ ok: r.ok, status: r.status, makeResponse: responseText, payloadSent: testPayload });
+    } catch (err) {
+      console.error("[test-webhook]", err.message);
       res.status(500).json({ ok: false, error: err.message });
     }
   });
