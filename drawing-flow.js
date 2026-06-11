@@ -806,7 +806,7 @@ module.exports = function mountDrawingFlow(app, notion) {
           folderBlocks: group.folderBlocks,  // array of { folderHtml, drawingsHtml, drawingCount }
           count:        totalCount,
         };
-        console.log(`[send-dt-emails] Firing webhook → ${group.dtEmail} (${group.submissions.length} submission(s))`);
+        console.log(`[send-dt-emails] Firing webhook → ${group.dtEmail} (${group.pageIds.length} submission(s))`);
         try {
           const r = await fetch(webhookUrl, {
             method:  "POST",
