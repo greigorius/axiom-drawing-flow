@@ -775,9 +775,20 @@ module.exports = function mountDrawingFlow(app, notion) {
             </tr>`
           ).join("");
 
+          // Instruction row — derive from the first drawing's actionLabel (all drawings in a folder share the same action)
+          const firstAction = folder.drawings[0]?.actionLabel ?? "";
+          const instruction = firstAction === "QA Approved"
+            ? "Upload dwg's to the Item folder link"
+            : firstAction.startsWith("Bounced")
+              ? "Commented drawings are in the Item folder link. Revise drawings to comments and re-upload PDF's to the 'Pending' folder for further review."
+              : null;
+          const instructionRow = instruction
+            ? `<tr><td colspan="3" style="padding:4px 8px 10px;font-size:12px;color:#888;font-style:italic;">${instruction}</td></tr>`
+            : "";
+
           return {
             folderHtml: linkHtml,
-            drawingsHtml: drawingRows,
+            drawingsHtml: drawingRows + instructionRow,
             drawingCount: folder.drawings.length,
           };
         });
