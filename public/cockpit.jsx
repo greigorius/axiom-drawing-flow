@@ -412,6 +412,7 @@ const Cockpit = () => {
   const [bounceTarget,         setBounceTarget]         = useState(null);
   const [issueTarget,          setIssueTarget]          = useState(null);
   const [logStatusTarget,      setLogStatusTarget]      = useState(null);
+  const [scanning,             setScanning]             = useState(false);
 
   // Multi-select: single Set shared across all sections; sections filter to their own IDs
   const [selectedIds, setSelectedIds] = useState(new Set());
@@ -627,6 +628,17 @@ const Cockpit = () => {
     }
   };
 
+  const handleScanPending = async () => {
+    setScanning(true);
+    try {
+      await fetch("/api/df/scan-pending", { method: "POST" });
+      // Give Make ~8s to run the scenario before refreshing
+      setTimeout(() => { fetchQueue(true); setScanning(false); }, 8000);
+    } catch {
+      setScanning(false);
+    }
+  };
+
   // ── Render ───────────────────────────────────────────────────────────────
   const total = submitted.length + awaitingIssue.length + issued.length;
 
@@ -646,6 +658,14 @@ const Cockpit = () => {
           {sendEmailResult === "error" && (
             <span className="send-result error">Send failed</span>
           )}
+          <button
+            className="btn btn-secondary btn-sm"
+            onClick={handleScanPending}
+            disabled={scanning}
+            title="Trigger Make ingest scenario to pick up new Dropbox submissions"
+          >
+            {scanning ? "Scanning…" : "⟳ Scan Pending"}
+          </button>
           <button
             className="btn btn-primary"
             onClick={handleSendDTEmails}

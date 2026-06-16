@@ -1414,4 +1414,35 @@ module.exports = function mountDrawingFlow(app, notion) {
     }
   });
 
+  // POST /api/df/scan-pending
+  // Triggers Make Scenario 1 (Ingest) to run immediately via the Make API.
+  // Called by the cockpit "Scan Pending" button.
+
+  app.post("/api/df/scan-pending", async (req, res) => {
+    const scenarioId = process.env.MAKE_SCENARIO_ID;
+    const apiKey     = process.env.MAKE_API_KEY;
+    const apiZone    = process.env.MAKE_API_ZONE || "eu1";
+
+    if (!scenarioId || !apiKey) {
+      return res.status(503).json({ ok: false, error: "MAKE_SCENARIO_ID or MAKE_API_KEY not configured" });
+    }
+
+    try {
+      const r = await fetch(`https://${apiZone}.make.com/api/v2/scenarios/${scenarioId}/run`, {
+        method:  "POST",
+        headers: { "Authorization": `Token ${apiKey}`, "Content-Type": "application/json" },
+      });
+      if (!r.ok) {
+        const body = await r.text();
+        return res.status(502).json({ ok: false, error: `Make API ${r.status}`, detail: body });
+      }
+      const data = await r.json();
+      console.log(`[scan-pending] Triggered scenario ${scenarioId}`);
+      return res.json({ ok: true, executionId: data.executionId ?? null });
+    } catch (err) {
+      console.error("[scan-pending]", err);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
 };
