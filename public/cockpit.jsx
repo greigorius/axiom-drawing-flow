@@ -634,7 +634,7 @@ const Cockpit = () => {
       await fetch("/api/df/scan-pending", { method: "POST" });
       // Give Make ~8s to run the scenario before refreshing
       setTimeout(() => { fetchQueue(true); setScanning(false); }, 8000);
-    } catch {
+    } catch (err) {
       setScanning(false);
     }
   };
