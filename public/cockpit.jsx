@@ -413,6 +413,8 @@ const Cockpit = () => {
   const [issueTarget,          setIssueTarget]          = useState(null);
   const [logStatusTarget,      setLogStatusTarget]      = useState(null);
   const [scanning,             setScanning]             = useState(false);
+  const [scanResult,           setScanResult]           = useState(null);  // "ok" | "error" | null
+  const [scanError,            setScanError]            = useState(null);
 
   // Multi-select: single Set shared across all sections; sections filter to their own IDs
   const [selectedIds, setSelectedIds] = useState(new Set());
@@ -630,12 +632,26 @@ const Cockpit = () => {
 
   const handleScanPending = async () => {
     setScanning(true);
+    setScanResult(null);
+    setScanError(null);
     try {
-      await fetch("/api/df/scan-pending", { method: "POST" });
-      // Give Make ~8s to run the scenario before refreshing
-      setTimeout(() => { fetchQueue(true); setScanning(false); }, 8000);
+      const res  = await fetch("/api/df/scan-pending", { method: "POST" });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setScanResult("error");
+        setScanError(body.error || `HTTP ${res.status}`);
+        setScanning(false);
+        setTimeout(() => setScanResult(null), 8000);
+        return;
+      }
+      setScanResult("ok");
+      // Give Make ~8s to run before refreshing queue
+      setTimeout(() => { fetchQueue(true); setScanning(false); setScanResult(null); }, 8000);
     } catch (err) {
+      setScanResult("error");
+      setScanError(err.message || "Network error");
       setScanning(false);
+      setTimeout(() => setScanResult(null), 8000);
     }
   };
 
@@ -658,14 +674,24 @@ const Cockpit = () => {
           {sendEmailResult === "error" && (
             <span className="send-result error">Send failed</span>
           )}
-          <button
-            className="btn btn-secondary btn-sm"
-            onClick={handleScanPending}
-            disabled={scanning}
-            title="Trigger Make ingest scenario to pick up new Dropbox submissions"
-          >
-            {scanning ? "Scanning…" : "⟳ Scan Pending"}
-          </button>
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 2 }}>
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={handleScanPending}
+              disabled={scanning}
+              title="Trigger Make ingest scenario to pick up new Dropbox submissions"
+            >
+              {scanning && scanResult !== "error" ? "Scanning…" : "⟳ Scan Pending"}
+            </button>
+            {scanResult === "ok" && (
+              <span style={{ fontSize: 11, color: "var(--success)" }}>Triggered — refreshing in 8s…</span>
+            )}
+            {scanResult === "error" && (
+              <span style={{ fontSize: 11, color: "var(--danger)" }} title={scanError}>
+                ✕ {scanError || "Scan failed"}
+              </span>
+            )}
+          </div>
           <button
             className="btn btn-primary"
             onClick={handleSendDTEmails}
