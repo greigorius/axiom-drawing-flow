@@ -1434,7 +1434,9 @@ module.exports = function mountDrawingFlow(app, notion) {
       });
       if (!r.ok) {
         const body = await r.text();
-        return res.status(502).json({ ok: false, error: `Make API ${r.status}`, detail: body });
+        let detail = body;
+        try { detail = JSON.parse(body)?.message || JSON.parse(body)?.error || body; } catch (_e) {}
+        return res.status(502).json({ ok: false, error: `Make ${r.status}: ${detail}` });
       }
       const data = await r.json();
       console.log(`[scan-pending] Triggered scenario ${scenarioId}`);
