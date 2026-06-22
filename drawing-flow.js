@@ -78,8 +78,38 @@ const STAGE_LOG_STATUS_MAP = {
 const BIC = {
   SUBMITTED: "DM",
   BOUNCED:   "DT",
-  GRADED:    "DT",
+  GRADED:    "DM",   // DM holds BIC until grade email is fired, then switches to DT
 };
+
+// ── Working-days helper ──────────────────────────────────────────────────────
+function addWorkingDays(dateStr, days) {
+  const d = new Date(dateStr);
+  let added = 0;
+  while (added < days) {
+    d.setDate(d.getDate() + 1);
+    const dow = d.getDay();
+    if (dow !== 0 && dow !== 6) added++;   // skip Sat & Sun
+  }
+  return d.toISOString().slice(0, 10);
+}
+
+// ── Resolve revision days from Projects DB via Drawing → Item → Project chain ─
+async function getRevisionDays(notion, drawingPageIds) {
+  try {
+    if (!drawingPageIds?.length) return 7;
+    const drawing    = await notion.pages.retrieve({ page_id: drawingPageIds[0] });
+    const taskIds    = getProp(drawing, "Item",    "relation");
+    if (!taskIds?.length) return 7;
+    const task       = await notion.pages.retrieve({ page_id: taskIds[0] });
+    const projectIds = getProp(task,    "Project", "relation");
+    if (!projectIds?.length) return 7;
+    const project    = await notion.pages.retrieve({ page_id: projectIds[0] });
+    return getProp(project, "Revision Days", "number") ?? 7;
+  } catch (err) {
+    console.warn("[getRevisionDays] Falling back to 7:", err.message);
+    return 7;
+  }
+}
 
 // Approval Days, Revision Days, C01 Sign Off Days are project-level — stored in Projects DB.
 const INPUTS_FIELDS = [
@@ -850,6 +880,194 @@ module.exports = function mountDrawingFlow(app, notion) {
     }
   });
 
+  // POST /api/df/send-grade-emails
+  // Groups all Graded + DT Notified=false submissions by DT, fires one grade-summary
+  // webhook per DT, then sets BIC→DT and DT Notified=true on each submission.
+
+  app.post("/api/df/send-grade-emails", async (req, res) => {
+    try {
+      const results = await queryAll(notion, SUBMISSIONS_DB, {
+        and: [
+          { property: "Status",      select:   { equals: "Graded" } },
+          { property: "DT Notified", checkbox: { equals: false    } },
+        ],
+      });
+
+      if (!results.length) {
+        return res.json({ ok: true, emailsSent: 0, submissionsNotified: 0, message: "Nothing pending" });
+      }
+
+      const enriched = await Promise.all(results.map(async (page) => {
+        const title      = getProp(page, "Submission",   "title");
+        const stage      = getProp(page, "Stage",        "select");
+        const grade      = getProp(page, "Client Grade", "select") ?? "—";
+        const revision   = getProp(page, "Rev",          "select") ?? "";
+        const reviewed   = getProp(page, "Reviewed",     "date");
+        const dtIds      = getProp(page, "DT",           "relation");
+        const drawingIds = getProp(page, "Drawing",      "relation");
+        const rawPath    = getProp(page, "Dropbox Path", "url");
+
+        const { drawingNo } = parseSubmissionTitle(title, stage);
+        const dt = await resolveDT(notion, dtIds);
+
+        // Derive Grade Returns folder path from submission's Dropbox path
+        // path: /Drawing Submissions/{project}/{stage}/Pending/{file}
+        // Grade Returns: /Drawing Submissions/{project}/{stage}/Grade Returns/
+        let gradeReturnsPath = null;
+        if (rawPath) {
+          const full   = toFullDropboxPath(rawPath);
+          const segs   = full ? full.split("/").filter(Boolean) : [];
+          // segs: ["Drawing Submissions", project, stage, "Pending", file]
+          const stageIdx = segs.findIndex((s) => ["S3","S4","S5","A4.5","AB"].includes(s.toUpperCase()));
+          if (stageIdx !== -1) {
+            gradeReturnsPath = "/" + segs.slice(0, stageIdx + 1).join("/") + "/Grade Returns";
+          }
+        }
+
+        // Action label based on grade and revision
+        const isProductionRev = revision.toUpperCase().startsWith("C");
+        const action = grade === "C"
+          ? "Review this drawing with the DM — do not revise independently"
+          : grade === "NA"
+            ? "Not applicable — no action required"
+            : isProductionRev
+              ? "Update drawings for production"
+              : "Update to next revision";
+
+        // Completion date: return date + revision days from Projects DB
+        const returnDate    = reviewed || gradedAt;
+        const revisionDays  = await getRevisionDays(notion, drawingIds);
+        const completionDate = addWorkingDays(returnDate, revisionDays);
+
+        return {
+          pageId: page.id,
+          dtName: dt.name,
+          dtEmail: dt.email,
+          gradeReturnsPath,
+          drawingNo,
+          stage,
+          grade,
+          revision,
+          action,
+          returnDate,
+          completionDate,
+          revisionDays,
+        };
+      }));
+
+      // Group by DT → by gradeReturnsPath (project+stage bucket)
+      const byDT = {};
+      for (const item of enriched) {
+        const dtKey = item.dtEmail || item.dtName || "unknown";
+        if (!byDT[dtKey]) byDT[dtKey] = { dtName: item.dtName, dtEmail: item.dtEmail, buckets: {}, pageIds: [] };
+        const bucketKey = item.gradeReturnsPath || "_no_path";
+        if (!byDT[dtKey].buckets[bucketKey]) {
+          byDT[dtKey].buckets[bucketKey] = { gradeReturnsPath: item.gradeReturnsPath, drawings: [] };
+        }
+        byDT[dtKey].buckets[bucketKey].drawings.push(item);
+        byDT[dtKey].pageIds.push(item.pageId);
+      }
+
+      // Build folderBlocks per DT (matches dt-summary email structure)
+      for (const group of Object.values(byDT)) {
+        group.folderBlocks = Object.values(group.buckets).map((bucket) => {
+          const pathText    = bucket.gradeReturnsPath || "Grade Returns folder";
+          const folderHtml  = `<strong>${pathText}</strong>`;
+
+          const filenameFormatNote =
+            `<tr><td colspan="5" style="padding:4px 8px 10px;font-size:11px;color:#888;font-style:italic;">` +
+            `Files in this folder are named: <code>{SuffixNo}_{DrawingNo}_{Rev}_{Grade}_{YYMMDD}.pdf</code>` +
+            `</td></tr>`;
+
+          const drawingRows = bucket.drawings.map((d) =>
+            `<tr>
+              <td style="padding:4px 8px;color:#333;">${d.drawingNo || "—"}</td>
+              <td style="padding:4px 8px;color:#555;">${d.stage}</td>
+              <td style="padding:4px 8px;color:#555;">${d.revision}</td>
+              <td style="padding:4px 8px;font-weight:600;color:#333;">${d.grade}</td>
+              <td style="padding:4px 8px;color:#555;">${d.action}</td>
+              <td style="padding:4px 8px;color:#555;">${d.completionDate}</td>
+            </tr>`
+          ).join("") + filenameFormatNote;
+
+          return {
+            folderHtml,
+            drawingsHtml: drawingRows,
+            drawingCount: bucket.drawings.length,
+          };
+        });
+      }
+
+      // Fire one webhook per DT
+      let emailsSent = 0;
+      const webhookResults = [];
+      const webhookUrl = process.env.MAKE_ACTIONS_WEBHOOK;
+
+      for (const group of Object.values(byDT)) {
+        if (!group.dtEmail) {
+          console.warn(`[send-grade-emails] Skipping DT "${group.dtName}" — no email`);
+          webhookResults.push({ dtName: group.dtName, skipped: true, reason: "no email" });
+          continue;
+        }
+        const totalCount = group.folderBlocks.reduce((n, b) => n + b.drawingCount, 0);
+        const payload = {
+          action:       "grade-summary",
+          dtName:       group.dtName,
+          dtEmail:      group.dtEmail,
+          folderBlocks: group.folderBlocks,
+          count:        totalCount,
+        };
+        try {
+          const r = await fetch(webhookUrl, {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify(payload),
+          });
+          const responseText = await r.text().catch(() => "");
+          webhookResults.push({ dtEmail: group.dtEmail, status: r.status, ok: r.ok });
+          if (r.ok) emailsSent++;
+        } catch (err) {
+          console.error(`[send-grade-emails] Webhook failed for ${group.dtEmail}:`, err.message);
+          webhookResults.push({ dtEmail: group.dtEmail, error: err.message });
+        }
+      }
+
+      // Mark notified: BIC → DT, DT Notified → true
+      const allPageIds = Object.values(byDT).flatMap((g) => g.pageIds);
+      const notifiedAt = now();
+      await Promise.all(allPageIds.map((pid) =>
+        notion.pages.update({ page_id: pid, properties: {
+          "DT Notified":   { checkbox: true                    },
+          "Ball In Court": { select:   { name: "DT"           } },
+          "BIC Since":     { date:     { start: notifiedAt    } },
+        }}).catch((e) => console.warn(`[send-grade-emails] Notion update failed ${pid}:`, e.message))
+      ));
+
+      console.log(`[send-grade-emails] Done — ${emailsSent} webhook(s), ${allPageIds.length} submission(s) notified`);
+      res.json({ ok: true, emailsSent, submissionsNotified: allPageIds.length, webhookResults });
+    } catch (err) {
+      console.error("[send-grade-emails]", err);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // PATCH /api/df/submissions/:id/hold
+  // Toggles the Blocked checkbox on a submission. Blocked rows are highlighted in the cockpit.
+
+  app.patch("/api/df/submissions/:id/hold", async (req, res) => {
+    const { id } = req.params;
+    const { blocked } = req.body;   // boolean
+    try {
+      await notion.pages.update({ page_id: id, properties: {
+        "Blocked": { checkbox: !!blocked },
+      }});
+      res.json({ ok: true, blocked: !!blocked });
+    } catch (err) {
+      console.error("[hold]", err);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
   // POST /api/df/test-webhook
   // Diagnostic endpoint — fires a minimal dt-summary test payload to MAKE_ACTIONS_WEBHOOK
   // and returns Make's raw response. Use to confirm the webhook URL and Make route are working
@@ -1223,12 +1441,13 @@ module.exports = function mountDrawingFlow(app, notion) {
 
   app.patch("/api/df/submissions/:id/log-status", async (req, res) => {
     const { id } = req.params;
-    const { grade } = req.body;
+    const { grade, returnDate } = req.body;   // returnDate = date filed on project system (YYYY-MM-DD)
     let submissionPage;
     try { submissionPage = await notion.pages.retrieve({ page_id: id }); }
-    catch { return res.status(404).json({ ok: false, error: "Submission not found" }); }
+    catch (_e) { return res.status(404).json({ ok: false, error: "Submission not found" }); }
 
     const stage    = getProp(submissionPage, "Stage",   "select");
+    const revision = getProp(submissionPage, "Rev",     "select") ?? "";
     const stageMap = STAGE_LOG_STATUS_MAP[stage];
 
     if (!stageMap || !stageMap.supported) {
@@ -1238,13 +1457,22 @@ module.exports = function mountDrawingFlow(app, notion) {
       return res.status(400).json({ ok: false, error: `Invalid grade "${grade}" for ${stage}. Valid: ${stageMap.grades.join(", ")}` });
     }
 
-    const drawingIds    = getProp(submissionPage, "Drawing", "relation");
-    const gradedAt      = now();
-    const isTerminalAB  = stage === "AB"   && grade === "Approved";
-    const isA45Approved = stage === "A4.5" && grade === "Approved";
-    const drawingStatus = isTerminalAB ? "Complete" : isA45Approved ? "Schedule" : "Approval Updates";
-    // Terminal AB → clear BIC; A4.5 Approved → back to DM; all others → DT
-    const newBIC        = isTerminalAB ? null : isA45Approved ? "DM" : BIC.GRADED;
+    const drawingIds       = getProp(submissionPage, "Drawing", "relation");
+    const gradedAt         = now();
+    const statusDate       = returnDate || gradedAt;   // prefer project-system date over today
+
+    const isTerminalAB     = stage === "AB"   && grade === "Approved";
+    const isA45Approved    = stage === "A4.5" && grade === "Approved";
+    const isProductionRev  = revision.toUpperCase().startsWith("C");
+
+    // Drawing Status: terminal stages override; otherwise use revision prefix
+    const drawingStatus = isTerminalAB  ? "Complete"
+                        : isA45Approved ? "Schedule"
+                        : isProductionRev ? "Production Updates"
+                        : "Approval Updates";
+
+    // BIC: terminal AB → clear; A4.5 Approved → DM (for production sign-off); graded → DM until email fired
+    const newBIC = isTerminalAB ? null : BIC.GRADED;   // BIC.GRADED is now "DM"
 
     const submissionStatus = isA45Approved ? "Schedule" : isTerminalAB ? "Complete" : "Graded";
 
@@ -1254,6 +1482,7 @@ module.exports = function mountDrawingFlow(app, notion) {
         "DM Action":     { select: { name: "Log Status"     } },
         "Client Grade":  { select: { name: grade            } },
         "Reviewed":      { date:   { start: gradedAt        } },
+        "DT Notified":   { checkbox: false                   },
         "Ball In Court": newBIC ? { select: { name: newBIC    } } : { select: null },
         "BIC Since":     newBIC ? { date:   { start: gradedAt } } : { date:   null },
       }});
@@ -1265,9 +1494,10 @@ module.exports = function mountDrawingFlow(app, notion) {
       try {
         const mdsProps = { "Drawing Status": { select: { name: drawingStatus } } };
         if (stageMap.statusField) mdsProps[stageMap.statusField] = { select: { name: grade } };
-        // A4.5: only set C01 Sign Off date when Approved (not when Rejected)
+        // Status Date uses the project-system return date (or today if not provided)
+        // A4.5: only set C01 Sign Off date when Approved
         if (stageMap.dateField && !(stage === "A4.5" && grade !== "Approved")) {
-          mdsProps[stageMap.dateField] = { date: { start: gradedAt } };
+          mdsProps[stageMap.dateField] = { date: { start: statusDate } };
         }
         await notion.pages.update({ page_id: drawingId, properties: mdsProps });
       } catch (err) {
@@ -1275,11 +1505,8 @@ module.exports = function mountDrawingFlow(app, notion) {
       }
     }
 
-    const submissionTitle = getProp(submissionPage, "Submission", "title");
-
-    // NOTE: fireWebhook removed — DT email now batched via POST /api/df/send-dt-emails
-    console.log(`[log-status] ${id} => ${grade} => ${drawingStatus}`);
-    res.json({ ok: true, grade, gradedAt, drawingStatus, submissionStatus, isTerminal: isTerminalAB, isA45Approved });
+    console.log(`[log-status] ${id} => ${grade} (Rev ${revision}) => ${drawingStatus}`);
+    res.json({ ok: true, grade, gradedAt, statusDate, drawingStatus, submissionStatus, isTerminal: isTerminalAB, isA45Approved });
   });
 
   // GET /api/df/drawings

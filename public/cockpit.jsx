@@ -86,18 +86,24 @@ const BounceModal = ({ submission, onConfirm, onClose }) => {
 };
 
 const LogStatusModal = ({ submission, onConfirm, onClose }) => {
-  const [busy, setBusy] = useState(false);
+  const [busy,       setBusy]       = useState(false);
+  const [returnDate, setReturnDate] = useState("");
 
   const isAB  = submission.stage === "AB";
   const isA45 = submission.stage === "A4.5";
+  const needsReturnDate = !isAB && !isA45;   // S4/S5 have a project-system return date
   const grades = (isAB || isA45) ? ["Approved", "Rejected"] : ["A", "B", "C", "NA"];
   const hint   = isAB  ? "Approved = As Built accepted · Rejected = revision required"
                : isA45 ? "Approved = Contractor sign-off · Rejected = revision required"
                : "A = accepted · B = minor revision · C = major revision · NA = not applicable";
 
   const select = async (grade) => {
+    if (needsReturnDate && !returnDate) {
+      alert("Please enter the date the return was filed on the project system.");
+      return;
+    }
     setBusy(true);
-    await onConfirm(submission.id, grade);
+    await onConfirm(submission.id, grade, returnDate || null);
     setBusy(false);
     onClose();
   };
@@ -109,7 +115,20 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
         <div className="modal-sub">
           {submission.stage} · Rev {submission.revision}
         </div>
-        <div className="grade-buttons">
+        {needsReturnDate && (
+          <div style={{ margin: "16px 0 4px" }}>
+            <label style={{ fontSize: 12, color: "var(--text2)", display: "block", marginBottom: 4 }}>
+              Return date (as filed on project system) *
+            </label>
+            <input
+              type="date"
+              value={returnDate}
+              onChange={(e) => setReturnDate(e.target.value)}
+              style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid var(--border)", background: "var(--surface2)", color: "var(--text1)", fontSize: 13 }}
+            />
+          </div>
+        )}
+        <div className="grade-buttons" style={{ marginTop: 16 }}>
           {grades.map((g) => (
             <button key={g} className={`grade-btn ${g}`} onClick={() => select(g)} disabled={busy}>
               {g}
@@ -163,11 +182,12 @@ const IssueModal = ({ submission, onConfirm, onClose }) => {
 
 // ─── Submission row ───────────────────────────────────────────────────────────
 
-const SubmissionRow = ({ sub, onApprove, onBounce, onLogStatus, onIssue, busy, selected, onToggleSelect }) => {
+const SubmissionRow = ({ sub, onApprove, onBounce, onLogStatus, onIssue, onHold, busy, selected, onToggleSelect }) => {
   const isBusy = busy === sub.id;
   const isApproved      = sub.status === "Approved";
   const isAwaitingIssue = sub.status === "Awaiting Issue";
   const isIssued        = sub.status === "Issued";
+  const isGraded        = sub.status === "Graded";
 
   const actions = () => {
     if (isIssued) {
@@ -202,7 +222,7 @@ const SubmissionRow = ({ sub, onApprove, onBounce, onLogStatus, onIssue, busy, s
   };
 
   return (
-    <div className={`queue-row${selected ? " selected" : ""}`}>
+    <div className={`queue-row${selected ? " selected" : ""}${sub.blocked ? " blocked" : ""}`}>
       <div className="queue-row-check">
         <input
           type="checkbox"
@@ -234,7 +254,19 @@ const SubmissionRow = ({ sub, onApprove, onBounce, onLogStatus, onIssue, busy, s
           ? <a href={sub.dropboxLink} target="_blank" rel="noopener noreferrer">↗ Open</a>
           : <span style={{ color: "var(--text3)", fontSize: 11 }}>No link</span>}
       </div>
-      <div className="queue-actions">{actions()}</div>
+      <div className="queue-actions">
+        {actions()}
+        {onHold && (
+          <button
+            className={`btn btn-sm${sub.blocked ? " btn-hold-active" : " btn-ghost"}`}
+            onClick={() => onHold(sub.id, sub.blocked)}
+            disabled={isBusy}
+            title={sub.blocked ? "Remove hold" : "Put on hold (RFI / Design Change)"}
+          >
+            {sub.blocked ? "⏸ Held" : "Hold"}
+          </button>
+        )}
+      </div>
     </div>
   );
 };
@@ -259,7 +291,7 @@ const BatchBar = ({ count, label, onAction, onClear, busy }) => {
 // ─── Queue section ────────────────────────────────────────────────────────────
 
 const QueueSection = ({
-  title, submissions, onApprove, onBounce, onLogStatus, onIssue, busy,
+  title, submissions, onApprove, onBounce, onLogStatus, onIssue, onHold, busy,
   selectedIds, onToggleSelect, batchLabel, onBatchAction, batchBusy,
 }) => {
   if (!submissions.length) return null;
@@ -317,6 +349,7 @@ const QueueSection = ({
               onBounce={onBounce}
               onLogStatus={onLogStatus}
               onIssue={onIssue}
+              onHold={onHold}
               busy={busy}
               selected={selectedIds.has(sub.id)}
               onToggleSelect={onToggleSelect}
@@ -415,6 +448,9 @@ const Cockpit = () => {
   const [scanning,             setScanning]             = useState(false);
   const [scanResult,           setScanResult]           = useState(null);  // "ok" | "error" | null
   const [scanError,            setScanError]            = useState(null);
+  const [graded,               setGraded]               = useState([]);
+  const [sendGradeEmailsBusy,  setSendGradeEmailsBusy]  = useState(false);
+  const [sendGradeResult,      setSendGradeResult]      = useState(null);  // "ok" | "error" | null
 
   // Multi-select: single Set shared across all sections; sections filter to their own IDs
   const [selectedIds, setSelectedIds] = useState(new Set());
@@ -458,15 +494,16 @@ const Cockpit = () => {
     if (!silent) setLoading(true);
     setError(null);
     try {
-      const [subRes, approvedRes, awaitRes, issRes, pendingRes] = await Promise.all([
+      const [subRes, approvedRes, awaitRes, issRes, pendingRes, gradedRes] = await Promise.all([
         fetch("/api/df/submissions?status=Submitted"),
         fetch("/api/df/submissions?status=Approved"),
         fetch("/api/df/submissions?status=Awaiting%20Issue"),
         fetch("/api/df/submissions?status=Issued"),
         fetch("/api/df/submissions?status=pending-notification"),
+        fetch("/api/df/submissions?status=Graded"),
       ]);
 
-      if (!subRes.ok || !approvedRes.ok || !awaitRes.ok || !issRes.ok || !pendingRes.ok) {
+      if (!subRes.ok || !approvedRes.ok || !awaitRes.ok || !issRes.ok || !pendingRes.ok || !gradedRes.ok) {
         throw new Error("API error");
       }
 
@@ -475,6 +512,7 @@ const Cockpit = () => {
       const { submissions: await_    } = await awaitRes.json();
       const { submissions: iss       } = await issRes.json();
       const { submissions: pending   } = await pendingRes.json();
+      const { submissions: graded_   } = await gradedRes.json();
 
       const newOnes = subs.filter((s) => !knownIds.current.has(s.id));
       if (newOnes.length && knownIds.current.size > 0) notify(newOnes.length);
@@ -484,6 +522,7 @@ const Cockpit = () => {
       setAwaitingIssue([...approved_, ...await_]);
       setIssued(iss);
       setPendingNotification(pending);
+      setGraded(graded_.filter((s) => !s.dtNotified));
       setLastPoll(new Date());
     } catch (err) {
       setError(err.message);
@@ -554,13 +593,13 @@ const Cockpit = () => {
     }
   };
 
-  const handleLogStatus = async (id, grade) => {
+  const handleLogStatus = async (id, grade, returnDate) => {
     setBusy(id);
     try {
       const res = await fetch(`/api/df/submissions/${id}/log-status`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ grade }),
+        body: JSON.stringify({ grade, ...(returnDate ? { returnDate } : {}) }),
       });
       if (!res.ok) {
         const body = await res.json();
@@ -630,6 +669,43 @@ const Cockpit = () => {
     }
   };
 
+  const handleSendGradeEmails = async () => {
+    setSendGradeEmailsBusy(true);
+    setSendGradeResult(null);
+    try {
+      const res  = await fetch("/api/df/send-grade-emails", { method: "POST" });
+      const body = await res.json();
+      if (!res.ok) {
+        alert(`Send grade emails failed: ${body.error || res.statusText}`);
+        setSendGradeResult("error");
+      } else {
+        setSendGradeResult("ok");
+        setGraded([]);
+        fetchQueue(true);
+      }
+    } catch (err) {
+      alert(`Send grade emails error: ${err.message}`);
+      setSendGradeResult("error");
+    } finally {
+      setSendGradeEmailsBusy(false);
+      setTimeout(() => setSendGradeResult(null), 4000);
+    }
+  };
+
+  const handleHold = async (id, currentBlocked) => {
+    const blocked = !currentBlocked;
+    try {
+      await fetch(`/api/df/submissions/${id}/hold`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ blocked }),
+      });
+      fetchQueue(true);
+    } catch (err) {
+      alert(`Hold toggle error: ${err.message}`);
+    }
+  };
+
   const handleScanPending = async () => {
     setScanning(true);
     setScanResult(null);
@@ -668,6 +744,16 @@ const Cockpit = () => {
           )}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          {sendGradeResult === "ok"    && <span className="send-result ok">Grade emails sent!</span>}
+          {sendGradeResult === "error" && <span className="send-result error">Send failed</span>}
+          <button
+            className="btn btn-secondary"
+            onClick={handleSendGradeEmails}
+            disabled={sendGradeEmailsBusy || graded.length === 0}
+            title={graded.length === 0 ? "No graded drawings awaiting notification" : `Send grade emails for ${graded.length} drawing(s)`}
+          >
+            {sendGradeEmailsBusy ? "Sending…" : `Send Grade Emails${graded.length > 0 ? ` (${graded.length})` : ""}`}
+          </button>
           {sendEmailResult === "ok" && (
             <span className="send-result ok">Emails sent!</span>
           )}
@@ -739,6 +825,7 @@ const Cockpit = () => {
           onBounce={(sub) => setBounceTarget(sub)}
           onLogStatus={(sub) => setLogStatusTarget(sub)}
           onIssue={(sub) => setIssueTarget(sub)}
+          onHold={handleHold}
           busy={busy}
           selectedIds={selectedIds}
           onToggleSelect={toggleSelect}
@@ -769,6 +856,7 @@ const Cockpit = () => {
           onBounce={(sub) => setBounceTarget(sub)}
           onLogStatus={(sub) => setLogStatusTarget(sub)}
           onIssue={(sub) => setIssueTarget(sub)}
+          onHold={handleHold}
           busy={busy}
           selectedIds={selectedIds}
           onToggleSelect={toggleSelect}
@@ -786,6 +874,7 @@ const Cockpit = () => {
           onBounce={(sub) => setBounceTarget(sub)}
           onLogStatus={(sub) => setLogStatusTarget(sub)}
           onIssue={(sub) => setIssueTarget(sub)}
+          onHold={handleHold}
           busy={busy}
           selectedIds={selectedIds}
           onToggleSelect={toggleSelect}
@@ -801,6 +890,20 @@ const Cockpit = () => {
           onBounce={(sub) => setBounceTarget(sub)}
           onLogStatus={(sub) => setLogStatusTarget(sub)}
           onIssue={(sub) => setIssueTarget(sub)}
+          onHold={handleHold}
+          busy={busy}
+          selectedIds={selectedIds}
+          onToggleSelect={toggleSelect}
+          batchBusy={batchBusy}
+        />
+      )}
+
+      {graded.length > 0 && (
+        <QueueSection
+          title="Graded — Awaiting DT Notification"
+          submissions={graded}
+          onLogStatus={(sub) => setLogStatusTarget(sub)}
+          onHold={handleHold}
           busy={busy}
           selectedIds={selectedIds}
           onToggleSelect={toggleSelect}

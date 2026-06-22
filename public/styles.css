@@ -339,6 +339,25 @@ main {
 .grade-btn.Approved:hover { border-color: var(--success); color: var(--success); }
 .grade-btn.Rejected:hover { border-color: var(--danger);  color: var(--danger);  }
 
+/* ─── Blocked / On Hold rows ─────────────────────────────────────────── */
+.queue-row.blocked {
+  background: rgba(245, 158, 11, 0.07);
+  border-left: 3px solid var(--warning);
+  opacity: 0.85;
+}
+.queue-row.blocked .queue-row-drawing {
+  color: var(--warning);
+}
+.btn-hold-active {
+  background: rgba(245, 158, 11, 0.18);
+  color: var(--warning);
+  border-color: var(--warning);
+  font-weight: 600;
+}
+.btn-hold-active:hover {
+  background: rgba(245, 158, 11, 0.28);
+}
+
 /* ─── Inputs form ────────────────────────────────────────────────────── */
 .form-card {
   background: var(--bg2);
