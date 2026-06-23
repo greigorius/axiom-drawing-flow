@@ -190,6 +190,13 @@ const SubmissionRow = ({ sub, onApprove, onBounce, onLogStatus, onIssue, onHold,
   const isGraded        = sub.status === "Graded";
 
   const actions = () => {
+    if (isGraded) {
+      return (
+        <span style={{ fontSize: 12, fontWeight: 600, color: "var(--warning)", whiteSpace: "nowrap" }}>
+          Grade: {sub.clientGrade || "—"}
+        </span>
+      );
+    }
     if (isIssued) {
       return (
         <button className="btn btn-grade btn-sm" onClick={() => onLogStatus(sub)} disabled={isBusy}>
@@ -250,8 +257,8 @@ const SubmissionRow = ({ sub, onApprove, onBounce, onLogStatus, onIssue, onHold,
       <div style={{ textAlign: "center", fontSize: 13, color: "var(--text2)" }}>R{sub.qaRound}</div>
       <div className={`bic-time ${bicSinceClass(sub.bicSince)}`}>{formatBicSince(sub.bicSince)}</div>
       <div className="queue-row-link">
-        {sub.dropboxLink
-          ? <a href={sub.dropboxLink} target="_blank" rel="noopener noreferrer">↗ Open</a>
+        {(sub.shareLink || sub.dropboxLink)
+          ? <a href={sub.shareLink || sub.dropboxLink} target="_blank" rel="noopener noreferrer">↗ Open</a>
           : <span style={{ color: "var(--text3)", fontSize: 11 }}>No link</span>}
       </div>
       <div className="queue-actions">
@@ -695,11 +702,16 @@ const Cockpit = () => {
   const handleHold = async (id, currentBlocked) => {
     const blocked = !currentBlocked;
     try {
-      await fetch(`/api/df/submissions/${id}/hold`, {
+      const res  = await fetch(`/api/df/submissions/${id}/hold`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ blocked }),
       });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        alert(`Hold failed: ${body.error || res.statusText}`);
+        return;
+      }
       fetchQueue(true);
     } catch (err) {
       alert(`Hold toggle error: ${err.message}`);

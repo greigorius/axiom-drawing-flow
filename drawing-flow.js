@@ -627,6 +627,8 @@ module.exports = function mountDrawingFlow(app, notion) {
           shareLink:   getProp(page, "Share Link",   "url"),
           drawingIds:  getProp(page, "Drawing",      "relation"),
           taskIds:     getProp(page, "Item",         "relation"),
+          blocked:     getProp(page, "Blocked",      "checkbox") ?? false,
+          clientGrade: getProp(page, "Client Grade", "select"),
         };
       }));
 
