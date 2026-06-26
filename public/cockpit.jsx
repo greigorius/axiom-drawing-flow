@@ -472,6 +472,8 @@ const Cockpit = () => {
   const [graded,               setGraded]               = useState([]);
   const [sendGradeEmailsBusy,  setSendGradeEmailsBusy]  = useState(false);
   const [sendGradeResult,      setSendGradeResult]      = useState(null);  // "ok" | "error" | null
+  const [search,               setSearch]               = useState("");
+  const [density,              setDensity]              = useState("comfortable");
 
   // Multi-select: single Set shared across all sections; sections filter to their own IDs
   const [selectedIds, setSelectedIds] = useState(new Set());
@@ -780,230 +782,178 @@ const Cockpit = () => {
   };
 
   // ── Render ───────────────────────────────────────────────────────────────
-  const total = submitted.length + awaitingIssue.length + issued.length;
+  const commentItems = issued.filter((s) => s.hasComments);
+  const signoffItems = issued.filter((s) => !s.hasComments);
+  const total = submitted.length + awaitingIssue.length + issued.length + graded.length;
+  const overdueCount = [...submitted, ...awaitingIssue, ...issued, ...graded]
+    .filter((s) => (daysSince(s.bicSince) ?? 0) > 14).length;
+
+  const COLS = [
+    { id: "submitted", title: "Submitted — Awaiting Review",     accent: "var(--info)",  sub: "New DT drawing submissions",        items: submitted,    tie: "Scan Pending" },
+    { id: "approved",  title: "Approved — Awaiting Issue",        accent: "var(--ok)",    sub: "Cleared internally, ready to issue", items: awaitingIssue },
+    { id: "comments",  title: "Issued — Review Client Comments",  accent: "var(--grade)", sub: "Client comments received",          items: commentItems, tie: "Scan Comments" },
+    { id: "signoff",   title: "Issued — Awaiting Sign-Off",       accent: "var(--warn)",  sub: "With client for grading",           items: signoffItems },
+    { id: "graded",    title: "Graded — Awaiting DT Notification", accent: "var(--accent)", sub: "Notion · DT Notified unchecked",  items: graded,       tie: "Send DT Emails" },
+  ];
+
+  const q = search.trim().toLowerCase();
+  const matchSearch = (s) => !q || `${s.drawingNo || ""} ${s.title || ""} ${s.taskCode || ""} ${s.dtName || ""}`.toLowerCase().includes(q);
+
+  const statusPill = (colId, s) => {
+    switch (colId) {
+      case "submitted": return { cls: "info",  txt: "Submitted" };
+      case "approved":  return { cls: "ok",    txt: "Approved" };
+      case "comments":  return { cls: "grade", txt: "Comments" };
+      case "signoff":   return { cls: "warn",  txt: "Issued" };
+      case "graded":    return { cls: "grade", txt: "Grade " + (s.clientGrade || "—") };
+      default:          return { cls: "info",  txt: "" };
+    }
+  };
+
+  const cardActions = (colId, s) => {
+    const isBusy = busy === s.id;
+    if (colId === "submitted") return (
+      <>
+        <button className="k-act go" disabled={isBusy} onClick={(e) => { e.stopPropagation(); handleApprove(s.id); }}>Approve</button>
+        <button className="k-act" disabled={isBusy} onClick={(e) => { e.stopPropagation(); setBounceTarget(s); }}>Bounce</button>
+      </>
+    );
+    if (colId === "approved") return (
+      <button className="k-act go" disabled={isBusy} onClick={(e) => { e.stopPropagation(); setIssueTarget(s); }}>Issue</button>
+    );
+    if (colId === "comments" || colId === "signoff") return (
+      <>
+        <button className="k-act go" onClick={(e) => { e.stopPropagation(); setLogStatusTarget(s); }}>Grade</button>
+        <button className="k-act" onClick={(e) => { e.stopPropagation(); handleHold(s.id, s.blocked); }}>{s.blocked ? "Unblock" : "Hold"}</button>
+      </>
+    );
+    return null;
+  };
+
+  const renderCard = (s, colId) => {
+    const age = daysSince(s.bicSince);
+    const ageCls = age == null ? "" : age > 14 ? "r" : age > 7 ? "a" : "g";
+    const sel = selectedIds.has(s.id);
+    const pill = statusPill(colId, s);
+    const initials = (s.dtName || "").split(/\s+/).filter(Boolean).map((w) => w[0]).join("").slice(0, 2).toUpperCase() || "—";
+    return (
+      <div
+        key={s.id}
+        className={`k-card${sel ? " sel" : ""}${(age ?? 0) > 14 ? " overdue" : ""}${s.blocked ? " blocked" : ""}`}
+        onClick={() => toggleSelect(s.id)}
+      >
+        <div className="k-card-top">
+          <input type="checkbox" className="k-check" checked={sel}
+            onChange={() => toggleSelect(s.id)} onClick={(e) => e.stopPropagation()}
+            aria-label={`Select ${s.drawingNo || s.title}`} />
+          <div className="k-ref">
+            <div className="k-code">{s.drawingNo || s.title}</div>
+            {s.taskCode && <div className="k-title">{s.taskCode}</div>}
+          </div>
+        </div>
+        <div className="k-meta">
+          {s.stage && <span className="k-tag">{s.stage}</span>}
+          {s.revision && <span className="k-tag">{s.revision}</span>}
+          <span className={`k-pill ${pill.cls}`}>{pill.txt}</span>
+          {s.hasComments && <span className="k-pill danger">New ✦</span>}
+          {s.blocked && <span className="k-pill warn">On Hold</span>}
+        </div>
+        <div className="k-card-foot">
+          <span className={`k-age ${ageCls}`} title={age == null ? "" : `${age} days in stage`}>{age == null ? "—" : age + "d"}</span>
+          <span className="k-ava" title={s.dtName || ""}>{initials}</span>
+          <span className="k-cardact">{cardActions(colId, s)}</span>
+        </div>
+      </div>
+    );
+  };
 
   return (
-    <div>
-      <div className="page-header">
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <h1 className="page-title">Submissions Queue</h1>
-          {pendingNotification.length > 0 && (
-            <span className="pending-email-badge">{pendingNotification.length} pending email</span>
-          )}
+    <div className="kanban" data-density={density}>
+      <div className="k-header">
+        <div className="k-kpis" role="group" aria-label="Queue summary">
+          <div className="k-kpi"><span className="v">{total}</span><span className="l">In flow</span></div>
+          <div className="k-kpi flag"><span className="v">{graded.length}</span><span className="l">Awaiting DT email</span></div>
+          <div className="k-kpi alert"><span className="v">{overdueCount}</span><span className="l">Overdue &gt;14d</span></div>
+          <div className="k-kpi"><span className="v">{commentItems.length}</span><span className="l">New comments</span></div>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          {sendGradeResult === "ok"    && <span className="send-result ok">Grade emails sent!</span>}
-          {sendGradeResult === "error" && <span className="send-result error">Send failed</span>}
-          <button
-            className="btn btn-secondary"
-            onClick={handleSendGradeEmails}
-            disabled={sendGradeEmailsBusy || graded.length === 0}
-            title={graded.length === 0 ? "No graded drawings awaiting notification" : `Send grade emails for ${graded.length} drawing(s)`}
-          >
-            {sendGradeEmailsBusy ? "Sending…" : `Send Grade Emails${graded.length > 0 ? ` (${graded.length})` : ""}`}
-          </button>
-          {sendEmailResult === "ok" && (
-            <span className="send-result ok">Emails sent!</span>
-          )}
-          {sendEmailResult === "error" && (
-            <span className="send-result error">Send failed</span>
-          )}
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 2 }}>
-            <button
-              className="btn btn-secondary btn-sm"
-              onClick={handleScanPending}
-              disabled={scanning}
-              title="Trigger Make ingest scenario to pick up new Dropbox submissions"
-            >
-              {scanning && scanResult !== "error" ? "Scanning…" : "⟳ Scan Pending"}
-            </button>
-            {scanResult === "ok" && (
-              <span style={{ fontSize: 11, color: "var(--success)" }}>Triggered — refreshing in 8s…</span>
-            )}
-            {scanResult === "error" && (
-              <span style={{ fontSize: 11, color: "var(--danger)" }} title={scanError}>
-                ✕ {scanError || "Scan failed"}
-              </span>
-            )}
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 2 }}>
-            <button
-              className="btn btn-secondary btn-sm"
-              onClick={handleScanComments}
-              disabled={scanCommentsBusy}
-              title="Ingest client comments: reads new PDFs in the Dropbox Client Comments folders, populates the MDS comment properties, and marks them as ingested"
-            >
-              {scanCommentsBusy && scanCommentsResult !== "error" ? "Ingesting…" : "💬 Scan Comments"}
-            </button>
-            {scanCommentsResult === "ok" && (
-              <span style={{ fontSize: 11, color: "var(--success)" }}>Triggered — refreshing in 8s…</span>
-            )}
-            {scanCommentsResult === "error" && (
-              <span style={{ fontSize: 11, color: "var(--danger)" }}>✕ Ingest failed</span>
-            )}
-          </div>
-          <button
-            className="btn btn-primary"
-            onClick={handleSendDTEmails}
-            disabled={sendEmailBusy || pendingNotification.length === 0}
-            title={pendingNotification.length === 0 ? "No pending notifications" : `Send DT emails for ${pendingNotification.length} item(s)`}
-          >
-            {sendEmailBusy ? "Sending…" : `Send DT Emails${pendingNotification.length > 0 ? ` (${pendingNotification.length})` : ""}`}
-          </button>
-          <div className="page-meta">
-            {lastPoll
-              ? `Updated ${lastPoll.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · auto-refresh 30s`
-              : "Loading…"
-            }
-          </div>
+        <div className="k-clock">
+          <span className="dot" aria-hidden="true" />
+          {lastPoll ? `Updated ${lastPoll.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · auto-refresh 30s` : "Loading…"}
         </div>
       </div>
 
-      {/* Pending DT Notification — shown first so DM sees outstanding emails before acting */}
-      <PendingNotificationSection submissions={pendingNotification} />
-
-      {loading && !total && (
-        <div className="state-loading">
-          <div className="spinner" />
-          <div>Loading submissions…</div>
+      <div className="k-toolbar" role="toolbar" aria-label="Cockpit actions">
+        <input className="k-search" type="search" placeholder="Search drawing ref, title, DT…"
+          value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search submissions" />
+        <div className="k-seg" role="group" aria-label="Density">
+          <button aria-pressed={density === "comfortable"} onClick={() => setDensity("comfortable")}>Comfortable</button>
+          <button aria-pressed={density === "compact"} onClick={() => setDensity("compact")}>Compact</button>
         </div>
-      )}
-
-      {error && (
-        <div className="state-error">
-          Failed to load: {error}
-        </div>
-      )}
-
-      {!loading && !error && total === 0 && pendingNotification.length === 0 && (
-        <div className="state-empty">
-          No submissions waiting — queue clear.
-        </div>
-      )}
-
-      <div className="kanban-board">
-
-      {submitted.length > 0 && (
-        <div className="kanban-column">
-          <QueueSection
-            title="Awaiting QA Review"
-            submissions={submitted}
-            onApprove={handleApprove}
-            onBounce={(sub) => setBounceTarget(sub)}
-            onLogStatus={(sub) => setLogStatusTarget(sub)}
-            onIssue={(sub) => setIssueTarget(sub)}
-            onHold={handleHold}
-            busy={busy}
-            selectedIds={selectedIds}
-            onToggleSelect={toggleSelect}
-            batchLabel="Approve"
-            onBatchAction={handleBatchApprove}
-            batchBusy={batchBusy}
-          />
-          {/* Bounce batch is separate so its button label differs */}
-          <div style={{ marginTop: -8 }}>
-            <BatchBar
-              count={submitted.filter((s) => selectedIds.has(s.id)).length}
-              label="Bounce"
-              onAction={() => handleBatchBounce(submitted.filter((s) => selectedIds.has(s.id)).map((s) => s.id))}
-              onClear={() => submitted.forEach((s) => selectedIds.has(s.id) && toggleSelect(s.id))}
-              busy={batchBusy}
-            />
-          </div>
-        </div>
-      )}
-
-      {awaitingIssue.length > 0 && (
-        <div className="kanban-column">
-        <QueueSection
-          title="Approved — Awaiting Issue"
-          submissions={awaitingIssue}
-          onApprove={handleApprove}
-          onBounce={(sub) => setBounceTarget(sub)}
-          onLogStatus={(sub) => setLogStatusTarget(sub)}
-          onIssue={(sub) => setIssueTarget(sub)}
-          onHold={handleHold}
-          busy={busy}
-          selectedIds={selectedIds}
-          onToggleSelect={toggleSelect}
-          batchLabel="Issue"
-          onBatchAction={handleBatchIssue}
-          batchBusy={batchBusy}
-        />
-        </div>
-      )}
-
-      {/* New group: issued drawings with client comments ingested → ready to review */}
-      {issued.filter((s) => s.hasComments).length > 0 && (
-        <div className="kanban-column">
-        <QueueSection
-          title="Issued — Review Client Comments"
-          submissions={issued.filter((s) => s.hasComments)}
-          onApprove={handleApprove}
-          onBounce={(sub) => setBounceTarget(sub)}
-          onLogStatus={(sub) => setLogStatusTarget(sub)}
-          onIssue={(sub) => setIssueTarget(sub)}
-          onHold={handleHold}
-          busy={busy}
-          selectedIds={selectedIds}
-          onToggleSelect={toggleSelect}
-          batchBusy={batchBusy}
-        />
-        </div>
-      )}
-
-      {issued.filter((s) => s.stage !== "A4.5" && !s.hasComments).length > 0 && (
-        <div className="kanban-column">
-        <QueueSection
-          title="Issued — Awaiting Client Grade"
-          submissions={issued.filter((s) => s.stage !== "A4.5" && !s.hasComments)}
-          onApprove={handleApprove}
-          onBounce={(sub) => setBounceTarget(sub)}
-          onLogStatus={(sub) => setLogStatusTarget(sub)}
-          onIssue={(sub) => setIssueTarget(sub)}
-          onHold={handleHold}
-          busy={busy}
-          selectedIds={selectedIds}
-          onToggleSelect={toggleSelect}
-          batchBusy={batchBusy}
-        />
-        </div>
-      )}
-
-      {issued.filter((s) => s.stage === "A4.5" && !s.hasComments).length > 0 && (
-        <div className="kanban-column">
-        <QueueSection
-          title="Issued — Awaiting Sign Off"
-          submissions={issued.filter((s) => s.stage === "A4.5" && !s.hasComments)}
-          onApprove={handleApprove}
-          onBounce={(sub) => setBounceTarget(sub)}
-          onLogStatus={(sub) => setLogStatusTarget(sub)}
-          onIssue={(sub) => setIssueTarget(sub)}
-          onHold={handleHold}
-          busy={busy}
-          selectedIds={selectedIds}
-          onToggleSelect={toggleSelect}
-          batchBusy={batchBusy}
-        />
-        </div>
-      )}
-
-      {graded.length > 0 && (
-        <div className="kanban-column">
-        <QueueSection
-          title="Graded — Awaiting DT Notification"
-          submissions={graded}
-          onLogStatus={(sub) => setLogStatusTarget(sub)}
-          onHold={handleHold}
-          busy={busy}
-          selectedIds={selectedIds}
-          onToggleSelect={toggleSelect}
-          batchBusy={batchBusy}
-        />
-        </div>
-      )}
-
+        <div className="k-spacer" />
+        {error && <span className="k-result error">Load failed</span>}
+        <button className="k-btn" onClick={handleScanPending} disabled={scanning}
+          title="Trigger Make ingest to pick up new Dropbox submissions">
+          {scanning && scanResult !== "error" ? "Scanning…" : "⟳ Scan Pending"}
+        </button>
+        {scanResult === "error" && <span className="k-result error">Scan failed</span>}
+        <button className="k-btn" onClick={handleScanComments} disabled={scanCommentsBusy}
+          title="Ingest client comments from the Dropbox Client Comments folders">
+          {scanCommentsBusy && scanCommentsResult !== "error" ? "Ingesting…" : "💬 Scan Comments"}
+          {commentItems.length > 0 && <span className="k-count">{commentItems.length}</span>}
+        </button>
+        {scanCommentsResult === "ok" && <span className="k-result ok">Triggered</span>}
+        {pendingNotification.length > 0 && (
+          <button className="k-btn" onClick={handleSendDTEmails} disabled={sendEmailBusy}
+            title={`Send pending DT notification emails for ${pendingNotification.length} item(s)`}>
+            {sendEmailBusy ? "Sending…" : "Pending DT Emails"}<span className="k-count">{pendingNotification.length}</span>
+          </button>
+        )}
+        {sendEmailResult === "ok" && <span className="k-result ok">Sent!</span>}
+        <button className="k-btn primary" onClick={handleSendGradeEmails}
+          disabled={sendGradeEmailsBusy || graded.length === 0}
+          title={graded.length === 0 ? "No graded drawings awaiting notification" : `Send grade emails for ${graded.length} drawing(s)`}>
+          {sendGradeEmailsBusy ? "Sending…" : "Send DT Grade Emails"}
+          {graded.length > 0 && <span className="k-count">{graded.length}</span>}
+        </button>
+        {sendGradeResult === "ok" && <span className="k-result ok">Sent!</span>}
+        {sendGradeResult === "error" && <span className="k-result error">Send failed</span>}
       </div>
+
+      <div className="k-board" aria-label="Submissions board">
+        {COLS.map((col) => {
+          const items = col.items.filter(matchSearch);
+          return (
+            <div key={col.id} className="k-column" style={{ "--k-col-accent": col.accent }}>
+              <div className="k-col-head">
+                <div className="k-col-title">
+                  <span className="k-swatch" aria-hidden="true" />
+                  <h2>{col.title}</h2>
+                  <span className="k-num">{items.length}</span>
+                </div>
+                <div className="k-col-sub">
+                  {col.tie && <span className="k-tie-pill">{col.tie}</span>}
+                  <span>{col.sub}</span>
+                </div>
+              </div>
+              <div className="k-col-body">
+                {items.length === 0
+                  ? <div className="k-empty">{q ? "No matches in this stage" : "Nothing here — all clear"}</div>
+                  : items.map((s) => renderCard(s, col.id))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {selectedIds.size > 0 && (
+        <div className="k-bulkbar">
+          <span className="k-bulk-n">{selectedIds.size}</span><span className="k-bulk-lbl">selected</span>
+          <button className="k-btn" onClick={clearSelection}>Clear</button>
+          <button className="k-btn" onClick={() => handleBatchApprove([...selectedIds])} disabled={batchBusy}>Approve</button>
+          <button className="k-btn" onClick={() => handleBatchBounce([...selectedIds])} disabled={batchBusy}>Bounce</button>
+          <button className="k-btn primary" onClick={() => handleBatchIssue([...selectedIds])} disabled={batchBusy}>Issue</button>
+        </div>
+      )}
 
       {bounceTarget && (
         <BounceModal
