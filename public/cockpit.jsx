@@ -240,7 +240,19 @@ const SubmissionRow = ({ sub, onApprove, onBounce, onLogStatus, onIssue, onHold,
         />
       </div>
       <div>
-        <div className="queue-row-drawing">{sub.drawingNo || sub.title}</div>
+        <div className="queue-row-drawing">
+          {sub.drawingNo || sub.title}
+          {sub.hasComments && (
+            <span
+              title="Client comments received — ready to review"
+              style={{ marginLeft: 6, fontSize: 10, fontWeight: 600, padding: "1px 6px",
+                       borderRadius: 8, background: "rgba(204,121,167,0.18)", color: "#CC79A7",
+                       whiteSpace: "nowrap", verticalAlign: "middle" }}
+            >
+              💬 Comments
+            </span>
+          )}
+        </div>
         <div className="queue-row-sub">
           R{sub.qaRound} · Rev {sub.revision}
           {sub.dtName ? ` · ${sub.dtName}` : ""}
@@ -455,6 +467,8 @@ const Cockpit = () => {
   const [scanning,             setScanning]             = useState(false);
   const [scanResult,           setScanResult]           = useState(null);  // "ok" | "error" | null
   const [scanError,            setScanError]            = useState(null);
+  const [scanCommentsBusy,     setScanCommentsBusy]     = useState(false);
+  const [scanCommentsResult,   setScanCommentsResult]   = useState(null);  // "ok" | "error" | null
   const [graded,               setGraded]               = useState([]);
   const [sendGradeEmailsBusy,  setSendGradeEmailsBusy]  = useState(false);
   const [sendGradeResult,      setSendGradeResult]      = useState(null);  // "ok" | "error" | null
@@ -718,6 +732,28 @@ const Cockpit = () => {
     }
   };
 
+  // Trigger on-demand client-comment ingest (Make cr-ingest), then refresh the Issued queue.
+  const handleScanComments = async () => {
+    setScanCommentsBusy(true);
+    setScanCommentsResult(null);
+    try {
+      const res = await fetch("/api/df/scan-comments", { method: "POST" });
+      if (!res.ok) {
+        setScanCommentsResult("error");
+        setScanCommentsBusy(false);
+        setTimeout(() => setScanCommentsResult(null), 8000);
+        return;
+      }
+      setScanCommentsResult("ok");
+      // Give Make ~8s to list folders + write properties, then refresh so badges appear.
+      setTimeout(() => { fetchQueue(true); setScanCommentsBusy(false); setScanCommentsResult(null); }, 8000);
+    } catch (err) {
+      setScanCommentsResult("error");
+      setScanCommentsBusy(false);
+      setTimeout(() => setScanCommentsResult(null), 8000);
+    }
+  };
+
   const handleScanPending = async () => {
     setScanning(true);
     setScanResult(null);
@@ -790,6 +826,22 @@ const Cockpit = () => {
               </span>
             )}
           </div>
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 2 }}>
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={handleScanComments}
+              disabled={scanCommentsBusy}
+              title="Ingest client comments: reads new PDFs in the Dropbox Client Comments folders, populates the MDS comment properties, and marks them as ingested"
+            >
+              {scanCommentsBusy && scanCommentsResult !== "error" ? "Ingesting…" : "💬 Scan Comments"}
+            </button>
+            {scanCommentsResult === "ok" && (
+              <span style={{ fontSize: 11, color: "var(--success)" }}>Triggered — refreshing in 8s…</span>
+            )}
+            {scanCommentsResult === "error" && (
+              <span style={{ fontSize: 11, color: "var(--danger)" }}>✕ Ingest failed</span>
+            )}
+          </div>
           <button
             className="btn btn-primary"
             onClick={handleSendDTEmails}
@@ -829,38 +881,40 @@ const Cockpit = () => {
         </div>
       )}
 
-      {submitted.length > 0 && (
-        <QueueSection
-          title="Awaiting QA Review"
-          submissions={submitted}
-          onApprove={handleApprove}
-          onBounce={(sub) => setBounceTarget(sub)}
-          onLogStatus={(sub) => setLogStatusTarget(sub)}
-          onIssue={(sub) => setIssueTarget(sub)}
-          onHold={handleHold}
-          busy={busy}
-          selectedIds={selectedIds}
-          onToggleSelect={toggleSelect}
-          batchLabel="Approve"
-          onBatchAction={handleBatchApprove}
-          batchBusy={batchBusy}
-        />
-      )}
+      <div className="kanban-board">
 
-      {/* Bounce batch is separate so its button label differs */}
       {submitted.length > 0 && (
-        <div style={{ marginTop: -8 }}>
-          <BatchBar
-            count={submitted.filter((s) => selectedIds.has(s.id)).length}
-            label="Bounce"
-            onAction={() => handleBatchBounce(submitted.filter((s) => selectedIds.has(s.id)).map((s) => s.id))}
-            onClear={() => submitted.forEach((s) => selectedIds.has(s.id) && toggleSelect(s.id))}
-            busy={batchBusy}
+        <div className="kanban-column">
+          <QueueSection
+            title="Awaiting QA Review"
+            submissions={submitted}
+            onApprove={handleApprove}
+            onBounce={(sub) => setBounceTarget(sub)}
+            onLogStatus={(sub) => setLogStatusTarget(sub)}
+            onIssue={(sub) => setIssueTarget(sub)}
+            onHold={handleHold}
+            busy={busy}
+            selectedIds={selectedIds}
+            onToggleSelect={toggleSelect}
+            batchLabel="Approve"
+            onBatchAction={handleBatchApprove}
+            batchBusy={batchBusy}
           />
+          {/* Bounce batch is separate so its button label differs */}
+          <div style={{ marginTop: -8 }}>
+            <BatchBar
+              count={submitted.filter((s) => selectedIds.has(s.id)).length}
+              label="Bounce"
+              onAction={() => handleBatchBounce(submitted.filter((s) => selectedIds.has(s.id)).map((s) => s.id))}
+              onClear={() => submitted.forEach((s) => selectedIds.has(s.id) && toggleSelect(s.id))}
+              busy={batchBusy}
+            />
+          </div>
         </div>
       )}
 
       {awaitingIssue.length > 0 && (
+        <div className="kanban-column">
         <QueueSection
           title="Approved — Awaiting Issue"
           submissions={awaitingIssue}
@@ -876,12 +930,33 @@ const Cockpit = () => {
           onBatchAction={handleBatchIssue}
           batchBusy={batchBusy}
         />
+        </div>
       )}
 
-      {issued.filter((s) => s.stage !== "A4.5").length > 0 && (
+      {/* New group: issued drawings with client comments ingested → ready to review */}
+      {issued.filter((s) => s.hasComments).length > 0 && (
+        <div className="kanban-column">
+        <QueueSection
+          title="Issued — Review Client Comments"
+          submissions={issued.filter((s) => s.hasComments)}
+          onApprove={handleApprove}
+          onBounce={(sub) => setBounceTarget(sub)}
+          onLogStatus={(sub) => setLogStatusTarget(sub)}
+          onIssue={(sub) => setIssueTarget(sub)}
+          onHold={handleHold}
+          busy={busy}
+          selectedIds={selectedIds}
+          onToggleSelect={toggleSelect}
+          batchBusy={batchBusy}
+        />
+        </div>
+      )}
+
+      {issued.filter((s) => s.stage !== "A4.5" && !s.hasComments).length > 0 && (
+        <div className="kanban-column">
         <QueueSection
           title="Issued — Awaiting Client Grade"
-          submissions={issued.filter((s) => s.stage !== "A4.5")}
+          submissions={issued.filter((s) => s.stage !== "A4.5" && !s.hasComments)}
           onApprove={handleApprove}
           onBounce={(sub) => setBounceTarget(sub)}
           onLogStatus={(sub) => setLogStatusTarget(sub)}
@@ -892,12 +967,14 @@ const Cockpit = () => {
           onToggleSelect={toggleSelect}
           batchBusy={batchBusy}
         />
+        </div>
       )}
 
-      {issued.filter((s) => s.stage === "A4.5").length > 0 && (
+      {issued.filter((s) => s.stage === "A4.5" && !s.hasComments).length > 0 && (
+        <div className="kanban-column">
         <QueueSection
           title="Issued — Awaiting Sign Off"
-          submissions={issued.filter((s) => s.stage === "A4.5")}
+          submissions={issued.filter((s) => s.stage === "A4.5" && !s.hasComments)}
           onApprove={handleApprove}
           onBounce={(sub) => setBounceTarget(sub)}
           onLogStatus={(sub) => setLogStatusTarget(sub)}
@@ -908,9 +985,11 @@ const Cockpit = () => {
           onToggleSelect={toggleSelect}
           batchBusy={batchBusy}
         />
+        </div>
       )}
 
       {graded.length > 0 && (
+        <div className="kanban-column">
         <QueueSection
           title="Graded — Awaiting DT Notification"
           submissions={graded}
@@ -921,7 +1000,10 @@ const Cockpit = () => {
           onToggleSelect={toggleSelect}
           batchBusy={batchBusy}
         />
+        </div>
       )}
+
+      </div>
 
       {bounceTarget && (
         <BounceModal

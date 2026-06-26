@@ -583,3 +583,30 @@ main {
   margin-bottom: 16px;
   cursor: pointer;
 }
+
+/* ─── Kanban board (status columns) ──────────────────────────────────── */
+.kanban-board {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  overflow-x: auto;
+  padding: 8px 24px 20px;
+  /* full-bleed: let the board use the whole viewport width, not just the 1100px column */
+  width: 100vw;
+  margin-left: calc(50% - 50vw);
+  scrollbar-width: thin;
+}
+
+.kanban-column {
+  flex: 0 0 auto;
+  width: 600px;
+  max-width: 92vw;
+  background: var(--bg2);
+  border: 1px solid var(--bg4);
+  border-radius: var(--radius);
+  padding: 4px 14px 14px;
+}
+
+/* tighten the section header inside a column (no big top gap) */
+.kanban-column .section-header { margin-top: 10px; }
+.kanban-column > div:first-child .section-header { margin-top: 6px; }

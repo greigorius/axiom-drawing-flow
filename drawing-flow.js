@@ -614,6 +614,20 @@ module.exports = function mountDrawingFlow(app, notion) {
         const dtIds = getProp(page, "DT",         "relation");
         const { taskCode, drawingNo } = parseSubmissionTitle(title, stage);
         const dtName = await resolveDTName(notion, dtIds);
+
+        // For the Issued queue, surface whether client comments have been ingested
+        // onto the related MDS drawing for this stage (drives the cockpit comment badge).
+        let hasComments = false;
+        if (statusFilter === "Issued") {
+          const drawingIds = getProp(page, "Drawing", "relation");
+          if (drawingIds?.length) {
+            try {
+              const dwg = await notion.pages.retrieve({ page_id: drawingIds[0] });
+              hasComments = !!getProp(dwg, `${stage} Comment Files`, "rich_text");
+            } catch { /* drawing fetch failed — leave hasComments false */ }
+          }
+        }
+
         return {
           id: page.id, title, taskCode, drawingNo, dtName, stage,
           revision:    getProp(page, "Revision",     "select"),
@@ -629,6 +643,7 @@ module.exports = function mountDrawingFlow(app, notion) {
           taskIds:     getProp(page, "Item",         "relation"),
           blocked:     getProp(page, "Blocked",      "checkbox") ?? false,
           clientGrade: getProp(page, "Client Grade", "select"),
+          hasComments,
         };
       }));
 
@@ -1054,18 +1069,116 @@ module.exports = function mountDrawingFlow(app, notion) {
   });
 
   // PATCH /api/df/submissions/:id/hold
-  // Toggles the Blocked checkbox on a submission. Blocked rows are highlighted in the cockpit.
+  // Reads/writes the Blocked checkbox on a submission. The `DM Action` transition
+  // (→ Unblock while held, reverting to its original state when cleared) is driven by a
+  // Notion automation off the Blocked property — so it is intentionally NOT written here.
+  //
+  // blocked=true  → put on hold.
+  // blocked=false → unblock ("coordinate the hold items"): hand the drawing back to the DT,
+  //                 roll the related MDS drawing(s) status forward (Approval Updates, or
+  //                 Production Updates for C-revisions) and clear Hold Notes.
 
   app.patch("/api/df/submissions/:id/hold", async (req, res) => {
     const { id } = req.params;
     const { blocked } = req.body;   // boolean
     try {
-      await notion.pages.update({ page_id: id, properties: {
-        "Blocked": { checkbox: !!blocked },
-      }});
+      const subProps = { "Blocked": { checkbox: !!blocked } };
+      // On unblock, hand back to the DT.
+      if (!blocked) subProps["Ball In Court"] = { select: { name: "DT" } };
+      await notion.pages.update({ page_id: id, properties: subProps });
+
+      // On unblock, roll the related MDS drawing(s) forward and clear Hold Notes.
+      if (!blocked) {
+        const submissionPage = await notion.pages.retrieve({ page_id: id });
+        const drawingIds = getProp(submissionPage, "Drawing", "relation") || [];
+        const revision   = getProp(submissionPage, "Revision", "select") ?? "";
+        const nextStatus = revision.toUpperCase().startsWith("C") ? "Production Updates" : "Approval Updates";
+        for (const drawingId of drawingIds) {
+          try {
+            await notion.pages.update({ page_id: drawingId, properties: {
+              "Drawing Status": { select: { name: nextStatus } },
+              "Hold Notes":     { rich_text: [] },
+            }});
+          } catch (err) {
+            console.warn(`[hold:unblock] MDS update failed for ${drawingId}:`, err.message);
+          }
+        }
+      }
+
       res.json({ ok: true, blocked: !!blocked });
     } catch (err) {
       console.error("[hold]", err);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // POST /api/df/scan-comments
+  // On-demand client-comment ingest. The DM uploads marked-up PDFs into the Dropbox
+  // `Client Comments/` folders, then clicks the cockpit trigger. This fires the Make
+  // "cr-ingest" action, which lists those folders, and for each new (non-`R_`) file POSTs to
+  // /api/df/cr-ingest (below) to populate Notion, then renames the file with an `R_` prefix so
+  // it is not ingested again. Replaces continuous folder-watching (saves Make credits).
+
+  app.post("/api/df/scan-comments", async (req, res) => {
+    const webhookUrl = process.env.MAKE_CR_INGEST_WEBHOOK || process.env.MAKE_ACTIONS_WEBHOOK;
+    if (!webhookUrl) return res.status(500).json({ ok: false, error: "MAKE_CR_INGEST_WEBHOOK / MAKE_ACTIONS_WEBHOOK env var not set" });
+    fireWebhook(webhookUrl, { action: "cr-ingest", requestedAt: now() });
+    res.json({ ok: true });
+  });
+
+  // POST /api/df/cr-ingest
+  // Called by the Make cr-ingest scenario once per new client-comment PDF.
+  // Body: { filePath | dropboxPath, shareLink, filename }
+  // Parses the filename + folder path, finds the MDS drawing, and appends the comment file
+  // (hyperlinked) to `<stage> Comment Files` and the client acronym to `<stage> Client Reviewers`.
+  // Existing values are preserved (multiple clients may comment on the same drawing/stage).
+
+  app.post("/api/df/cr-ingest", async (req, res) => {
+    try {
+      const { filePath, dropboxPath, shareLink, filename } = req.body || {};
+      const pathStr = (filePath || dropboxPath || "");
+      const name = filename || pathStr.split("/").pop();
+      if (!name) return res.status(400).json({ ok: false, error: "filename required" });
+
+      // Parse {ClientAcronym}_{YYMMDD}_{DrawingNo}_{Rev}.pdf
+      const baseName = name.replace(/\.pdf$/i, "");
+      const parts = baseName.split("_");
+      if (parts.length < 4) return res.status(400).json({ ok: false, error: `Could not parse filename: ${name}` });
+      const clientAcronym = parts[0];
+      const drawingNo     = parts.slice(2, parts.length - 1).join("_");
+
+      // Stage from the folder path
+      const norm  = pathStr.replace(/\\/g, "/");
+      const stage = /\/A4\.5\//i.test(norm) ? "A4.5" : /\/S5\//i.test(norm) ? "S5" : "S4";
+      const commentProp  = `${stage} Comment Files`;
+      const reviewerProp = `${stage} Client Reviewers`;
+
+      const matches = await queryAll(notion, DRAWINGS_DB, {
+        property: "Drawing Number", title: { contains: drawingNo },
+      });
+      if (!matches.length) return res.json({ ok: true, matched: false, note: `No MDS drawing for ${drawingNo}` });
+      const drawing = matches[0];
+
+      // Append hyperlinked filename to the stage's Comment Files rich_text (preserve existing)
+      const existingRT = drawing.properties?.[commentProp]?.rich_text ?? [];
+      const separator  = existingRT.length ? [{ type: "text", text: { content: ", " } }] : [];
+      const newSegment = { type: "text", text: { content: name, link: shareLink ? { url: shareLink } : null } };
+
+      // Add client acronym to the stage's Client Reviewers multi-select (preserve existing)
+      const existingMS = drawing.properties?.[reviewerProp]?.multi_select ?? [];
+      const multiSelect = existingMS.some((o) => o.name === clientAcronym)
+        ? existingMS.map((o) => ({ name: o.name }))
+        : [...existingMS.map((o) => ({ name: o.name })), { name: clientAcronym }];
+
+      await notion.pages.update({ page_id: drawing.id, properties: {
+        [commentProp]:  { rich_text: [...existingRT, ...separator, newSegment] },
+        [reviewerProp]: { multi_select: multiSelect },
+      }});
+
+      console.log(`[cr-ingest] ${name} → ${drawingNo} ${stage} (${clientAcronym})`);
+      res.json({ ok: true, matched: true, drawingId: drawing.id, stage, clientAcronym, drawingNo });
+    } catch (err) {
+      console.error("[cr-ingest]", err);
       res.status(500).json({ ok: false, error: err.message });
     }
   });
