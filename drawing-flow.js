@@ -643,6 +643,7 @@ module.exports = function mountDrawingFlow(app, notion) {
           taskIds:     getProp(page, "Item",         "relation"),
           blocked:     getProp(page, "Blocked",      "checkbox") ?? false,
           clientGrade: getProp(page, "Client Grade", "select"),
+          dtNotified:  getProp(page, "DT Notified",  "checkbox") ?? false,
           hasComments,
         };
       }));

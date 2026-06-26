@@ -51,6 +51,19 @@ function groupByTask(submissions) {
   return groups;
 }
 
+// Deterministic hue (0–359) from a string — used to colour DTs and projects consistently.
+function hashHue(str) {
+  let h = 0;
+  for (let i = 0; i < (str || "").length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0;
+  return h % 360;
+}
+// Colour per DT (avatar) and per project (group accent). Same input → same colour.
+function personColor(name) { return `oklch(58% 0.16 ${hashHue(name || "?")})`; }
+function projectColor(taskCode) {
+  const proj = (taskCode || "").split("-").slice(0, 2).join("-") || taskCode || "x";
+  return `oklch(64% 0.15 ${hashHue(proj)})`;
+}
+
 // ─── Modals ───────────────────────────────────────────────────────────────────
 
 const BounceModal = ({ submission, onConfirm, onClose }) => {
@@ -782,18 +795,35 @@ const Cockpit = () => {
   };
 
   // ── Render ───────────────────────────────────────────────────────────────
-  const commentItems = issued.filter((s) => s.hasComments);
-  const signoffItems = issued.filter((s) => !s.hasComments);
+  const commentItems     = issued.filter((s) => s.hasComments);
+  const signoffItems     = issued.filter((s) => s.stage === "A4.5" && !s.hasComments);
+  const awaitingComments = issued.filter((s) => s.stage !== "A4.5" && !s.hasComments);
+  const reviewedNotify   = pendingNotification.filter((s) => s.status === "Approved" || s.status === "Rejected");
+  // Approved drawings only enter the Awaiting-Issue column once the DT has been notified;
+  // until their DWGs are uploaded (Make flips status → "Awaiting Issue") the Issue button stays grey.
+  const approvedItems    = awaitingIssue.filter((s) => s.status === "Awaiting Issue" || s.dtNotified);
   const total = submitted.length + awaitingIssue.length + issued.length + graded.length;
   const overdueCount = [...submitted, ...awaitingIssue, ...issued, ...graded]
     .filter((s) => (daysSince(s.bicSince) ?? 0) > 14).length;
 
+  const scanPendingLabel  = scanning && scanResult !== "error" ? "Scanning…" : "⟳ Scan Pending";
+  const scanCommentsLabel = scanCommentsBusy && scanCommentsResult !== "error" ? "💬 Ingesting…" : "💬 Scan Comments";
+  const sendDtLabel       = sendEmailBusy ? "Sending…" : "✉ Send DT Email";
+  const sendGradeLabel    = sendGradeEmailsBusy ? "Sending…" : "✉ Send DT Email";
+
   const COLS = [
-    { id: "submitted", title: "Submitted — Awaiting Review",     accent: "var(--info)",  sub: "New DT drawing submissions",        items: submitted,    tie: "Scan Pending" },
-    { id: "approved",  title: "Approved — Awaiting Issue",        accent: "var(--ok)",    sub: "Cleared internally, ready to issue", items: awaitingIssue },
-    { id: "comments",  title: "Issued — Review Client Comments",  accent: "var(--grade)", sub: "Client comments received",          items: commentItems, tie: "Scan Comments" },
-    { id: "signoff",   title: "Issued — Awaiting Sign-Off",       accent: "var(--warn)",  sub: "With client for grading",           items: signoffItems },
-    { id: "graded",    title: "Graded — Awaiting DT Notification", accent: "var(--accent)", sub: "Notion · DT Notified unchecked",  items: graded,       tie: "Send DT Emails" },
+    { id: "submitted", title: "Submitted — Awaiting Review", accent: "var(--info)", sub: "New DT drawing submissions", items: submitted,
+      action: { label: scanPendingLabel, onClick: handleScanPending, disabled: scanning } },
+    { id: "reviewed", title: "Reviewed — Notify DT", accent: "var(--ok)", sub: "Approved / bounced — awaiting DT email", items: reviewedNotify,
+      action: { label: sendDtLabel, onClick: handleSendDTEmails, disabled: sendEmailBusy, count: reviewedNotify.length } },
+    { id: "approved", title: "Approved — Awaiting Issue", accent: "var(--ok)", sub: "DT notified · awaiting DWG upload, then issue", items: approvedItems },
+    { id: "awaiting-comments", title: "Issued — Awaiting Comments", accent: "var(--info)", sub: "Issued to client, awaiting comments", items: awaitingComments,
+      action: { label: sendDtLabel, onClick: handleSendDTEmails, disabled: sendEmailBusy } },
+    { id: "comments", title: "Issued — Review Client Comments", accent: "var(--grade)", sub: "Client comments received", items: commentItems,
+      action: { label: scanCommentsLabel, onClick: handleScanComments, disabled: scanCommentsBusy, count: commentItems.length } },
+    { id: "signoff", title: "Issued — Awaiting Sign-Off", accent: "var(--warn)", sub: "A4.5 — with client for sign-off", items: signoffItems },
+    { id: "graded", title: "Graded — Notify DT", accent: "var(--accent)", sub: "Notion · DT Notified unchecked", items: graded,
+      action: { label: sendGradeLabel, onClick: handleSendGradeEmails, disabled: sendGradeEmailsBusy, count: graded.length } },
   ];
 
   const q = search.trim().toLowerCase();
@@ -801,33 +831,42 @@ const Cockpit = () => {
 
   const statusPill = (colId, s) => {
     switch (colId) {
-      case "submitted": return { cls: "info",  txt: "Submitted" };
-      case "approved":  return { cls: "ok",    txt: "Approved" };
-      case "comments":  return { cls: "grade", txt: "Comments" };
-      case "signoff":   return { cls: "warn",  txt: "Issued" };
-      case "graded":    return { cls: "grade", txt: "Grade " + (s.clientGrade || "—") };
-      default:          return { cls: "info",  txt: "" };
+      case "submitted":         return { cls: "info",  txt: "Submitted" };
+      case "reviewed":          return s.status === "Rejected" ? { cls: "danger", txt: "Bounced" } : { cls: "ok", txt: "Approved" };
+      case "approved":          return s.status === "Awaiting Issue" ? { cls: "ok", txt: "Ready to Issue" } : { cls: "warn", txt: "Awaiting DT Upload" };
+      case "awaiting-comments": return { cls: "info",  txt: "Issued" };
+      case "comments":          return { cls: "grade", txt: "Comments" };
+      case "signoff":           return { cls: "warn",  txt: "Sign-Off" };
+      case "graded":            return { cls: "grade", txt: "Grade " + (s.clientGrade || "—") };
+      default:                  return { cls: "info",  txt: "" };
     }
   };
 
+  // Every card gets a Hold/Unblock action; some stages add a primary action too.
   const cardActions = (colId, s) => {
     const isBusy = busy === s.id;
-    if (colId === "submitted") return (
+    const hold = (
+      <button className="k-act" onClick={(e) => { e.stopPropagation(); handleHold(s.id, s.blocked); }}>{s.blocked ? "Unblock" : "Hold"}</button>
+    );
+    let primary = null;
+    if (colId === "submitted") primary = (
       <>
         <button className="k-act go" disabled={isBusy} onClick={(e) => { e.stopPropagation(); handleApprove(s.id); }}>Approve</button>
         <button className="k-act" disabled={isBusy} onClick={(e) => { e.stopPropagation(); setBounceTarget(s); }}>Bounce</button>
       </>
     );
-    if (colId === "approved") return (
-      <button className="k-act go" disabled={isBusy} onClick={(e) => { e.stopPropagation(); setIssueTarget(s); }}>Issue</button>
+    else if (colId === "approved") {
+      const ready = s.status === "Awaiting Issue"; // DWGs uploaded → Issue enabled (blue)
+      primary = (
+        <button className={`k-act${ready ? " go" : ""}`} disabled={isBusy || !ready}
+          onClick={(e) => { e.stopPropagation(); setIssueTarget(s); }}
+          title={ready ? "Issue the drawing" : "Awaiting DT to upload DWGs"}>Issue</button>
+      );
+    }
+    else if (colId === "comments" || colId === "signoff" || colId === "awaiting-comments") primary = (
+      <button className="k-act go" onClick={(e) => { e.stopPropagation(); setLogStatusTarget(s); }}>Grade</button>
     );
-    if (colId === "comments" || colId === "signoff") return (
-      <>
-        <button className="k-act go" onClick={(e) => { e.stopPropagation(); setLogStatusTarget(s); }}>Grade</button>
-        <button className="k-act" onClick={(e) => { e.stopPropagation(); handleHold(s.id, s.blocked); }}>{s.blocked ? "Unblock" : "Hold"}</button>
-      </>
-    );
-    return null;
+    return (<>{primary}{hold}</>);
   };
 
   const renderCard = (s, colId) => {
@@ -860,11 +899,25 @@ const Cockpit = () => {
         </div>
         <div className="k-card-foot">
           <span className={`k-age ${ageCls}`} title={age == null ? "" : `${age} days in stage`}>{age == null ? "—" : age + "d"}</span>
-          <span className="k-ava" title={s.dtName || ""}>{initials}</span>
+          <span className="k-ava" style={{ background: personColor(s.dtName) }} title={s.dtName || ""}>{initials}</span>
           <span className="k-cardact">{cardActions(colId, s)}</span>
         </div>
       </div>
     );
+  };
+
+  // Group a column's cards by project-suffix (taskCode), colour-coded by project.
+  const renderColumnBody = (items, colId) => {
+    if (items.length === 0) return <div className="k-empty">{q ? "No matches in this stage" : "Nothing here — all clear"}</div>;
+    const groups = groupByTask(items);
+    return Object.entries(groups).map(([taskCode, rows]) => (
+      <div key={taskCode} className="k-group" style={{ "--k-proj": projectColor(taskCode) }}>
+        <div className="k-group-head">
+          <span className="k-group-dot" aria-hidden="true" />{taskCode}<span className="k-group-n">{rows.length}</span>
+        </div>
+        {rows.map((s) => renderCard(s, colId))}
+      </div>
+    ));
   };
 
   return (
@@ -891,31 +944,9 @@ const Cockpit = () => {
         </div>
         <div className="k-spacer" />
         {error && <span className="k-result error">Load failed</span>}
-        <button className="k-btn" onClick={handleScanPending} disabled={scanning}
-          title="Trigger Make ingest to pick up new Dropbox submissions">
-          {scanning && scanResult !== "error" ? "Scanning…" : "⟳ Scan Pending"}
-        </button>
         {scanResult === "error" && <span className="k-result error">Scan failed</span>}
-        <button className="k-btn" onClick={handleScanComments} disabled={scanCommentsBusy}
-          title="Ingest client comments from the Dropbox Client Comments folders">
-          {scanCommentsBusy && scanCommentsResult !== "error" ? "Ingesting…" : "💬 Scan Comments"}
-          {commentItems.length > 0 && <span className="k-count">{commentItems.length}</span>}
-        </button>
-        {scanCommentsResult === "ok" && <span className="k-result ok">Triggered</span>}
-        {pendingNotification.length > 0 && (
-          <button className="k-btn" onClick={handleSendDTEmails} disabled={sendEmailBusy}
-            title={`Send pending DT notification emails for ${pendingNotification.length} item(s)`}>
-            {sendEmailBusy ? "Sending…" : "Pending DT Emails"}<span className="k-count">{pendingNotification.length}</span>
-          </button>
-        )}
-        {sendEmailResult === "ok" && <span className="k-result ok">Sent!</span>}
-        <button className="k-btn primary" onClick={handleSendGradeEmails}
-          disabled={sendGradeEmailsBusy || graded.length === 0}
-          title={graded.length === 0 ? "No graded drawings awaiting notification" : `Send grade emails for ${graded.length} drawing(s)`}>
-          {sendGradeEmailsBusy ? "Sending…" : "Send DT Grade Emails"}
-          {graded.length > 0 && <span className="k-count">{graded.length}</span>}
-        </button>
-        {sendGradeResult === "ok" && <span className="k-result ok">Sent!</span>}
+        {sendEmailResult === "ok" && <span className="k-result ok">Emails sent!</span>}
+        {sendGradeResult === "ok" && <span className="k-result ok">Grade emails sent!</span>}
         {sendGradeResult === "error" && <span className="k-result error">Send failed</span>}
       </div>
 
@@ -930,15 +961,16 @@ const Cockpit = () => {
                   <h2>{col.title}</h2>
                   <span className="k-num">{items.length}</span>
                 </div>
-                <div className="k-col-sub">
-                  {col.tie && <span className="k-tie-pill">{col.tie}</span>}
-                  <span>{col.sub}</span>
-                </div>
+                <div className="k-col-sub"><span>{col.sub}</span></div>
+                {col.action && (
+                  <button className="k-col-btn" onClick={col.action.onClick} disabled={col.action.disabled}>
+                    {col.action.label}
+                    {col.action.count != null && col.action.count > 0 && <span className="k-count">{col.action.count}</span>}
+                  </button>
+                )}
               </div>
               <div className="k-col-body">
-                {items.length === 0
-                  ? <div className="k-empty">{q ? "No matches in this stage" : "Nothing here — all clear"}</div>
-                  : items.map((s) => renderCard(s, col.id))}
+                {renderColumnBody(items, col.id)}
               </div>
             </div>
           );
