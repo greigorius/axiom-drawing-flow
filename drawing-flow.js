@@ -1162,6 +1162,15 @@ module.exports = function mountDrawingFlow(app, notion) {
 
       // Append hyperlinked filename to the stage's Comment Files rich_text (preserve existing)
       const existingRT = drawing.properties?.[commentProp]?.rich_text ?? [];
+
+      // Deduplicate — skip if this filename (with or without R_ prefix) is already recorded
+      const existingText = existingRT.map((r) => r.text?.content ?? "").join("");
+      const baseScanName = name.replace(/^R_/i, "");
+      if (existingText.includes(baseScanName)) {
+        console.log(`[cr-ingest] already ingested, skipping: ${name}`);
+        return res.json({ ok: true, matched: true, skipped: true, drawingId: drawing.id, stage, drawingNo });
+      }
+
       const separator  = existingRT.length ? [{ type: "text", text: { content: ", " } }] : [];
       const newSegment = { type: "text", text: { content: name, link: shareLink ? { url: shareLink } : null } };
 
