@@ -529,6 +529,8 @@ const Cockpit = () => {
   };
 
   // ── Fetch ────────────────────────────────────────────────────────────────
+  const consecutiveErrors = React.useRef(0);
+
   const fetchQueue = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     setError(null);
@@ -574,7 +576,9 @@ const Cockpit = () => {
       setPendingNotification(pending);
       setGraded(graded_.filter((s) => !s.dtNotified));
       setLastPoll(new Date());
+      consecutiveErrors.current = 0;
     } catch (err) {
+      consecutiveErrors.current += 1;
       setError(err.message);
     } finally {
       setLoading(false);
@@ -583,8 +587,13 @@ const Cockpit = () => {
 
   useEffect(() => {
     fetchQueue();
-    const interval = setInterval(() => fetchQueue(true), 30000);
-    return () => clearInterval(interval);
+    // Back off polling after repeated failures: 30s normally, 5min after 3+ errors
+    const schedule = () => {
+      const delay = consecutiveErrors.current >= 3 ? 300_000 : 30_000;
+      return setTimeout(() => { fetchQueue(true); timerRef.current = schedule(); }, delay);
+    };
+    const timerRef = { current: schedule() };
+    return () => clearTimeout(timerRef.current);
   }, [fetchQueue]);
 
   // ── Individual actions ───────────────────────────────────────────────────
