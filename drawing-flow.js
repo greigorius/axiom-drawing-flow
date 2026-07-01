@@ -514,6 +514,122 @@ module.exports = function mountDrawingFlow(app, notion) {
     return res.json({ ok: true, submissionId: newSubmission.id, submissionTitle, qaRound, isResubmission: qaRound > 1 });
   });
 
+  // GET /api/df/queue
+  // Returns all cockpit queues in a single request, with sequential Notion calls
+  // to avoid hitting the ~3 req/s rate limit when multiple Lambda invocations run in parallel.
+
+  app.get("/api/df/queue", async (req, res) => {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    // Helper: fetch one status group sequentially, returns mapped submission objects.
+    const fetchStatus = async (statusFilter, extraHasComments = false) => {
+      const pages = await queryAll(notion, SUBMISSIONS_DB,
+        { property: "Status", select: { equals: statusFilter } },
+        [{ property: "BIC Since", direction: "ascending" }]
+      );
+      const results = [];
+      for (const page of pages) {
+        const title     = getProp(page, "Submission", "title");
+        const stage     = getProp(page, "Stage",      "select");
+        const dtIds     = getProp(page, "DT",         "relation");
+        const { taskCode, drawingNo } = parseSubmissionTitle(title, stage);
+        const dtName    = await resolveDTName(notion, dtIds);
+
+        let hasComments = false;
+        if (extraHasComments) {
+          const drawingIds = getProp(page, "Drawing", "relation");
+          if (drawingIds?.length) {
+            try {
+              const dwg = await notion.pages.retrieve({ page_id: drawingIds[0] });
+              hasComments = !!getProp(dwg, `${stage} Comment Files`, "rich_text");
+            } catch { /* ignore */ }
+          }
+        }
+
+        results.push({
+          id: page.id, title, taskCode, drawingNo, dtName, stage,
+          revision:    getProp(page, "Revision",      "select"),
+          qaRound:     getProp(page, "QA Round",      "number"),
+          status:      getProp(page, "Status",        "select"),
+          bic:         getProp(page, "Ball In Court", "select"),
+          bicSince:    getProp(page, "BIC Since",     "date"),
+          submitted:   getProp(page, "Submitted",     "date"),
+          reviewed:    getProp(page, "Reviewed",      "date"),
+          dropboxPath: getProp(page, "Dropbox Path",  "url"),
+          shareLink:   getProp(page, "Share Link",    "url"),
+          drawingIds:  getProp(page, "Drawing",       "relation"),
+          taskIds:     getProp(page, "Item",          "relation"),
+          blocked:     getProp(page, "Blocked",       "checkbox") ?? false,
+          clientGrade: getProp(page, "Client Grade",  "select"),
+          dtNotified:  getProp(page, "DT Notified",   "checkbox") ?? false,
+          hasComments,
+        });
+        await sleep(50); // small delay between per-page Notion calls
+      }
+      return results;
+    };
+
+    try {
+      const submitted     = await fetchStatus("Submitted");         await sleep(150);
+      const rejected      = await fetchStatus("Rejected");          await sleep(150);
+      const approved      = await fetchStatus("Approved");          await sleep(150);
+      const awaitingIssue = await fetchStatus("Awaiting Issue");    await sleep(150);
+      const issued        = await fetchStatus("Issued", true);      await sleep(150);
+      const graded        = await fetchStatus("Graded");            await sleep(150);
+
+      // pending-notification: Approved+Rejected with Folder Link set + DT Notified=false
+      // or Issued+Graded with DT Notified=false
+      const FOLDER_STATUSES  = ["Approved", "Rejected"];
+      const INSTANT_STATUSES = ["Issued", "Graded"];
+      const pendingPages = [];
+      for (const s of [...FOLDER_STATUSES, ...INSTANT_STATUSES]) {
+        const pages = await queryAll(notion, SUBMISSIONS_DB, {
+          and: [
+            { property: "Status",      select:   { equals: s     } },
+            { property: "DT Notified", checkbox: { equals: false } },
+          ]
+        }, [{ property: "BIC Since", direction: "ascending" }]);
+        pendingPages.push(...pages);
+        await sleep(150);
+      }
+      const folderGated = pendingPages.filter((page) => {
+        const status = getProp(page, "Status", "select");
+        if (FOLDER_STATUSES.includes(status)) return !!getProp(page, "Folder Link", "url");
+        return true;
+      });
+      const pending = await Promise.all(folderGated.map(async (page) => {
+        const title      = getProp(page, "Submission", "title");
+        const stage      = getProp(page, "Stage",      "select");
+        const dtIds      = getProp(page, "DT",         "relation");
+        const status     = getProp(page, "Status",     "select");
+        const dmAction   = getProp(page, "DM Action",  "select");
+        const { taskCode, drawingNo } = parseSubmissionTitle(title, stage);
+        const dtName     = await resolveDTName(notion, dtIds);
+        const dt         = await resolveDT(notion, dtIds);
+        const rawPath    = getProp(page, "Dropbox Path", "url");
+        const folderLink = getProp(page, "Folder Link",  "url");
+        const folderPath = rawPath ? toFullDropboxPath(rawPath).split("/").slice(0, -1).join("/") : null;
+        const folderSegs = folderPath ? folderPath.split("/").filter(Boolean) : [];
+        const folderName = folderSegs.slice(-1).join("") || null;
+        return {
+          id: page.id, title, taskCode, drawingNo, dtName, dtEmail: dt.email, stage,
+          status, dmAction,
+          revision:  getProp(page, "Revision",     "select"),
+          qaRound:   getProp(page, "QA Round",     "number"),
+          grade:     getProp(page, "Client Grade", "select"),
+          bicSince:  getProp(page, "BIC Since",    "date"),
+          reviewed:  getProp(page, "Reviewed",     "date"),
+          folderPath, folderName, folderLink,
+        };
+      }));
+
+      res.json({ submitted, rejected, approved, awaitingIssue, issued, graded, pending });
+    } catch (err) {
+      console.error("[queue]", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/df/submissions
   // ?status=Submitted|Approved|Awaiting Issue|Issued|Rejected|Graded
   // ?status=pending-notification  → actioned items where DT Notified = false
@@ -1658,7 +1774,6 @@ module.exports = function mountDrawingFlow(app, notion) {
         drawingStatus:   getProp(page, "Drawing Status",           "select"),
         submissionStage: getProp(page, "Submission Stage",         "select"),
         revision:        getProp(page, "Rev",                      "select"),
-        s4Status:        getProp(page, "S4 Status",                "select"),
         s5Status:        getProp(page, "S5 Status",                "select"),
         abStatus:        getProp(page, "AB Status",                "select"),
         s4SubmitActual:  getProp(page, "S4 Submit Date (Actual)",  "date"),

@@ -533,35 +533,19 @@ const Cockpit = () => {
     if (!silent) setLoading(true);
     setError(null);
     try {
-      // Batch in pairs with 300 ms gaps to stay under Notion's ~3 req/s rate limit
-      const [subRes, bouncedRes] = await Promise.all([
-        fetch("/api/df/submissions?status=Submitted"),
-        fetch("/api/df/submissions?status=Rejected"),
-      ]);
-      await pause(300);
-      const [approvedRes, awaitRes] = await Promise.all([
-        fetch("/api/df/submissions?status=Approved"),
-        fetch("/api/df/submissions?status=Awaiting%20Issue"),
-      ]);
-      await pause(300);
-      const [issRes, pendingRes] = await Promise.all([
-        fetch("/api/df/submissions?status=Issued"),
-        fetch("/api/df/submissions?status=pending-notification"),
-      ]);
-      await pause(300);
-      const gradedRes = await fetch("/api/df/submissions?status=Graded");
+      // Single request — backend runs all Notion queries sequentially to avoid rate limiting
+      const queueRes = await fetch("/api/df/queue");
+      if (!queueRes.ok) throw new Error(`API error ${queueRes.status}`);
 
-      if (!subRes.ok || !bouncedRes.ok || !approvedRes.ok || !awaitRes.ok || !issRes.ok || !pendingRes.ok || !gradedRes.ok) {
-        throw new Error("API error");
-      }
-
-      const { submissions: subs      } = await subRes.json();
-      const { submissions: bounced_  } = await bouncedRes.json();
-      const { submissions: approved_ } = await approvedRes.json();
-      const { submissions: await_    } = await awaitRes.json();
-      const { submissions: iss       } = await issRes.json();
-      const { submissions: pending   } = await pendingRes.json();
-      const { submissions: graded_   } = await gradedRes.json();
+      const {
+        submitted:     subs,
+        rejected:      bounced_,
+        approved:      approved_,
+        awaitingIssue: await_,
+        issued:        iss,
+        graded:        graded_,
+        pending,
+      } = await queueRes.json();
 
       const newOnes = subs.filter((s) => !knownIds.current.has(s.id));
       if (newOnes.length && knownIds.current.size > 0) notify(newOnes.length);
