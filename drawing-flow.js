@@ -1925,6 +1925,7 @@ module.exports = function mountDrawingFlow(app, notion) {
       const r = await fetch(`https://${apiZone}.make.com/api/v2/scenarios/${scenarioId}/run`, {
         method:  "POST",
         headers: { "Authorization": `Token ${apiKey}`, "Content-Type": "application/json" },
+      });
       if (!r.ok) {
         const body = await r.text();
         let detail = body;
