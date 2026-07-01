@@ -462,6 +462,8 @@ const PendingNotificationSection = ({ submissions }) => {
 
 // ─── Cockpit root ─────────────────────────────────────────────────────────────
 
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+
 const Cockpit = () => {
   const [submitted,            setSubmitted]            = useState([]);
   const [awaitingIssue,        setAwaitingIssue]        = useState([]);
@@ -482,6 +484,7 @@ const Cockpit = () => {
   const [scanError,            setScanError]            = useState(null);
   const [scanCommentsBusy,     setScanCommentsBusy]     = useState(false);
   const [scanCommentsResult,   setScanCommentsResult]   = useState(null);  // "ok" | "error" | null
+  const [bounced,              setBounced]              = useState([]);
   const [graded,               setGraded]               = useState([]);
   const [sendGradeEmailsBusy,  setSendGradeEmailsBusy]  = useState(false);
   const [sendGradeResult,      setSendGradeResult]      = useState(null);  // "ok" | "error" | null
@@ -530,20 +533,30 @@ const Cockpit = () => {
     if (!silent) setLoading(true);
     setError(null);
     try {
-      const [subRes, approvedRes, awaitRes, issRes, pendingRes, gradedRes] = await Promise.all([
+      // Batch in pairs with 300 ms gaps to stay under Notion's ~3 req/s rate limit
+      const [subRes, bouncedRes] = await Promise.all([
         fetch("/api/df/submissions?status=Submitted"),
+        fetch("/api/df/submissions?status=Rejected"),
+      ]);
+      await pause(300);
+      const [approvedRes, awaitRes] = await Promise.all([
         fetch("/api/df/submissions?status=Approved"),
         fetch("/api/df/submissions?status=Awaiting%20Issue"),
+      ]);
+      await pause(300);
+      const [issRes, pendingRes] = await Promise.all([
         fetch("/api/df/submissions?status=Issued"),
         fetch("/api/df/submissions?status=pending-notification"),
-        fetch("/api/df/submissions?status=Graded"),
       ]);
+      await pause(300);
+      const gradedRes = await fetch("/api/df/submissions?status=Graded");
 
-      if (!subRes.ok || !approvedRes.ok || !awaitRes.ok || !issRes.ok || !pendingRes.ok || !gradedRes.ok) {
+      if (!subRes.ok || !bouncedRes.ok || !approvedRes.ok || !awaitRes.ok || !issRes.ok || !pendingRes.ok || !gradedRes.ok) {
         throw new Error("API error");
       }
 
       const { submissions: subs      } = await subRes.json();
+      const { submissions: bounced_  } = await bouncedRes.json();
       const { submissions: approved_ } = await approvedRes.json();
       const { submissions: await_    } = await awaitRes.json();
       const { submissions: iss       } = await issRes.json();
@@ -555,6 +568,7 @@ const Cockpit = () => {
       subs.forEach((s) => knownIds.current.add(s.id));
 
       setSubmitted(subs);
+      setBounced(bounced_.filter((s) => s.dtNotified));
       setAwaitingIssue([...approved_, ...await_]);
       setIssued(iss);
       setPendingNotification(pending);
@@ -812,6 +826,7 @@ const Cockpit = () => {
   const sendGradeLabel    = sendGradeEmailsBusy ? "Sending…" : "✉ Send DT Email";
 
   const COLS = [
+    { id: "bounced", title: "Bounced — With DT", accent: "var(--danger)", sub: "Returned to DT · awaiting revised resubmission", items: bounced },
     { id: "submitted", title: "Submitted — Awaiting Review", accent: "var(--info)", sub: "New DT drawing submissions", items: submitted,
       action: { label: scanPendingLabel, onClick: handleScanPending, disabled: scanning } },
     { id: "reviewed", title: "Reviewed — Notify DT", accent: "var(--ok)", sub: "Approved / bounced — awaiting DT email", items: reviewedNotify,
@@ -831,6 +846,7 @@ const Cockpit = () => {
 
   const statusPill = (colId, s) => {
     switch (colId) {
+      case "bounced":           return { cls: "danger", txt: `R${s.qaRound ?? "?"} Bounced` };
       case "submitted":         return { cls: "info",  txt: "Submitted" };
       case "reviewed":          return s.status === "Rejected" ? { cls: "danger", txt: "Bounced" } : { cls: "ok", txt: "Approved" };
       case "approved":          return s.status === "Awaiting Issue" ? { cls: "ok", txt: "Ready to Issue" } : { cls: "warn", txt: "Awaiting DT Upload" };
