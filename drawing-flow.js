@@ -1345,11 +1345,16 @@ module.exports = function mountDrawingFlow(app, notion) {
 
   app.patch("/api/df/submissions/:id/issue", async (req, res) => {
     const { id } = req.params;
+    console.log(`[issue] retrieving page: ${id}`);
     let submissionPage;
     try { submissionPage = await notion.pages.retrieve({ page_id: id }); }
-    catch { return res.status(404).json({ ok: false, error: "Submission not found" }); }
+    catch (err) {
+      console.error(`[issue] retrieve failed for ${id}:`, err?.status, err?.code, err?.message);
+      return res.status(404).json({ ok: false, error: "Submission not found", detail: `${err?.code ?? ""}: ${err?.message ?? err}` });
+    }
 
     const currentStatus = getProp(submissionPage, "Status", "select");
+    console.log(`[issue] page retrieved, status: ${currentStatus}`);
     if (currentStatus !== "Awaiting Issue") {
       return res.status(400).json({ ok: false, error: `Expected Awaiting Issue, got: ${currentStatus}` });
     }

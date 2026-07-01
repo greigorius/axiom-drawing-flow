@@ -618,7 +618,7 @@ const Cockpit = () => {
       const res = await fetch(`/api/df/submissions/${id}/issue`, { method: "PATCH" });
       if (!res.ok) {
         const body = await res.json();
-        alert(`Issue failed: ${body.error || res.statusText}`);
+        alert(`Issue failed: ${body.error || res.statusText}${body.detail ? `\n(${body.detail})` : ""}`);
       } else {
         await fetchQueue(true);
       }
