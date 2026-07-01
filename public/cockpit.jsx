@@ -567,8 +567,24 @@ const Cockpit = () => {
       if (newOnes.length && knownIds.current.size > 0) notify(newOnes.length);
       subs.forEach((s) => knownIds.current.add(s.id));
 
+      // For each drawing, find the highest QA Round seen across all submissions.
+      // A bounced submission only shows if it's still the latest round (no resubmission yet).
+      const maxQaByDrawing = {};
+      for (const s of [...subs, ...bounced_, ...approved_, ...await_, ...iss, ...graded_]) {
+        for (const did of (s.drawingIds || [])) {
+          if ((s.qaRound ?? 0) > (maxQaByDrawing[did] ?? 0)) maxQaByDrawing[did] = s.qaRound ?? 0;
+        }
+      }
+
       setSubmitted(subs);
-      setBounced(bounced_.filter((s) => s.dtNotified));
+      setBounced(
+        bounced_.filter((s) => {
+          if (!s.dtNotified) return false;
+          const ids = s.drawingIds || [];
+          if (!ids.length) return true; // no drawing link — show it
+          return ids.every((did) => (s.qaRound ?? 0) >= (maxQaByDrawing[did] ?? 0));
+        })
+      );
       setAwaitingIssue([...approved_, ...await_]);
       setIssued(iss);
       setPendingNotification(pending);
