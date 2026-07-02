@@ -700,6 +700,7 @@ const Cockpit = () => {
   const handleBatchApprove = (ids) => runBatch(ids, "approve");
   const handleBatchBounce  = (ids) => runBatch(ids, "bounce", "PATCH", {});
   const handleBatchIssue   = (ids) => runBatch(ids, "issue");
+  const handleBatchHold    = (ids) => runBatch(ids, "hold", "PATCH", { blocked: true });
 
   // ── Send DT emails ───────────────────────────────────────────────────────
   const handleSendDTEmails = async () => {
@@ -753,6 +754,7 @@ const Cockpit = () => {
 
   const handleHold = async (id, currentBlocked) => {
     const blocked = !currentBlocked;
+    setBusy(id);
     try {
       const res  = await fetch(`/api/df/submissions/${id}/hold`, {
         method: "PATCH",
@@ -764,9 +766,11 @@ const Cockpit = () => {
         alert(`Hold failed: ${body.error || res.statusText}`);
         return;
       }
-      fetchQueue(true);
+      await fetchQueue(true);
     } catch (err) {
       alert(`Hold toggle error: ${err.message}`);
+    } finally {
+      setBusy(null);
     }
   };
 
@@ -871,12 +875,16 @@ const Cockpit = () => {
   const cardActions = (colId, s) => {
     const isBusy = busy === s.id;
     const hold = (
-      <button className="k-act" onClick={(e) => { e.stopPropagation(); handleHold(s.id, s.blocked); }}>{s.blocked ? "Unblock" : "Hold"}</button>
+      <button className="k-act" disabled={isBusy}
+        onClick={(e) => { e.stopPropagation(); handleHold(s.id, s.blocked); }}
+        title={s.blocked ? "Remove hold" : "Put on hold (RFI / Design Change)"}>
+        {isBusy ? "…" : (s.blocked ? "Unblock" : "Hold")}
+      </button>
     );
     let primary = null;
     if (colId === "submitted") primary = (
       <>
-        <button className="k-act go" disabled={isBusy} onClick={(e) => { e.stopPropagation(); handleApprove(s.id); }}>Approve</button>
+        <button className="k-act go" disabled={isBusy} onClick={(e) => { e.stopPropagation(); handleApprove(s.id); }}>{isBusy ? "…" : "Approve"}</button>
         <button className="k-act" disabled={isBusy} onClick={(e) => { e.stopPropagation(); setBounceTarget(s); }}>Bounce</button>
       </>
     );
@@ -1005,9 +1013,12 @@ const Cockpit = () => {
       {selectedIds.size > 0 && (
         <div className="k-bulkbar">
           <span className="k-bulk-n">{selectedIds.size}</span><span className="k-bulk-lbl">selected</span>
-          <button className="k-btn" onClick={clearSelection}>Clear</button>
+          {batchBusy && <span className="k-bulk-lbl" style={{ color: "var(--accent)" }}>Working…</span>}
+          <button className="k-btn" onClick={clearSelection} disabled={batchBusy}>Clear</button>
           <button className="k-btn" onClick={() => handleBatchApprove([...selectedIds])} disabled={batchBusy}>Approve</button>
           <button className="k-btn" onClick={() => handleBatchBounce([...selectedIds])} disabled={batchBusy}>Bounce</button>
+          <button className="k-btn" onClick={() => handleBatchHold([...selectedIds])} disabled={batchBusy}
+            title="Put selected drawings on hold (RFI / Design Change)">Hold</button>
           <button className="k-btn primary" onClick={() => handleBatchIssue([...selectedIds])} disabled={batchBusy}>Issue</button>
         </div>
       )}
