@@ -272,7 +272,7 @@ NOTION_DB_INPUTS=                              # Set once Inputs DB is created i
 
 # Make.com
 MAKE_ACTIONS_WEBHOOK=                          # Scenario 2 webhook URL
-MAKE_CR_INGEST_WEBHOOK=https://hook.eu1.make.com/vge6mxe63qh8ucq44e55bz8bygd19q5d
+MAKE_CR_INGEST_WEBHOOK=https://hook.eu1.make.com/xxxx      # Client-review ingest webhook URL
 MAKE_SCENARIO_ID=                              # Scenario 1 ID (for Scan Pending button)
 MAKE_API_KEY=                                  # Make.com API key
 MAKE_API_ZONE=eu1                              # Make.com region
