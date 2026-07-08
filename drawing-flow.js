@@ -240,6 +240,25 @@ async function queryAll(notion, database_id, filter, sorts) {
   return results;
 }
 
+// Notion's API is limited to ~3 requests/second. A bare Promise.all over a large
+// list (e.g. every Issued submission needing its own drawing lookup) fires everything
+// at once and trips that limit — Notion returns 429s that this codebase doesn't retry,
+// so they surface as unhandled rejections → 500s. This runs `fn` over `items` with only
+// `limit` in flight at a time, so any one status-group request stays under the rate limit
+// even when the group has 50+ rows.
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
 function getProp(page, name, type) {
   const prop = page.properties?.[name];
   if (!prop) return null;
@@ -773,7 +792,7 @@ module.exports = function mountDrawingFlow(app, notion) {
         return drawingCache.get(id);
       };
 
-      const submissions = await Promise.all(results.map(async (page) => {
+      const submissions = await mapWithConcurrency(results, 4, async (page) => {
         const title = getProp(page, "Submission", "title");
         const stage = getProp(page, "Stage",      "select");
         const dtIds = getProp(page, "DT",         "relation");
@@ -782,8 +801,10 @@ module.exports = function mountDrawingFlow(app, notion) {
 
         // For the Issued queue, surface whether client comments have been ingested
         // onto the related MDS drawing for this stage (drives the cockpit comment badge).
-        let hasComments = false;
-        if (statusFilter === "Issued") {
+        // Fast path: cr-ingest now flips Ball In Court -> "DM" on the submission itself
+        // when a comment lands, so most rows can skip the extra drawing lookup entirely.
+        let hasComments = getProp(page, "Ball In Court", "select") === "DM" && statusFilter === "Issued";
+        if (statusFilter === "Issued" && !hasComments) {
           const drawingIds = getProp(page, "Drawing", "relation");
           if (drawingIds?.length) {
             try {
@@ -811,7 +832,7 @@ module.exports = function mountDrawingFlow(app, notion) {
           dtNotified:  getProp(page, "DT Notified",  "checkbox") ?? false,
           hasComments,
         };
-      }));
+      });
 
       res.json({ submissions });
     } catch (err) {

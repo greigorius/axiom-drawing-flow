@@ -545,17 +545,24 @@ const Cockpit = () => {
     if (!silent) setLoading(true);
     setError(null);
     try {
+      // One retry on failure — a 500 here is usually a transient Notion rate-limit
+      // blip (bursty concurrent lookups within a single status group), not a real
+      // fault, and clears on its own a second later.
+      const fetchWithRetry = async (url, label) => {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const res = await fetch(url);
+          if (res.ok) return (await res.json()).submissions;
+          if (attempt === 0) { await pause(1500); continue; }
+          throw new Error(`API error ${res.status} (${label})`);
+        }
+      };
       const fetchStatus = async (status, i) => {
-        await pause(i * 120);
-        const res = await fetch(`/api/df/submissions?status=${encodeURIComponent(status)}`);
-        if (!res.ok) throw new Error(`API error ${res.status} (${status})`);
-        return (await res.json()).submissions;
+        await pause(i * 350);
+        return fetchWithRetry(`/api/df/submissions?status=${encodeURIComponent(status)}`, status);
       };
       const fetchPending = async (i) => {
-        await pause(i * 120);
-        const res = await fetch("/api/df/submissions?status=pending-notification");
-        if (!res.ok) throw new Error(`API error ${res.status} (pending)`);
-        return (await res.json()).submissions;
+        await pause(i * 350);
+        return fetchWithRetry("/api/df/submissions?status=pending-notification", "pending");
       };
 
       const [subs, bounced_, approved_, await_, iss, graded_, pending] = await Promise.all([
