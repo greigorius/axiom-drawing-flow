@@ -76,9 +76,10 @@ const STAGE_LOG_STATUS_MAP = {
 };
 
 const BIC = {
-  SUBMITTED: "DM",
-  BOUNCED:   "DT",
-  GRADED:    "DM",   // DM holds BIC until grade email is fired, then switches to DT
+  SUBMITTED:        "DM",
+  BOUNCED:          "DT",
+  GRADED:           "DM",   // DM holds BIC until grade email is fired, then switches to DT
+  COMMENTS_RECEIVED: "DM",  // Client comments landed on an Issued submission — DM needs to review
 };
 
 // ── Working-days helper ──────────────────────────────────────────────────────
@@ -364,6 +365,20 @@ async function resolveDT(notion, dtIds) {
 // Convenience wrapper for the submissions list endpoint.
 async function resolveDTName(notion, dtIds) {
   return (await resolveDT(notion, dtIds)).name;
+}
+
+// Request-scoped DT resolver — dedupes concurrent lookups for the same DT id so a
+// status list with many submissions from the same handful of DTs only hits Notion
+// once per unique DT, not once per submission. Cuts Notion API load substantially
+// on endpoints that map an array of pages in parallel (Promise.all).
+function makeDTResolver(notion) {
+  const cache = new Map(); // dtId -> Promise<{ name, email }>
+  return function resolveCached(dtIds) {
+    const id = dtIds?.[0];
+    if (!id) return Promise.resolve({ name: null, email: null });
+    if (!cache.has(id)) cache.set(id, resolveDT(notion, [id]));
+    return cache.get(id);
+  };
 }
 
 // Fire-and-forget POST to a Make.com webhook URL.
@@ -699,6 +714,9 @@ module.exports = function mountDrawingFlow(app, notion) {
 
         const results = [...folderResults, ...instantResults];
 
+        // Dedupe DT lookups — a handful of DTs may own many of these submissions.
+        const resolveCached = makeDTResolver(notion);
+
         const submissions = await Promise.all(results.map(async (page) => {
           const title    = getProp(page, "Submission", "title");
           const stage    = getProp(page, "Stage",      "select");
@@ -706,8 +724,8 @@ module.exports = function mountDrawingFlow(app, notion) {
           const status   = getProp(page, "Status",     "select");
           const dmAction = getProp(page, "DM Action",  "select");
           const { taskCode, drawingNo } = parseSubmissionTitle(title, stage);
-          const dtName   = await resolveDTName(notion, dtIds);
-          const dt       = await resolveDT(notion, dtIds);
+          const dt       = await resolveCached(dtIds);
+          const dtName   = dt.name;
           const rawPath  = getProp(page, "Dropbox Path", "url");
           const folderLink = getProp(page, "Folder Link", "url");
           const folderPath = rawPath
@@ -746,12 +764,21 @@ module.exports = function mountDrawingFlow(app, notion) {
         [{ property: "BIC Since", direction: "ascending" }]
       );
 
+      // Dedupe DT + drawing lookups across this status group — several submissions
+      // can share the same DT or the same MDS drawing (multiple stages/revisions).
+      const resolveCached = makeDTResolver(notion);
+      const drawingCache  = new Map(); // drawingId -> Promise<page>
+      const getDrawing = (id) => {
+        if (!drawingCache.has(id)) drawingCache.set(id, notion.pages.retrieve({ page_id: id }));
+        return drawingCache.get(id);
+      };
+
       const submissions = await Promise.all(results.map(async (page) => {
         const title = getProp(page, "Submission", "title");
         const stage = getProp(page, "Stage",      "select");
         const dtIds = getProp(page, "DT",         "relation");
         const { taskCode, drawingNo } = parseSubmissionTitle(title, stage);
-        const dtName = await resolveDTName(notion, dtIds);
+        const dtName = (await resolveCached(dtIds)).name;
 
         // For the Issued queue, surface whether client comments have been ingested
         // onto the related MDS drawing for this stage (drives the cockpit comment badge).
@@ -760,7 +787,7 @@ module.exports = function mountDrawingFlow(app, notion) {
           const drawingIds = getProp(page, "Drawing", "relation");
           if (drawingIds?.length) {
             try {
-              const dwg = await notion.pages.retrieve({ page_id: drawingIds[0] });
+              const dwg = await getDrawing(drawingIds[0]);
               hasComments = !!getProp(dwg, `${stage} Comment Files`, "rich_text");
             } catch { /* drawing fetch failed — leave hasComments false */ }
           }
@@ -1091,7 +1118,11 @@ module.exports = function mountDrawingFlow(app, notion) {
               : "Update to next revision";
 
         // Completion date: return date + revision days from Projects DB
-        const returnDate    = reviewed || gradedAt;
+        // Falls back to today if "Reviewed" was never set on this submission (there is no
+        // separate "graded date" property — this previously referenced an undefined
+        // `gradedAt` variable, which threw inside Promise.all and 500'd the whole batch
+        // whenever any pending submission was missing a Reviewed date).
+        const returnDate    = reviewed || now();
         const revisionDays  = await getRevisionDays(notion, drawingIds);
         const completionDate = addWorkingDays(returnDate, revisionDays);
 
@@ -1323,8 +1354,36 @@ module.exports = function mountDrawingFlow(app, notion) {
         [reviewerProp]: { multi_select: multiSelect },
       }});
 
+      // Hand the submission back to the DM for comment review. Status stays "Issued" —
+      // receiving client comments doesn't change the ISO stage, just who needs to act next.
+      // Ball In Court → DM is what the cockpit's "Review Client Comments" column is keyed off.
+      let submissionId = null;
+      try {
+        const subs = await queryAll(notion, SUBMISSIONS_DB, {
+          and: [
+            { property: "Drawing", relation: { contains: drawing.id } },
+            { property: "Stage",   select:   { equals: stage        } },
+            { property: "Status",  select:   { equals: "Issued"     } },
+          ],
+        });
+        if (subs.length) {
+          // Most recent QA round wins if more than one Issued submission matches.
+          const target = subs.sort(
+            (a, b) => (getProp(b, "QA Round", "number") ?? 0) - (getProp(a, "QA Round", "number") ?? 0)
+          )[0];
+          submissionId = target.id;
+          await notion.pages.update({ page_id: target.id, properties: {
+            "Ball In Court": { select: { name: BIC.COMMENTS_RECEIVED } },
+          }});
+        } else {
+          console.warn(`[cr-ingest] no Issued submission found for ${drawingNo} ${stage} — Comment Files written but Ball In Court not updated`);
+        }
+      } catch (err) {
+        console.warn(`[cr-ingest] Ball In Court update failed for ${drawingNo} ${stage}:`, err.message);
+      }
+
       console.log(`[cr-ingest] ${name} → ${drawingNo} ${stage} (${clientAcronym})`);
-      res.json({ ok: true, matched: true, drawingId: drawing.id, stage, clientAcronym, drawingNo });
+      res.json({ ok: true, matched: true, drawingId: drawing.id, submissionId, stage, clientAcronym, drawingNo });
     } catch (err) {
       console.error("[cr-ingest]", err);
       res.status(500).json({ ok: false, error: err.message });

@@ -531,23 +531,37 @@ const Cockpit = () => {
   // ── Fetch ────────────────────────────────────────────────────────────────
   const consecutiveErrors = React.useRef(0);
 
+  // Chunked fetch — one small request per status group instead of a single monolithic
+  // /api/df/queue call. The old approach ran ~10-15 sequential Notion queries inside one
+  // Lambda invocation (with artificial gaps to dodge rate limiting), which on larger queues
+  // ran past Netlify's function timeout and came back as a 502. Splitting into per-status
+  // requests keeps each Lambda invocation short; a small stagger on kickoff (rather than
+  // firing all 7 at once) keeps the aggregate Notion call rate reasonable.
+  const STATUS_FETCHES = [
+    "Submitted", "Rejected", "Approved", "Awaiting Issue", "Issued", "Graded",
+  ];
+
   const fetchQueue = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     setError(null);
     try {
-      // Single request — backend runs all Notion queries sequentially to avoid rate limiting
-      const queueRes = await fetch("/api/df/queue");
-      if (!queueRes.ok) throw new Error(`API error ${queueRes.status}`);
+      const fetchStatus = async (status, i) => {
+        await pause(i * 120);
+        const res = await fetch(`/api/df/submissions?status=${encodeURIComponent(status)}`);
+        if (!res.ok) throw new Error(`API error ${res.status} (${status})`);
+        return (await res.json()).submissions;
+      };
+      const fetchPending = async (i) => {
+        await pause(i * 120);
+        const res = await fetch("/api/df/submissions?status=pending-notification");
+        if (!res.ok) throw new Error(`API error ${res.status} (pending)`);
+        return (await res.json()).submissions;
+      };
 
-      const {
-        submitted:     subs,
-        rejected:      bounced_,
-        approved:      approved_,
-        awaitingIssue: await_,
-        issued:        iss,
-        graded:        graded_,
-        pending,
-      } = await queueRes.json();
+      const [subs, bounced_, approved_, await_, iss, graded_, pending] = await Promise.all([
+        ...STATUS_FETCHES.map((s, i) => fetchStatus(s, i)),
+        fetchPending(STATUS_FETCHES.length),
+      ]);
 
       const newOnes = subs.filter((s) => !knownIds.current.has(s.id));
       if (newOnes.length && knownIds.current.size > 0) notify(newOnes.length);
@@ -834,6 +848,7 @@ const Cockpit = () => {
     .filter((s) => (daysSince(s.bicSince) ?? 0) > 14).length;
 
   const scanPendingLabel  = scanning && scanResult !== "error" ? "Scanning…" : "⟳ Scan Pending";
+  const scanUploadsLabel  = scanning && scanResult !== "error" ? "Scanning…" : "⟳ Scan Uploads";
   const scanCommentsLabel = scanCommentsBusy && scanCommentsResult !== "error" ? "💬 Ingesting…" : "💬 Scan Comments";
   const sendDtLabel       = sendEmailBusy ? "Sending…" : "✉ Send DT Email";
   const sendGradeLabel    = sendGradeEmailsBusy ? "Sending…" : "✉ Send DT Email";
@@ -844,9 +859,9 @@ const Cockpit = () => {
       action: { label: scanPendingLabel, onClick: handleScanPending, disabled: scanning } },
     { id: "reviewed", title: "Reviewed — Notify DT", accent: "var(--ok)", sub: "Approved / bounced — awaiting DT email", items: reviewedNotify,
       action: { label: sendDtLabel, onClick: handleSendDTEmails, disabled: sendEmailBusy, count: reviewedNotify.length } },
-    { id: "approved", title: "Approved — Awaiting Issue", accent: "var(--ok)", sub: "DT notified · awaiting DWG upload, then issue", items: approvedItems },
-    { id: "awaiting-comments", title: "Issued — Awaiting Comments", accent: "var(--info)", sub: "Issued to client, awaiting comments", items: awaitingComments,
-      action: { label: sendDtLabel, onClick: handleSendDTEmails, disabled: sendEmailBusy } },
+    { id: "approved", title: "Approved — Awaiting Issue", accent: "var(--ok)", sub: "DT notified · awaiting DWG upload, then issue", items: approvedItems,
+      action: { label: scanUploadsLabel, onClick: handleScanPending, disabled: scanning } },
+    { id: "awaiting-comments", title: "Issued — Awaiting Comments", accent: "var(--info)", sub: "Issued to client, awaiting comments", items: awaitingComments },
     { id: "comments", title: "Issued — Review Client Comments", accent: "var(--grade)", sub: "Client comments received", items: commentItems,
       action: { label: scanCommentsLabel, onClick: handleScanComments, disabled: scanCommentsBusy, count: commentItems.length } },
     { id: "signoff", title: "Issued — Awaiting Sign-Off", accent: "var(--warn)", sub: "A4.5 — with client for sign-off", items: signoffItems },
@@ -864,7 +879,7 @@ const Cockpit = () => {
       case "reviewed":          return s.status === "Rejected" ? { cls: "danger", txt: "Bounced" } : { cls: "ok", txt: "Approved" };
       case "approved":          return s.status === "Awaiting Issue" ? { cls: "ok", txt: "Ready to Issue" } : { cls: "warn", txt: "Awaiting DT Upload" };
       case "awaiting-comments": return { cls: "info",  txt: "Issued" };
-      case "comments":          return { cls: "grade", txt: "Comments" };
+      case "comments":          return { cls: "grade", txt: "Review Comments" };
       case "signoff":           return { cls: "warn",  txt: "Sign-Off" };
       case "graded":            return { cls: "grade", txt: "Grade " + (s.clientGrade || "—") };
       default:                  return { cls: "info",  txt: "" };
