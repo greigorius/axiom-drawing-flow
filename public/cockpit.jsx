@@ -608,13 +608,38 @@ const Cockpit = () => {
 
   useEffect(() => {
     fetchQueue();
-    // Back off polling after repeated failures: 30s normally, 5min after 3+ errors
+    // Back off polling after repeated failures: 30s normally, 5min after 3+ errors.
+    // Also skip ticks entirely while the tab is hidden or the browser is offline — a
+    // cockpit tab left open unattended (overnight, over a weekend) was previously
+    // polling nonstop regardless, racking up thousands of requests for no one to see.
+    // This does NOT touch Make — this loop only ever calls /api/df/submissions?status=X,
+    // which reads Notion. Make scenarios only fire from explicit button clicks
+    // (Scan Comments / Scan Uploads / Send DT / Grade Emails) or the approve/bounce/
+    // issue/log-status actions, never from this poll.
     const schedule = () => {
       const delay = consecutiveErrors.current >= 3 ? 300_000 : 30_000;
-      return setTimeout(() => { fetchQueue(true); timerRef.current = schedule(); }, delay);
+      return setTimeout(runPoll, delay);
+    };
+    const runPoll = () => {
+      if (document.hidden || !navigator.onLine) { timerRef.current = schedule(); return; }
+      fetchQueue(true);
+      timerRef.current = schedule();
     };
     const timerRef = { current: schedule() };
-    return () => clearTimeout(timerRef.current);
+
+    // Catch up immediately on regaining focus/connectivity rather than waiting out
+    // whatever's left of the current interval — keeps the board fresh the moment
+    // someone actually looks at it again, without polling the whole time it was hidden.
+    const onVisible = () => { if (!document.hidden) fetchQueue(true); };
+    const onOnline  = () => fetchQueue(true);
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("online", onOnline);
+
+    return () => {
+      clearTimeout(timerRef.current);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("online", onOnline);
+    };
   }, [fetchQueue]);
 
   // ── Individual actions ───────────────────────────────────────────────────

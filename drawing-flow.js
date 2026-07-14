@@ -13,6 +13,8 @@
 //   GET    /api/df/inputs/:projectId
 //   GET    /api/df/inputs/:projectId/:taskId
 //   POST   /api/df/inputs
+//   GET    /api/df/activity-log        ?taskId&limit  — Item Activity Log feed for a task
+//   POST   /api/df/activity-log        manual/backfill entry (also auto-fired on approve/issue/bounce/log-status/ingest)
 //
 // Make.com integration:
 //   Scenario 1 (Ingest):      Make watches Dropbox /Pending/ and calls POST /api/df/ingest
@@ -28,6 +30,7 @@ const SUBMISSIONS_DB = process.env.NOTION_DB_SUBMISSIONS;
 const TEAM_DB        = process.env.NOTION_DB_TEAM;
 const TASKS_DB       = process.env.NOTION_DB_TASKS;
 const INPUTS_DB      = () => process.env.NOTION_DB_INPUTS;
+const ACTIVITY_LOG_DB = process.env.NOTION_DB_ACTIVITY_LOG;
 
 // --- Stage constants ---
 
@@ -225,15 +228,35 @@ function parseSubmissionTitle(title, stage) {
 
 // --- Notion utilities ---
 
+// Notion's API returns 429 ("You have been rate limited...") once its ~3 req/s limit is
+// exceeded — easy to trip when several status groups' worth of DT/drawing lookups land at
+// once, and near-guaranteed if more than one cockpit tab (e.g. a Netlify tab left open plus
+// a local dev tab) is polling against the same integration token at the same time. None of
+// the Notion calls in this file retried on that before, so a single 429 surfaced straight to
+// the client as an uncaught 500. This retries up to 3 times with backoff, honoring Notion's
+// Retry-After header when present, before giving up for real.
+async function withNotionRetry(fn, retries = 3) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const isRateLimited = err?.status === 429 || err?.code === "rate_limited";
+      if (!isRateLimited || attempt >= retries) throw err;
+      const retryAfterSec = Number(err?.headers?.["retry-after"]) || (attempt + 1) * 1.5;
+      await new Promise((r) => setTimeout(r, retryAfterSec * 1000));
+    }
+  }
+}
+
 async function queryAll(notion, database_id, filter, sorts) {
   const results = [];
   let cursor;
   do {
-    const res = await notion.databases.query({
+    const res = await withNotionRetry(() => notion.databases.query({
       database_id, filter, sorts,
       ...(cursor ? { start_cursor: cursor } : {}),
       page_size: 100,
-    });
+    }));
     results.push(...res.results);
     cursor = res.has_more ? res.next_cursor : undefined;
   } while (cursor);
@@ -373,7 +396,7 @@ async function findLatestSubmission(notion, drawingPageId, stage) {
 async function resolveDT(notion, dtIds) {
   if (!dtIds?.length) return { name: null, email: null };
   try {
-    const dtPage = await notion.pages.retrieve({ page_id: dtIds[0] });
+    const dtPage = await withNotionRetry(() => notion.pages.retrieve({ page_id: dtIds[0] }));
     return {
       name:  getProp(dtPage, "Name",  "title"),
       email: getProp(dtPage, "Email", "email") ?? getProp(dtPage, "Email", "rich_text"),
@@ -400,19 +423,54 @@ function makeDTResolver(notion) {
   };
 }
 
-// Fire-and-forget POST to a Make.com webhook URL.
-// Non-blocking — logged on error but never throws.
-function fireWebhook(url, payload) {
+// POST to a Make.com webhook URL. Never throws (logged on error) — callers don't need
+// try/catch — but IS awaited by every call site. This must not be true fire-and-forget:
+// Netlify freezes the Lambda's execution environment the instant res.json() is sent, which
+// kills any still-in-flight promise that wasn't awaited first. An un-awaited webhook call
+// here would race the response and frequently get cut off mid-request, silently dropping
+// the trigger to Make. (This was confirmed as the cause of "Scan Comments" intermittently
+// not triggering — the request usually didn't get a chance to leave before the function froze.)
+async function fireWebhook(url, payload) {
   if (!url) return;
-  fetch(url, {
-    method:  "POST",
-    headers: { "Content-Type": "application/json" },
-    body:    JSON.stringify(payload),
-  }).then((r) => {
+  try {
+    const r = await fetch(url, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify(payload),
+    });
     if (!r.ok) console.warn(`[make] Webhook returned ${r.status} — ${url}`);
-  }).catch((err) => {
+  } catch (err) {
     console.warn(`[make] Webhook POST failed:`, err.message);
-  });
+  }
+}
+
+// --- Activity Log helper ---
+
+// Writes one entry to the Item Activity Log DB. Never throws — errors are logged and
+// swallowed so a logging failure can never break the calling submission endpoint.
+// IMPORTANT: still call this with `await`, same as fireWebhook above. Netlify freezes the
+// Lambda the instant res.json() is sent, so an un-awaited "fire and forget" call here would
+// frequently get cut off mid-write before it reaches Notion, silently dropping the entry.
+async function createActivityLogEntry(notion, { taskId, source, tag, author, entry, detail, link }) {
+  if (!ACTIVITY_LOG_DB) {
+    console.warn("[activity-log] NOTION_DB_ACTIVITY_LOG not configured — skipping entry:", entry);
+    return;
+  }
+  try {
+    const properties = {
+      "Entry":  { title:    [{ text: { content: entry } }] },
+      "Source": { select:   { name: source } },
+      "Tag":    { select:   { name: tag } },
+      "Author": { rich_text: [{ text: { content: author || "System" } }] },
+    };
+    if (taskId) properties["Task"]   = { relation: [{ id: taskId }] };
+    if (detail) properties["Detail"] = { rich_text: [{ text: { content: detail } }] };
+    if (link)   properties["Link"]   = { url: link };
+
+    await notion.pages.create({ parent: { database_id: ACTIVITY_LOG_DB }, properties });
+  } catch (err) {
+    console.warn("[activity-log] write failed:", err.message);
+  }
 }
 
 // --- Inputs helpers ---
@@ -543,6 +601,15 @@ module.exports = function mountDrawingFlow(app, notion) {
       }
       await notion.pages.update({ page_id: drawingPage.id, properties: mdsProps });
     } catch (err) { console.warn("[ingest] MDS update failed:", err.message); }
+
+    const dtName = dtPage ? (getProp(dtPage, "Name", "title") ?? dtInitials) : dtInitials;
+    await createActivityLogEntry(notion, {
+      taskId: taskPage.id,
+      source: "Drawing Flow",
+      tag:    "#info",
+      author: dtName || "System",
+      entry:  `Drawing ${drawingNo} Rev ${revision} submitted by ${dtName}. (QA Round ${qaRound})`,
+    });
 
     console.log(`[ingest] created ${submissionTitle} (${newSubmission.id})`);
     return res.json({ ok: true, submissionId: newSubmission.id, submissionTitle, qaRound, isResubmission: qaRound > 1 });
@@ -788,7 +855,7 @@ module.exports = function mountDrawingFlow(app, notion) {
       const resolveCached = makeDTResolver(notion);
       const drawingCache  = new Map(); // drawingId -> Promise<page>
       const getDrawing = (id) => {
-        if (!drawingCache.has(id)) drawingCache.set(id, notion.pages.retrieve({ page_id: id }));
+        if (!drawingCache.has(id)) drawingCache.set(id, withNotionRetry(() => notion.pages.retrieve({ page_id: id })));
         return drawingCache.get(id);
       };
 
@@ -1105,7 +1172,7 @@ module.exports = function mountDrawingFlow(app, notion) {
         const title      = getProp(page, "Submission",   "title");
         const stage      = getProp(page, "Stage",        "select");
         const grade      = getProp(page, "Client Grade", "select") ?? "—";
-        const revision   = getProp(page, "Rev",          "select") ?? "";
+        const revision   = getProp(page, "Revision",     "select") ?? "";
         const reviewed   = getProp(page, "Reviewed",     "date");
         const dtIds      = getProp(page, "DT",           "relation");
         const drawingIds = getProp(page, "Drawing",      "relation");
@@ -1306,14 +1373,17 @@ module.exports = function mountDrawingFlow(app, notion) {
   // POST /api/df/scan-comments
   // On-demand client-comment ingest. The DM uploads marked-up PDFs into the Dropbox
   // `Client Comments/` folders, then clicks the cockpit trigger. This fires the Make
-  // "cr-ingest" action, which lists those folders, and for each new (non-`R_`) file POSTs to
-  // /api/df/cr-ingest (below) to populate Notion, then renames the file with an `R_` prefix so
-  // it is not ingested again. Replaces continuous folder-watching (saves Make credits).
+  // "cr-ingest" action, which lists those folders, and for each new file POSTs to
+  // /api/df/cr-ingest (below) to populate Notion. The file is NOT renamed at this point —
+  // the filename only changes once a human has actually reviewed it. Re-running this scan is
+  // safe: /api/df/cr-ingest dedupes by checking whether the filename is already recorded in
+  // Notion's Comment Files field, independent of any `R_` prefix on disk. Replaces continuous
+  // folder-watching (saves Make credits).
 
   app.post("/api/df/scan-comments", async (req, res) => {
     const webhookUrl = process.env.MAKE_CR_INGEST_WEBHOOK || process.env.MAKE_ACTIONS_WEBHOOK;
     if (!webhookUrl) return res.status(500).json({ ok: false, error: "MAKE_CR_INGEST_WEBHOOK / MAKE_ACTIONS_WEBHOOK env var not set" });
-    fireWebhook(webhookUrl, { action: "cr-ingest", requestedAt: now() });
+    await fireWebhook(webhookUrl, { action: "cr-ingest", requestedAt: now() });
     res.json({ ok: true });
   });
 
@@ -1353,9 +1423,13 @@ module.exports = function mountDrawingFlow(app, notion) {
       // Append hyperlinked filename to the stage's Comment Files rich_text (preserve existing)
       const existingRT = drawing.properties?.[commentProp]?.rich_text ?? [];
 
-      // Deduplicate — skip if this filename (with or without R_ prefix) is already recorded
-      const existingText = existingRT.map((r) => r.text?.content ?? "").join("");
-      const baseScanName = name.replace(/^R_/i, "");
+      // Deduplicate — skip if this filename (with or without R_ prefix) is already recorded.
+      // Case-insensitive: Dropbox/Make can return the same file's extension in a different
+      // case on different list passes (seen in practice — "_P01.pdf" vs "_P01.PDF" for the
+      // same file), which a case-sensitive check treats as a new, distinct filename and
+      // appends a duplicate entry.
+      const existingText = existingRT.map((r) => r.text?.content ?? "").join("").toLowerCase();
+      const baseScanName = name.replace(/^R_/i, "").toLowerCase();
       if (existingText.includes(baseScanName)) {
         console.log(`[cr-ingest] already ingested, skipping: ${name}`);
         return res.json({ ok: true, matched: true, skipped: true, drawingId: drawing.id, stage, drawingNo });
@@ -1393,8 +1467,15 @@ module.exports = function mountDrawingFlow(app, notion) {
             (a, b) => (getProp(b, "QA Round", "number") ?? 0) - (getProp(a, "QA Round", "number") ?? 0)
           )[0];
           submissionId = target.id;
+          const receivedAt = now();
           await notion.pages.update({ page_id: target.id, properties: {
             "Ball In Court": { select: { name: BIC.COMMENTS_RECEIVED } },
+            "BIC Since":     { date:   { start: receivedAt           } },
+            // Unlike every other DM Action value (Approve/Bounce/Log Status — all stamped
+            // as a record of an action already taken), this one is prescriptive: it flags
+            // that reviewing the comments is the action now required. Chosen deliberately
+            // over a separate field so it's visible in the same column as everything else.
+            "DM Action":     { select: { name: "Review Comments"    } },
           }});
         } else {
           console.warn(`[cr-ingest] no Issued submission found for ${drawingNo} ${stage} — Comment Files written but Ball In Court not updated`);
@@ -1537,7 +1618,7 @@ module.exports = function mountDrawingFlow(app, notion) {
     // Fire webhook so Make can: (1) move the file, (2) create shared link,
     // (3) POST the link back via /api/df/submissions/:id/folder-link.
     // Email is NOT sent here — handled by POST /api/df/send-dt-emails.
-    fireWebhook(process.env.MAKE_ACTIONS_WEBHOOK, {
+    await fireWebhook(process.env.MAKE_ACTIONS_WEBHOOK, {
       action:       "approve",
       submissionId: id,
       submissionTitle,
@@ -1552,6 +1633,16 @@ module.exports = function mountDrawingFlow(app, notion) {
       ...(dropboxMove ? { dropboxMove } : {}),
       dtName:  dt.name,
       dtEmail: dt.email,
+    });
+
+    const revision = getProp(submissionPage, "Revision", "select") ?? "";
+    const approveDrawingNo = dropboxMove?.drawingNo ?? parseSubmissionTitle(submissionTitle, stage).drawingNo;
+    await createActivityLogEntry(notion, {
+      taskId: taskIds?.[0],
+      source: "Drawing Flow",
+      tag:    "#approval",
+      author: "DM",
+      entry:  `Drawing ${approveDrawingNo} Rev ${revision} approved by DM. Queued for issue.`,
     });
 
     console.log(`[approve] ${id} => Awaiting Issue (suffix ${suffixRef})`);
@@ -1612,6 +1703,16 @@ module.exports = function mountDrawingFlow(app, notion) {
     }
 
     const submissionTitle = getProp(submissionPage, "Submission", "title");
+    const taskIds  = getProp(submissionPage, "Item",     "relation");
+    const revision = getProp(submissionPage, "Revision", "select") ?? "";
+    const { drawingNo: issueDrawingNo } = parseSubmissionTitle(submissionTitle, stage);
+    await createActivityLogEntry(notion, {
+      taskId: taskIds?.[0],
+      source: "Drawing Flow",
+      tag:    "#approval",
+      author: "DM",
+      entry:  `Drawing ${issueDrawingNo} Rev ${revision} issued to client.`,
+    });
 
     // NOTE: fireWebhook removed — DT email now batched via POST /api/df/send-dt-emails
     console.log(`[issue] ${id} => ${drawingStatus}`);
@@ -1763,7 +1864,7 @@ module.exports = function mountDrawingFlow(app, notion) {
     // Fire webhook so Make can: (1) move the file, (2) create shared link on the Rejected folder,
     // (3) POST the link back via /api/df/submissions/:id/folder-link.
     // Email is NOT sent here — handled by POST /api/df/send-dt-emails.
-    fireWebhook(process.env.MAKE_ACTIONS_WEBHOOK, {
+    await fireWebhook(process.env.MAKE_ACTIONS_WEBHOOK, {
       action:           "bounce",
       submissionId:     id,
       submissionTitle,
@@ -1780,6 +1881,16 @@ module.exports = function mountDrawingFlow(app, notion) {
       dtEmail: dt.email,
     });
 
+    const bounceRevision = getProp(submissionPage, "Revision", "select") ?? "";
+    const bounceDrawingNo = dropboxMove?.drawingNo ?? parseSubmissionTitle(submissionTitle, stage).drawingNo;
+    await createActivityLogEntry(notion, {
+      taskId: taskIds?.[0],
+      source: "Drawing Flow",
+      tag:    "#issue",
+      author: "DM",
+      entry:  `Drawing ${bounceDrawingNo} Rev ${bounceRevision} bounced — QA Round ${qaRound}. BIC returned to ${dt.name || "DT"}.`,
+    });
+
     console.log(`[bounce] ${id} (path: ${annotatedDropboxPath || "none"}, base64: ${annotatedPdfBase64 ? "yes" : "no"})`);
     res.json({ ok: true, bouncedAt, ...(dropboxMove ? { dropboxMove } : {}) });
   });
@@ -1794,8 +1905,8 @@ module.exports = function mountDrawingFlow(app, notion) {
     try { submissionPage = await notion.pages.retrieve({ page_id: id }); }
     catch (_e) { return res.status(404).json({ ok: false, error: "Submission not found" }); }
 
-    const stage    = getProp(submissionPage, "Stage",   "select");
-    const revision = getProp(submissionPage, "Rev",     "select") ?? "";
+    const stage    = getProp(submissionPage, "Stage",     "select");
+    const revision = getProp(submissionPage, "Revision",  "select") ?? "";
     const stageMap = STAGE_LOG_STATUS_MAP[stage];
 
     if (!stageMap || !stageMap.supported) {
@@ -1852,6 +1963,17 @@ module.exports = function mountDrawingFlow(app, notion) {
         console.warn(`[log-status] MDS failed for ${drawingId}:`, err.message);
       }
     }
+
+    const logStatusTitle = getProp(submissionPage, "Submission", "title");
+    const taskIds = getProp(submissionPage, "Item", "relation");
+    const { drawingNo: logStatusDrawingNo } = parseSubmissionTitle(logStatusTitle, stage);
+    await createActivityLogEntry(notion, {
+      taskId: taskIds?.[0],
+      source: "Drawing Flow",
+      tag:    "#response",
+      author: "System",
+      entry:  `Client grade ${grade} recorded for ${logStatusDrawingNo} Rev ${revision}.`,
+    });
 
     console.log(`[log-status] ${id} => ${grade} (Rev ${revision}) => ${drawingStatus}`);
     res.json({ ok: true, grade, gradedAt, statusDate, drawingStatus, submissionStatus, isTerminal: isTerminalAB, isA45Approved });
@@ -2018,6 +2140,93 @@ module.exports = function mountDrawingFlow(app, notion) {
     } catch (err) {
       console.error("[scan-pending]", err);
       return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // GET /api/df/activity-log?taskId=&limit=50
+  // Returns Item Activity Log entries for a Task, newest first. Sorts by "Event Date" when
+  // set — that field only gets populated on backfilled/historical entries (old emails, past
+  // events reconstructed after the fact) — otherwise falls back to Created (the live anchor
+  // for entries logged in real time).
+
+  app.get("/api/df/activity-log", async (req, res) => {
+    if (!ACTIVITY_LOG_DB) return res.status(503).json({ ok: false, error: "NOTION_DB_ACTIVITY_LOG not configured" });
+    const { taskId, limit } = req.query;
+    if (!taskId) return res.status(400).json({ ok: false, error: "taskId required" });
+    const pageSize = Math.min(Number(limit) || 50, 100);
+
+    try {
+      const result = await notion.databases.query({
+        database_id: ACTIVITY_LOG_DB,
+        filter:      { property: "Task", relation: { contains: taskId } },
+        sorts:       [{ property: "Created", direction: "descending" }],
+        page_size:   pageSize,
+      });
+
+      const entries = result.results
+        .map((page) => ({
+          id:        page.id,
+          created:   page.created_time,
+          eventDate: getProp(page, "Event Date", "date"),
+          entry:     getProp(page, "Entry",   "title"),
+          source:    getProp(page, "Source",  "select"),
+          tag:       getProp(page, "Tag",     "select"),
+          author:    getProp(page, "Author",  "rich_text"),
+          detail:    getProp(page, "Detail",  "rich_text") ?? "",
+          link:      getProp(page, "Link",    "url") ?? "",
+        }))
+        // Notion's own sort covers Created order; re-sort here so any row with an Event Date
+        // (backfilled history) slots into true chronological position instead of clustering
+        // at the top by its real Created (import) time.
+        .sort((a, b) => new Date(b.eventDate || b.created) - new Date(a.eventDate || a.created));
+
+      res.json({ entries });
+    } catch (err) {
+      console.error("GET /api/df/activity-log", err);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // POST /api/df/activity-log
+  // Manual quick-log entry from the cockpit Feed panel, and the general-purpose write path
+  // for backfilling historical entries (old emails, past events). Author has no picker in
+  // the UI yet, so the cockpit always sends author: 'DM' — see handoff doc.
+  // Pass eventDate (YYYY-MM-DD) only when backfilling; omit it for real-time manual notes.
+
+  app.post("/api/df/activity-log", async (req, res) => {
+    if (!ACTIVITY_LOG_DB) return res.status(503).json({ ok: false, error: "NOTION_DB_ACTIVITY_LOG not configured" });
+    const { taskId, tag, entry, author, source, detail, link, eventDate } = req.body || {};
+    if (!entry) return res.status(400).json({ ok: false, error: "entry required" });
+    if (!tag)   return res.status(400).json({ ok: false, error: "tag required" });
+
+    try {
+      const resolvedSource = source || "Manual";
+      const properties = {
+        "Entry":  { title:     [{ text: { content: entry } }] },
+        "Source": { select:    { name: resolvedSource } },
+        "Tag":    { select:    { name: tag } },
+        "Author": { rich_text: [{ text: { content: author || "DM" } }] },
+      };
+      if (taskId)    properties["Task"]       = { relation: [{ id: taskId }] };
+      if (detail)    properties["Detail"]     = { rich_text: [{ text: { content: detail } }] };
+      if (link)      properties["Link"]       = { url: link };
+      if (eventDate) properties["Event Date"] = { date: { start: eventDate } };
+
+      const newPage = await notion.pages.create({ parent: { database_id: ACTIVITY_LOG_DB }, properties });
+      res.json({
+        ok: true,
+        entry: {
+          id:        newPage.id,
+          created:   newPage.created_time,
+          eventDate: eventDate ?? null,
+          entry, tag, detail: detail || "", link: link || "",
+          source: resolvedSource,
+          author: author || "DM",
+        },
+      });
+    } catch (err) {
+      console.error("POST /api/df/activity-log", err);
+      res.status(500).json({ ok: false, error: err.message });
     }
   });
 
