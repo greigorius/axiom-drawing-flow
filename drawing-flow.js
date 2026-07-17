@@ -56,7 +56,7 @@ const STAGE_APPROVE_DRAWING_STATUS = {
   "S3":   "Client Review",
   "S4":   "Client Review",
   "S5":   "Client Review",
-  "A4.5": "Production Updates",
+  "A4.5": "Client Review",
   "AB":   "Client Review",
 };
 
@@ -282,12 +282,27 @@ async function mapWithConcurrency(items, limit, fn) {
   return results;
 }
 
+// Notion's REST API represents bold, italic, etc. as an `annotations` flag on each
+// rich_text segment — never as literal characters. Wrap bold segments in "**...**" here
+// so the frontend's lightweight markdown renderer (which just looks for "**text**") can
+// show real Notion bold formatting without needing a separate structured text format.
+// Real line breaks need no special handling — Notion preserves them as literal "\n"
+// inside a segment's plain_text, and that comes straight through the join below.
+function richTextToMarkdown(t) {
+  const text = t.plain_text ?? "";
+  return t.annotations?.bold ? `**${text}**` : text;
+}
+
 function getProp(page, name, type) {
   const prop = page.properties?.[name];
   if (!prop) return null;
   switch (type) {
-    case "title":     return prop.title?.[0]?.plain_text ?? null;
-    case "rich_text": return prop.rich_text?.[0]?.plain_text ?? null;
+    // Notion splits title/rich_text into multiple array segments whenever formatting
+    // changes (bold, links, etc.) — reading only [0] silently truncates at the first
+    // formatting run. Concatenate every segment instead (via richTextToMarkdown, which
+    // also re-encodes bold annotations as "**...**" for the frontend to parse).
+    case "title":     return prop.title?.map(richTextToMarkdown).join("") || null;
+    case "rich_text": return prop.rich_text?.map(richTextToMarkdown).join("") || null;
     case "select":    return prop.select?.name ?? null;
     case "status":    return prop.status?.name ?? null;
     case "number":    return prop.number ?? null;
@@ -297,6 +312,15 @@ function getProp(page, name, type) {
     case "url":       return prop.url ?? null;
     case "relation":  return prop.relation?.map((r) => r.id) ?? [];
     case "rollup":    return prop.rollup ?? null;
+    // Internal Notion-hosted files ("file") carry a presigned S3 URL that expires after
+    // ~1hr — fine for opening right after a fresh API fetch (which is all this app does),
+    // but the URL must not be cached or reused past that window. External files (pasted
+    // links) don't expire.
+    case "files":
+      return prop.files?.map((f) => ({
+        name: f.name ?? null,
+        url:  f.type === "external" ? (f.external?.url ?? null) : (f.file?.url ?? null),
+      })).filter((f) => f.url) ?? [];
     case "formula": {
       const f = prop.formula;
       if (!f) return null;
@@ -442,6 +466,54 @@ async function fireWebhook(url, payload) {
   } catch (err) {
     console.warn(`[make] Webhook POST failed:`, err.message);
   }
+}
+
+// --- Activity Log lookups ---
+
+// Resolve all Task page IDs belonging to a Project — the Activity Log DB only relates
+// to Tasks, not Projects directly, so "all activity for this project" is built by first
+// finding its tasks, then OR-ing the Task relation filter across all of their IDs.
+async function findTaskIdsForProject(notion, projectId) {
+  // Tasks DB's relation to Projects DB is named "Project" (singular) — confirmed by
+  // getRevisionDays above, which walks this same relation. There's a separate rollup
+  // property named "Projects" (plural, used elsewhere to search project names as text),
+  // which isn't relation-filterable and would 400 if used here.
+  const results = await queryAll(notion, TASKS_DB, { property: "Project", relation: { contains: projectId } });
+  return results.map((p) => p.id);
+}
+
+// Request-scoped Task/Project resolver — dedupes repeated lookups so a feed spanning many
+// entries against the same handful of items (a global or project-scoped view) only hits
+// Notion once per unique Task and once per unique Project, not once per entry. Same
+// pattern as makeDTResolver above. Returns { taskName, projectName } per Task id.
+function makeTaskNameResolver(notion) {
+  const taskCache    = new Map(); // taskId -> Promise<{taskName, projectName}>
+  const projectCache = new Map(); // projectId -> Promise<string|null>
+
+  function resolveProjectName(projectId) {
+    if (!projectId) return Promise.resolve(null);
+    if (!projectCache.has(projectId)) {
+      projectCache.set(projectId, withNotionRetry(() => notion.pages.retrieve({ page_id: projectId }))
+        .then((page) => getProp(page, "Project Name", "title"))
+        .catch(() => null));
+    }
+    return projectCache.get(projectId);
+  }
+
+  return function resolveCached(taskId) {
+    if (!taskId) return Promise.resolve({ taskName: null, projectName: null });
+    if (!taskCache.has(taskId)) {
+      taskCache.set(taskId, withNotionRetry(() => notion.pages.retrieve({ page_id: taskId }))
+        .then(async (page) => {
+          const taskName    = getProp(page, "Item Name", "title");
+          const projectId   = getProp(page, "Project", "relation")?.[0] ?? null;
+          const projectName = await resolveProjectName(projectId);
+          return { taskName, projectName };
+        })
+        .catch(() => ({ taskName: null, projectName: null })));
+    }
+    return taskCache.get(taskId);
+  };
 }
 
 // --- Activity Log helper ---
@@ -971,8 +1043,14 @@ module.exports = function mountDrawingFlow(app, notion) {
 
   app.post("/api/df/send-dt-emails", async (req, res) => {
     try {
+      // Optional: scope to a specific selection from the cockpit (checkbox-selected cards).
+      // Without this, the button processed every eligible submission regardless of what
+      // was checked — checkboxes existed in the UI but nothing downstream read them.
+      const { submissionIds } = req.body || {};
+      const idFilter = Array.isArray(submissionIds) && submissionIds.length ? new Set(submissionIds) : null;
+
       const NOTIFIABLE_STATUSES = ["Approved", "Rejected", "Issued", "Graded"];
-      const results = (await Promise.all(
+      let results = (await Promise.all(
         NOTIFIABLE_STATUSES.map((s) =>
           queryAll(notion, SUBMISSIONS_DB, {
             and: [
@@ -982,6 +1060,7 @@ module.exports = function mountDrawingFlow(app, notion) {
           })
         )
       )).flat();
+      if (idFilter) results = results.filter((page) => idFilter.has(page.id));
 
       if (!results.length) {
         return res.json({ ok: true, emailsSent: 0, submissionsNotified: 0, message: "Nothing pending" });
@@ -1157,12 +1236,19 @@ module.exports = function mountDrawingFlow(app, notion) {
 
   app.post("/api/df/send-grade-emails", async (req, res) => {
     try {
-      const results = await queryAll(notion, SUBMISSIONS_DB, {
+      // Optional: scope to a specific selection from the cockpit (checkbox-selected cards).
+      // Without this, the button processed every eligible submission regardless of what
+      // was checked — checkboxes existed in the UI but nothing downstream read them.
+      const { submissionIds } = req.body || {};
+      const idFilter = Array.isArray(submissionIds) && submissionIds.length ? new Set(submissionIds) : null;
+
+      let results = await queryAll(notion, SUBMISSIONS_DB, {
         and: [
           { property: "Status",      select:   { equals: "Graded" } },
           { property: "DT Notified", checkbox: { equals: false    } },
         ],
       });
+      if (idFilter) results = results.filter((page) => idFilter.has(page.id));
 
       if (!results.length) {
         return res.json({ ok: true, emailsSent: 0, submissionsNotified: 0, message: "Nothing pending" });
@@ -1227,6 +1313,7 @@ module.exports = function mountDrawingFlow(app, notion) {
           returnDate,
           completionDate,
           revisionDays,
+          drawingIds,
         };
       }));
 
@@ -1317,6 +1404,21 @@ module.exports = function mountDrawingFlow(app, notion) {
           "BIC Since":     { date:     { start: notifiedAt    } },
         }}).catch((e) => console.warn(`[send-grade-emails] Notion update failed ${pid}:`, e.message))
       ));
+
+      // A4.5's Drawing Status is finalized here, at the same moment Ball In Court above
+      // actually flips to DT — Approved → Production Updates (goes to DT for production),
+      // Rejected → DT Review (drawing starts its submission journey again). Every other
+      // stage already got its Drawing Status written immediately at log-status time.
+      const a45DrawingStatus = (grade) => grade === "Approved" ? "Production Updates" : "DT Review";
+      await Promise.all(
+        enriched
+          .filter((item) => item.stage === "A4.5")
+          .flatMap((item) => (item.drawingIds || []).map((drawingId) =>
+            notion.pages.update({ page_id: drawingId, properties: {
+              "Drawing Status": { select: { name: a45DrawingStatus(item.grade) } },
+            }}).catch((e) => console.warn(`[send-grade-emails] A4.5 MDS update failed ${drawingId}:`, e.message))
+          ))
+      );
 
       console.log(`[send-grade-emails] Done — ${emailsSent} webhook(s), ${allPageIds.length} submission(s) notified`);
       res.json({ ok: true, emailsSent, submissionsNotified: allPageIds.length, webhookResults });
@@ -1905,6 +2007,18 @@ module.exports = function mountDrawingFlow(app, notion) {
     try { submissionPage = await notion.pages.retrieve({ page_id: id }); }
     catch (_e) { return res.status(404).json({ ok: false, error: "Submission not found" }); }
 
+    // Client comments received on this submission are graded through the Comment
+    // Reviewer app's pin-based markup review — not here. DM Action reads "Review Comments"
+    // only for that pending window (set by cr-ingest, cleared once the Comment Reviewer app's
+    // Save & Close writes its own DM Action). Blocking here mirrors hiding the cockpit's Grade
+    // button on these cards, so a direct API call can't bypass it either.
+    if (getProp(submissionPage, "DM Action", "select") === "Review Comments") {
+      return res.status(400).json({
+        ok: false,
+        error: "This submission has client comments awaiting review — grade it from the Comment Reviewer app instead of Log Status.",
+      });
+    }
+
     const stage    = getProp(submissionPage, "Stage",     "select");
     const revision = getProp(submissionPage, "Revision",  "select") ?? "";
     const stageMap = STAGE_LOG_STATUS_MAP[stage];
@@ -1924,16 +2038,22 @@ module.exports = function mountDrawingFlow(app, notion) {
     const isA45Approved    = stage === "A4.5" && grade === "Approved";
     const isProductionRev  = revision.toUpperCase().startsWith("C");
 
+    // A4.5's Drawing Status is finalized later, in POST /api/df/send-grade-emails, at the
+    // same moment Ball In Court actually flips to DT (Approved → Production Updates,
+    // Rejected → DT Review) — not here, since BIC sits with DM until the notify email
+    // fires. Skip writing Drawing Status at this step for that stage; every other stage
+    // keeps the immediate write.
+    const deferDrawingStatus = stage === "A4.5";
+
     // Drawing Status: terminal stages override; otherwise use revision prefix
     const drawingStatus = isTerminalAB  ? "Complete"
-                        : isA45Approved ? "Schedule"
                         : isProductionRev ? "Production Updates"
                         : "Approval Updates";
 
-    // BIC: terminal AB → clear; A4.5 Approved → DM (for production sign-off); graded → DM until email fired
+    // BIC: terminal AB → clear; graded → DM until email fired
     const newBIC = isTerminalAB ? null : BIC.GRADED;   // BIC.GRADED is now "DM"
 
-    const submissionStatus = isA45Approved ? "Schedule" : isTerminalAB ? "Complete" : "Graded";
+    const submissionStatus = isTerminalAB ? "Complete" : "Graded";
 
     try {
       await notion.pages.update({ page_id: id, properties: {
@@ -1951,14 +2071,17 @@ module.exports = function mountDrawingFlow(app, notion) {
 
     for (const drawingId of drawingIds) {
       try {
-        const mdsProps = { "Drawing Status": { select: { name: drawingStatus } } };
+        const mdsProps = {};
+        if (!deferDrawingStatus) mdsProps["Drawing Status"] = { select: { name: drawingStatus } };
         if (stageMap.statusField) mdsProps[stageMap.statusField] = { select: { name: grade } };
         // Status Date uses the project-system return date (or today if not provided)
         // A4.5: only set C01 Sign Off date when Approved
         if (stageMap.dateField && !(stage === "A4.5" && grade !== "Approved")) {
           mdsProps[stageMap.dateField] = { date: { start: statusDate } };
         }
-        await notion.pages.update({ page_id: drawingId, properties: mdsProps });
+        if (Object.keys(mdsProps).length) {
+          await notion.pages.update({ page_id: drawingId, properties: mdsProps });
+        }
       } catch (err) {
         console.warn(`[log-status] MDS failed for ${drawingId}:`, err.message);
       }
@@ -1966,7 +2089,53 @@ module.exports = function mountDrawingFlow(app, notion) {
 
     const logStatusTitle = getProp(submissionPage, "Submission", "title");
     const taskIds = getProp(submissionPage, "Item", "relation");
-    const { drawingNo: logStatusDrawingNo } = parseSubmissionTitle(logStatusTitle, stage);
+    const { taskCode: logStatusTaskCode, drawingNo: logStatusDrawingNo } = parseSubmissionTitle(logStatusTitle, stage);
+
+    // A4.5 Rejected: the file currently sitting in the Item/Suffix folder (placed there by
+    // the earlier Approve step) is no longer the final record — move it into Grade Returns,
+    // tagged with item/rev/grade so it's uniquely identified like the original Submissions
+    // were, freeing the Item folder for the eventual approved file. Approved A4.5 files are
+    // left exactly where they are — that copy IS the final client-submission record, and
+    // stays in the Item folder until As Builts are required.
+    if (stage === "A4.5" && grade === "Rejected") {
+      const rawPath   = getProp(submissionPage, "Dropbox Path", "url");
+      const taskParts = logStatusTaskCode ? logStatusTaskCode.split("-") : [];
+      const itemNo    = taskParts[taskParts.length - 1] ?? "";
+      const fullPath  = toFullDropboxPath(rawPath);
+
+      if (fullPath && itemNo && logStatusDrawingNo) {
+        const segs     = fullPath.split("/").filter(Boolean);
+        const stageIdx = segs.findIndex((s) => s.toUpperCase() === "A4.5");
+        const toFolder = stageIdx >= 0 ? "/" + segs.slice(0, stageIdx + 1).join("/") + "/Grade Returns" : null;
+
+        if (toFolder) {
+          const dateTag     = gradedAt.replace(/-/g, "").slice(2);   // YYYY-MM-DD -> YYMMDD
+          const newFilename = `${itemNo}_${logStatusDrawingNo}_${revision}_Rejected_${dateTag}.pdf`;
+
+          await fireWebhook(process.env.MAKE_ACTIONS_WEBHOOK, {
+            action:       "grade-reject",
+            fromPath:     fullPath,
+            toFolder,
+            newFilename,
+            submissionId: id,
+          });
+
+          // Optimistic update — mirrors the pattern used in /approve and /bounce.
+          const newFullPath  = `${toFolder}/${newFilename}`;
+          const newShortPath = newFullPath.toLowerCase().startsWith(DROPBOX_ROOT.toLowerCase())
+            ? newFullPath.slice(DROPBOX_ROOT.length).replace(/^\//, "")
+            : newFullPath;
+          notion.pages.update({ page_id: id, properties: {
+            "Dropbox Path": { url: newShortPath }
+          }}).catch((e) => console.warn("[log-status] Dropbox Path update failed:", e.message));
+        } else {
+          console.warn(`[log-status] Could not derive Grade Returns folder from path: ${fullPath}`);
+        }
+      } else {
+        console.warn(`[log-status] Missing data for Grade Returns move (itemNo/drawingNo/path) — submission ${id}`);
+      }
+    }
+
     await createActivityLogEntry(notion, {
       taskId: taskIds?.[0],
       source: "Drawing Flow",
@@ -2143,42 +2312,71 @@ module.exports = function mountDrawingFlow(app, notion) {
     }
   });
 
-  // GET /api/df/activity-log?taskId=&limit=50
-  // Returns Item Activity Log entries for a Task, newest first. Sorts by "Event Date" when
-  // set — that field only gets populated on backfilled/historical entries (old emails, past
-  // events reconstructed after the fact) — otherwise falls back to Created (the live anchor
-  // for entries logged in real time).
+  // GET /api/df/activity-log?taskId=&projectId=&days=&limit=
+  // Three modes, in priority order:
+  //   taskId given    -> full history for that one item, unbounded by date.
+  //   projectId given -> all activity across every item in that project, unbounded by date
+  //                      (resolves the project's task IDs first, then OR's the Task filter).
+  //   neither given   -> global feed across every project/item, capped to the last `days`
+  //                      (default 7) — this is the default page-load view.
+  // Sorts by "Event Date" when set (backfilled/historical entries), else Created.
 
   app.get("/api/df/activity-log", async (req, res) => {
     if (!ACTIVITY_LOG_DB) return res.status(503).json({ ok: false, error: "NOTION_DB_ACTIVITY_LOG not configured" });
-    const { taskId, limit } = req.query;
-    if (!taskId) return res.status(400).json({ ok: false, error: "taskId required" });
-    const pageSize = Math.min(Number(limit) || 50, 100);
+    const { taskId, projectId, days, limit } = req.query;
+    const pageSize = Math.min(Number(limit) || (taskId || projectId ? 50 : 100), 200);
 
     try {
+      let filter;
+      if (taskId) {
+        filter = { property: "Task", relation: { contains: taskId } };
+      } else if (projectId) {
+        const projectTaskIds = await findTaskIdsForProject(notion, projectId);
+        if (!projectTaskIds.length) return res.json({ entries: [] });
+        filter = { or: projectTaskIds.map((id) => ({ property: "Task", relation: { contains: id } })) };
+      } else {
+        const windowDays = Number(days) || 7;
+        const since = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000).toISOString();
+        filter = { property: "Created", created_time: { on_or_after: since } };
+      }
+
       const result = await notion.databases.query({
         database_id: ACTIVITY_LOG_DB,
-        filter:      { property: "Task", relation: { contains: taskId } },
+        filter,
         sorts:       [{ property: "Created", direction: "descending" }],
         page_size:   pageSize,
       });
 
-      const entries = result.results
-        .map((page) => ({
-          id:        page.id,
-          created:   page.created_time,
-          eventDate: getProp(page, "Event Date", "date"),
-          entry:     getProp(page, "Entry",   "title"),
-          source:    getProp(page, "Source",  "select"),
-          tag:       getProp(page, "Tag",     "select"),
-          author:    getProp(page, "Author",  "rich_text"),
-          detail:    getProp(page, "Detail",  "rich_text") ?? "",
-          link:      getProp(page, "Link",    "url") ?? "",
-        }))
-        // Notion's own sort covers Created order; re-sort here so any row with an Event Date
-        // (backfilled history) slots into true chronological position instead of clustering
-        // at the top by its real Created (import) time.
-        .sort((a, b) => new Date(b.eventDate || b.created) - new Date(a.eventDate || a.created));
+      // Enrich with which item each entry belongs to — needed once a feed can span more
+      // than one Task (the global and project-scoped views). Cached per unique Task id so a
+      // feed full of entries from the same handful of items only costs one lookup each.
+      const resolveTaskName = makeTaskNameResolver(notion);
+      const entries = await Promise.all(result.results.map(async (page) => {
+        const entryTaskId = getProp(page, "Task", "relation")?.[0] ?? null;
+        const { taskName, projectName } = entryTaskId
+          ? await resolveTaskName(entryTaskId)
+          : { taskName: null, projectName: null };
+        return {
+          id:          page.id,
+          created:     page.created_time,
+          eventDate:   getProp(page, "Event Date", "date"),
+          entry:       getProp(page, "Entry",   "title"),
+          source:      getProp(page, "Source",  "select"),
+          tag:         getProp(page, "Tag",     "select"),
+          author:      getProp(page, "Author",  "rich_text"),
+          detail:      getProp(page, "Detail",  "rich_text") ?? "",
+          link:        getProp(page, "Link",    "url") ?? "",
+          files:       getProp(page, "Files & media", "files") ?? [],
+          taskId:      entryTaskId,
+          taskName,
+          projectName,
+        };
+      }));
+
+      // Notion's own sort covers Created order; re-sort here so any row with an Event Date
+      // (backfilled history) slots into true chronological position instead of clustering
+      // at the top by its real Created (import) time.
+      entries.sort((a, b) => new Date(b.eventDate || b.created) - new Date(a.eventDate || a.created));
 
       res.json({ entries });
     } catch (err) {

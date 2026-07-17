@@ -26,7 +26,7 @@ app.get("/api/projects", async (req, res) => {
     do {
       const r = await notion.databases.query({
         database_id: PROJECTS_DB,
-        sorts: [{ property: "Name", direction: "ascending" }],
+        sorts: [{ property: "Project Name", direction: "ascending" }],
         page_size: 100,
         ...(cursor ? { start_cursor: cursor } : {}),
       });
@@ -36,7 +36,7 @@ app.get("/api/projects", async (req, res) => {
 
     const projects = results.map((p) => ({
       id:   p.id,
-      name: p.properties?.Name?.title?.[0]?.plain_text ?? "(Unnamed)",
+      name: p.properties?.["Project Name"]?.title?.[0]?.plain_text ?? "(Unnamed)",
     }));
     res.json({ projects });
   } catch (err) {
@@ -62,7 +62,11 @@ app.get("/api/tasks", async (req, res) => {
       const r = await notion.databases.query({
         database_id: TASKS_DB,
         ...(filter ? { filter } : {}),
-        sorts: [{ property: "Item No.", direction: "ascending" }],
+        // NOTE: "Item No." is not a real property on this DB (it doesn't exist — the old
+        // sort here threw a 400 from Notion on every call). Item numbering lives inside the
+        // "Item Name" title text instead, e.g. "Suffix 022 - Description", which happens to
+        // sort correctly as plain text since it's zero-padded to 3 digits.
+        sorts: [{ property: "Item Name", direction: "ascending" }],
         page_size: 100,
         ...(cursor ? { start_cursor: cursor } : {}),
       });
@@ -70,11 +74,15 @@ app.get("/api/tasks", async (req, res) => {
       cursor = r.has_more ? r.next_cursor : undefined;
     } while (cursor);
 
-    const tasks = results.map((p) => ({
-      id:     p.id,
-      name:   p.properties?.["Item Name"]?.title?.[0]?.plain_text ?? "(Unnamed)",
-      itemNo: p.properties?.["Item No."]?.number ?? null,
-    }));
+    const tasks = results.map((p) => {
+      const name = p.properties?.["Item Name"]?.title?.[0]?.plain_text ?? "(Unnamed)";
+      const itemNoMatch = name.match(/Suffix\s*(\d+)/i);
+      return {
+        id:     p.id,
+        name,
+        itemNo: itemNoMatch ? Number(itemNoMatch[1]) : null,
+      };
+    });
     res.json({ tasks });
   } catch (err) {
     console.error("GET /api/tasks", err);

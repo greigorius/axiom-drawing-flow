@@ -749,19 +749,34 @@ const Cockpit = () => {
   const handleBatchHold    = (ids) => runBatch(ids, "hold", "PATCH", { blocked: true });
 
   // ── Send DT emails ───────────────────────────────────────────────────────
-  const handleSendDTEmails = async () => {
+  // `ids`, when passed, scopes the send to those checkbox-selected cards only — this used
+  // to be ignored entirely (checkboxes existed but the button always sent the whole column).
+  // No ids (or an empty selection) preserves the old "send everything in this column" default.
+  const handleSendDTEmails = async (ids) => {
     setSendEmailBusy(true);
     setSendEmailResult(null);
     try {
-      const res = await fetch("/api/df/send-dt-emails", { method: "POST" });
+      const scoped = Array.isArray(ids) && ids.length > 0;
+      const res = await fetch("/api/df/send-dt-emails", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(scoped ? { submissionIds: ids } : {}),
+      });
       const body = await res.json();
       if (!res.ok) {
         alert(`Send emails failed: ${body.error || res.statusText}`);
         setSendEmailResult("error");
       } else {
         setSendEmailResult("ok");
-        // Remove notified items from pending list immediately (no wait for next poll)
-        setPendingNotification([]);
+        if (scoped) {
+          // Only drop the items actually sent — leave the rest of the column as-is.
+          const sent = new Set(ids);
+          setPendingNotification((prev) => prev.filter((s) => !sent.has(s.id)));
+          setSelectedIds((prev) => { const next = new Set(prev); ids.forEach((id) => next.delete(id)); return next; });
+        } else {
+          // Remove notified items from pending list immediately (no wait for next poll)
+          setPendingNotification([]);
+        }
         // Refresh queue in background to catch any state changes
         fetchQueue(true);
       }
@@ -775,18 +790,29 @@ const Cockpit = () => {
     }
   };
 
-  const handleSendGradeEmails = async () => {
+  const handleSendGradeEmails = async (ids) => {
     setSendGradeEmailsBusy(true);
     setSendGradeResult(null);
     try {
-      const res  = await fetch("/api/df/send-grade-emails", { method: "POST" });
+      const scoped = Array.isArray(ids) && ids.length > 0;
+      const res  = await fetch("/api/df/send-grade-emails", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(scoped ? { submissionIds: ids } : {}),
+      });
       const body = await res.json();
       if (!res.ok) {
         alert(`Send grade emails failed: ${body.error || res.statusText}`);
         setSendGradeResult("error");
       } else {
         setSendGradeResult("ok");
-        setGraded([]);
+        if (scoped) {
+          const sent = new Set(ids);
+          setGraded((prev) => prev.filter((s) => !sent.has(s.id)));
+          setSelectedIds((prev) => { const next = new Set(prev); ids.forEach((id) => next.delete(id)); return next; });
+        } else {
+          setGraded([]);
+        }
         fetchQueue(true);
       }
     } catch (err) {
@@ -872,6 +898,10 @@ const Cockpit = () => {
   const signoffItems     = issued.filter((s) => s.stage === "A4.5" && !s.hasComments);
   const awaitingComments = issued.filter((s) => s.stage !== "A4.5" && !s.hasComments);
   const reviewedNotify   = pendingNotification.filter((s) => s.status === "Approved" || s.status === "Rejected");
+  // Checkbox-selected cards, scoped to each of these two columns — an empty result means
+  // "nothing selected in this column", which the send handlers treat as "send everything".
+  const reviewedSelectedIds = reviewedNotify.filter((s) => selectedIds.has(s.id)).map((s) => s.id);
+  const gradedSelectedIds   = graded.filter((s) => selectedIds.has(s.id)).map((s) => s.id);
   // Approved drawings only enter the Awaiting-Issue column once the DT has been notified;
   // until their DWGs are uploaded (Make flips status → "Awaiting Issue") the Issue button stays grey.
   const approvedItems    = awaitingIssue.filter((s) => s.status === "Awaiting Issue" || s.dtNotified);
@@ -890,7 +920,8 @@ const Cockpit = () => {
     { id: "submitted", title: "Submitted — Awaiting Review", accent: "var(--info)", sub: "New DT drawing submissions", items: submitted,
       action: { label: scanPendingLabel, onClick: handleScanPending, disabled: scanning } },
     { id: "reviewed", title: "Reviewed — Notify DT", accent: "var(--ok)", sub: "Approved / bounced — awaiting DT email", items: reviewedNotify,
-      action: { label: sendDtLabel, onClick: handleSendDTEmails, disabled: sendEmailBusy, count: reviewedNotify.length } },
+      action: { label: sendDtLabel, disabled: sendEmailBusy, count: reviewedSelectedIds.length || reviewedNotify.length,
+        onClick: () => handleSendDTEmails(reviewedSelectedIds) } },
     { id: "approved", title: "Approved — Awaiting Issue", accent: "var(--ok)", sub: "DT notified · awaiting DWG upload, then issue", items: approvedItems,
       action: { label: scanUploadsLabel, onClick: handleScanPending, disabled: scanning } },
     { id: "awaiting-comments", title: "Issued — Awaiting Comments", accent: "var(--info)", sub: "Issued to client, awaiting comments", items: awaitingComments },
@@ -898,7 +929,8 @@ const Cockpit = () => {
       action: { label: scanCommentsLabel, onClick: handleScanComments, disabled: scanCommentsBusy, count: commentItems.length } },
     { id: "signoff", title: "Issued — Awaiting Sign-Off", accent: "var(--warn)", sub: "A4.5 — with client for sign-off", items: signoffItems },
     { id: "graded", title: "Graded — Notify DT", accent: "var(--accent)", sub: "Notion · DT Notified unchecked", items: graded,
-      action: { label: sendGradeLabel, onClick: handleSendGradeEmails, disabled: sendGradeEmailsBusy, count: graded.length } },
+      action: { label: sendGradeLabel, disabled: sendGradeEmailsBusy, count: gradedSelectedIds.length || graded.length,
+        onClick: () => handleSendGradeEmails(gradedSelectedIds) } },
   ];
 
   const q = search.trim().toLowerCase();
@@ -943,8 +975,18 @@ const Cockpit = () => {
           title={ready ? "Issue the drawing" : "Awaiting DT to upload DWGs"}>Issue</button>
       );
     }
-    else if (colId === "comments" || colId === "signoff" || colId === "awaiting-comments") primary = (
+    else if (colId === "signoff" || colId === "awaiting-comments") primary = (
       <button className="k-act go" onClick={(e) => { e.stopPropagation(); setLogStatusTarget(s); }}>Grade</button>
+    );
+    // Client comments already received on this submission go through the Comment
+    // Reviewer app's pin-based markup review, not the generic Log Status modal — the two
+    // used to both be reachable on the same card, producing a Grade Returns email for
+    // drawings actually being handled through Client Comments/Reviewed.
+    else if (colId === "comments") primary = (
+      <button className="k-act" disabled
+        title="Client comments received — grade this drawing in the Comment Reviewer app, not here">
+        Review in Comment Reviewer
+      </button>
     );
     return (<>{primary}{hold}</>);
   };

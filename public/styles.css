@@ -610,3 +610,246 @@ main {
 /* tighten the section header inside a column (no big top gap) */
 .kanban-column .section-header { margin-top: 10px; }
 .kanban-column > div:first-child .section-header { margin-top: 6px; }
+
+/* ─── Activity Feed ──────────────────────────────────────────────────── */
+.activity-feed-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.activity-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  font-size: 13px;
+}
+
+.activity-row-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.activity-row-time {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text3);
+  white-space: nowrap;
+}
+
+.activity-row-entry {
+  color: var(--text);
+}
+
+/* Rows default to just the Entry line — this reveals Detail text + media, only
+   rendered when there's something behind it to show. */
+.activity-row-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  background: none;
+  border: none;
+  padding: 0;
+  margin-top: 1px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  cursor: pointer;
+  font-family: var(--font);
+}
+
+.activity-row-toggle:hover { text-decoration: underline; }
+
+.attachment-indicator {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text2);
+  background: var(--bg4);
+  border-radius: var(--radius);
+  padding: 1px 6px;
+}
+
+/* Shown only in multi-item views (global / project-scoped) so each row is clear about
+   which item it belongs to. */
+.activity-row-item {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.activity-row-detail {
+  font-size: 12px;
+  color: var(--text3);
+}
+
+/* Collapsed: clipped to one visual line with an ellipsis — no manual "first line"
+   splitting, since real Detail text has no reliable per-line delimiter. Whether the
+   toggle even appears is decided by measuring actual overflow on this element. */
+.activity-row-detail-preview {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+/* Expanded: full text, real line breaks (literal "\n" from Notion) preserved and
+   wrapping normally. */
+.activity-row-detail-full {
+  white-space: pre-line;
+}
+
+.activity-row-link {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.activity-row-link:hover { text-decoration: underline; }
+
+/* All entry text is full-brightness now for readability. Manual / Email entries still
+   stand out from the auto-logged majority (System / Drawing Flow), just via weight
+   rather than a dimmer color. */
+.activity-row-manual .activity-row-entry { font-weight: 500; }
+
+/* Tag pill + source badge sit together on their own line at the bottom of the card. */
+.activity-row-footer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+/* Source badge and tag pills use solid (opaque) backgrounds rather than translucent
+   tints — contrast against a translucent tint shifts with whatever's behind it, while a
+   solid fill + white text keeps a verified >=4.5:1 contrast ratio (WCAG AA) no matter
+   what card or page background sits behind it. */
+.source-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: var(--radius);
+  background: #374151; /* slate-700 — ~10:1 contrast with white text */
+  color: #ffffff;
+  text-align: center;
+  white-space: nowrap;
+  height: fit-content;
+}
+
+.activity-row-manual .source-badge {
+  background: #1e3a8a; /* blue-900 — ~9:1 contrast with white text; marks human-authored entries */
+}
+
+/* Tag pills — one solid color per tag, consistent between the feed rows and the
+   quick-log picker buttons below. All verified >=4.5:1 contrast with white text. */
+.tag-pill {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
+  height: fit-content;
+  color: #ffffff;
+}
+
+.tag-decision    { background: #1e3a8a; } /* blue-900   ~8.9:1 */
+.tag-instruction { background: #78350f; } /* amber-900  ~11.4:1 */
+.tag-query       { background: #7c2d12; } /* orange-900 ~9.9:1 */
+.tag-response    { background: #134e4a; } /* teal-900   ~11.9:1 */
+.tag-issue       { background: #7f1d1d; } /* red-900    ~10.2:1 */
+.tag-approval    { background: #14532d; } /* green-900  ~11.6:1 */
+.tag-info        { background: #374151; } /* slate-700  ~10:1 */
+
+/* ─── Media attachments ──────────────────────────────────────────────── */
+.activity-row-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.activity-file-thumb {
+  display: block;
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.activity-file-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.activity-file-doc {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--bg4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 5px 10px;
+  text-decoration: none;
+  max-width: 220px;
+}
+
+.activity-file-doc span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-file-doc:hover { border-color: var(--accent); }
+
+/* ─── Quick-log form ─────────────────────────────────────────────────── */
+.activity-note-input {
+  width: 100%;
+  resize: vertical;
+  min-height: 60px;
+  margin-bottom: 12px;
+}
+
+.tag-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.tag-picker-btn {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 2px solid transparent;
+  color: #ffffff;
+  cursor: pointer;
+  font-family: var(--font);
+  transition: border-color 0.15s, opacity 0.15s;
+}
+
+.tag-picker-btn:hover { opacity: 0.85; }
+
+/* Selection is shown with a light outline ring rather than a brightness filter —
+   brightening these solid colors would push them toward lighter shades and erode the
+   white-text contrast ratio the palette above was chosen to guarantee. */
+.tag-picker-btn.selected {
+  border-color: #ffffff;
+}

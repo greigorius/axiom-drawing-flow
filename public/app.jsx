@@ -1,5 +1,5 @@
 // app.jsx — App shell with hash-based routing
-// Loaded last; Cockpit and InputsForm are exposed on window by their files.
+// Loaded last; Cockpit and ActivityFeed are exposed on window by their files.
 
 const { useState, useEffect } = React;
 
@@ -12,8 +12,8 @@ const App = () => {
     return () => window.removeEventListener("hashchange", handler);
   }, []);
 
-  const CockpitView  = window.Cockpit;
-  const InputsView   = window.InputsForm;
+  const CockpitView = window.Cockpit;
+  const FeedView     = window.ActivityFeed;
 
   return (
     <div className="app">
@@ -25,14 +25,14 @@ const App = () => {
           <a href="#cockpit" className={route === "#cockpit" ? "active" : ""}>
             Cockpit
           </a>
-          <a href="#inputs" className={route === "#inputs" ? "active" : ""}>
-            Programme Inputs
+          <a href="#activity" className={route === "#activity" ? "active" : ""}>
+            Activity Feed
           </a>
         </div>
       </nav>
       <main>
-        {route === "#inputs"
-          ? <InputsView />
+        {route === "#activity"
+          ? <FeedView />
           : <CockpitView />
         }
       </main>
