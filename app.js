@@ -12,6 +12,11 @@ const notion = new Client({ auth: process.env.NOTION_TOKEN });
 // ─── Middleware ────────────────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
+// The email-ingest Make scenario posts its body as application/x-www-form-urlencoded
+// (safer than a hand-built JSON string template for arbitrary email text — Make escapes
+// url-encoded fields itself, where a raw JSON string body would break on stray quotes or
+// newlines in a subject/body). Every other endpoint still sends/expects JSON as before.
+app.use(express.urlencoded({ extended: true }));
 
 // ─── Drawing Flow routes (MUST be before static middleware) ───────────────────
 const mountDrawingFlow = require("./drawing-flow");

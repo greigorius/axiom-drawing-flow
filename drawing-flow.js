@@ -365,6 +365,37 @@ async function findTask(notion, projectNo, itemNo) {
   return candidates[0] ?? null;
 }
 
+// Email subjects only ever give us an item number, never a project — unlike findTask()
+// above (used by Drawing Flow, which always knows the project from the Dropbox folder
+// path already), so there's no way to disambiguate if the same item number happens to
+// exist in more than one project. Guessing wrong would mis-link an email to someone
+// else's item, which is worse than leaving it unlinked for manual review — so, unlike
+// findTask(), this returns null whenever the match isn't unique instead of falling back
+// to a best guess.
+async function findTaskByItemNo(notion, itemNo) {
+  const paddedItemNo = itemNo.padStart(3, "0");
+  const res = await notion.databases.query({
+    database_id: TASKS_DB,
+    filter: { property: "Item Name", title: { contains: `Suffix ${paddedItemNo}` } },
+    page_size: 50,
+  });
+  if (!res.results.length) return null;
+  const byFormula = res.results.filter(
+    (page) => getProp(page, "Item No.", "formula") === paddedItemNo
+  );
+  const candidates = byFormula.length ? byFormula : res.results;
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+// Looks for an item number the same way Drawing Flow filenames already encode one
+// ("Suffix 022") — the one convention already used consistently across this codebase.
+// Bare numbers, drawing numbers, or client references aren't attempted; a false-positive
+// match is worse than no match, so this is deliberately conservative.
+function parseItemNoFromSubject(subject) {
+  const m = /suffix\s*0*(\d{1,4})/i.exec(subject || "");
+  return m ? m[1] : null;
+}
+
 async function findDrawing(notion, drawingNo, taskPageId) {
   // First try: match by drawing number AND task relation (precise)
   const res1 = await notion.databases.query({
@@ -518,6 +549,16 @@ function makeTaskNameResolver(notion) {
 
 // --- Activity Log helper ---
 
+// Notion hard-limits a single rich_text `text.content` string to 2000 characters — every
+// entry every existing call site produces is short (code-generated summaries), so this
+// never mattered before. Email bodies routinely will exceed it, and Notion 400s on the
+// whole request if it's over, which createActivityLogEntry's catch below would otherwise
+// swallow silently (entry just never gets written, no visible error anywhere).
+function truncateForNotion(str, max = 1900) {
+  if (!str) return str;
+  return str.length > max ? str.slice(0, max) + "… (truncated)" : str;
+}
+
 // Writes one entry to the Item Activity Log DB. Never throws — errors are logged and
 // swallowed so a logging failure can never break the calling submission endpoint.
 // IMPORTANT: still call this with `await`, same as fireWebhook above. Netlify freezes the
@@ -530,13 +571,13 @@ async function createActivityLogEntry(notion, { taskId, source, tag, author, ent
   }
   try {
     const properties = {
-      "Entry":  { title:    [{ text: { content: entry } }] },
+      "Entry":  { title:    [{ text: { content: truncateForNotion(entry) } }] },
       "Source": { select:   { name: source } },
       "Tag":    { select:   { name: tag } },
-      "Author": { rich_text: [{ text: { content: author || "System" } }] },
+      "Author": { rich_text: [{ text: { content: truncateForNotion(author || "System") } }] },
     };
     if (taskId) properties["Task"]   = { relation: [{ id: taskId }] };
-    if (detail) properties["Detail"] = { rich_text: [{ text: { content: detail } }] };
+    if (detail) properties["Detail"] = { rich_text: [{ text: { content: truncateForNotion(detail) } }] };
     if (link)   properties["Link"]   = { url: link };
 
     await notion.pages.create({ parent: { database_id: ACTIVITY_LOG_DB }, properties });
@@ -614,18 +655,41 @@ module.exports = function mountDrawingFlow(app, notion) {
     catch (err) { console.warn(`[ingest] DT lookup failed for "${dtInitials}":`, err.message); }
 
     let qaRound = 1;
+    let duplicateOf = null;
     try {
       const prev = await findLatestSubmission(notion, drawingPage.id, stage);
       if (prev) {
-        qaRound = (getProp(prev, "QA Round", "number") ?? 1) + 1;
-        // Only supersede a still-open submission — a Rejected one is already closed
-        const prevStatus = getProp(prev, "Status", "select");
-        if (prevStatus === "Submitted") {
-          notion.pages.update({ page_id: prev.id, properties: { "Status": { select: { name: "Rejected" } } } })
-            .catch((e) => console.warn("[ingest] Supersede failed:", e.message));
+        const prevRevision = getProp(prev, "Revision", "select");
+        if (prevRevision === revision) {
+          // Same drawing/stage/revision already has a Submission — this is a redelivery of
+          // a file still sitting in Pending (Make's watch trigger re-detecting it: a scenario
+          // edit resetting its cursor, a manual rerun, a folder re-list), not a new business
+          // event. Treat as a no-op instead of creating a duplicate Submission / bumping QA
+          // Round / superseding the still-open entry it would otherwise supersede.
+          duplicateOf = prev;
+        } else {
+          qaRound = (getProp(prev, "QA Round", "number") ?? 1) + 1;
+          // Only supersede a still-open submission — a Rejected one is already closed
+          const prevStatus = getProp(prev, "Status", "select");
+          if (prevStatus === "Submitted") {
+            notion.pages.update({ page_id: prev.id, properties: { "Status": { select: { name: "Rejected" } } } })
+              .catch((e) => console.warn("[ingest] Supersede failed:", e.message));
+          }
         }
       }
     } catch (err) { console.warn("[ingest] Resubmission check:", err.message); }
+
+    if (duplicateOf) {
+      console.log(`[ingest] Duplicate ingest for ${projectNo}/${stage}/${filename} — already recorded as ${duplicateOf.id}, skipping.`);
+      return res.json({
+        ok: true,
+        submissionId: duplicateOf.id,
+        submissionTitle: getProp(duplicateOf, "Submission", "title"),
+        qaRound: getProp(duplicateOf, "QA Round", "number") ?? 1,
+        isResubmission: false,
+        duplicate: true,
+      });
+    }
 
     const submissionTitle = `${projectNo}-${itemNo.padStart(3, "0")}_${drawingNo}_${stage}_R${qaRound}`;
 
@@ -2400,13 +2464,13 @@ module.exports = function mountDrawingFlow(app, notion) {
     try {
       const resolvedSource = source || "Manual";
       const properties = {
-        "Entry":  { title:     [{ text: { content: entry } }] },
+        "Entry":  { title:     [{ text: { content: truncateForNotion(entry) } }] },
         "Source": { select:    { name: resolvedSource } },
         "Tag":    { select:    { name: tag } },
-        "Author": { rich_text: [{ text: { content: author || "DM" } }] },
+        "Author": { rich_text: [{ text: { content: truncateForNotion(author || "DM") } }] },
       };
       if (taskId)    properties["Task"]       = { relation: [{ id: taskId }] };
-      if (detail)    properties["Detail"]     = { rich_text: [{ text: { content: detail } }] };
+      if (detail)    properties["Detail"]     = { rich_text: [{ text: { content: truncateForNotion(detail) } }] };
       if (link)      properties["Link"]       = { url: link };
       if (eventDate) properties["Event Date"] = { date: { start: eventDate } };
 
@@ -2424,6 +2488,68 @@ module.exports = function mountDrawingFlow(app, notion) {
       });
     } catch (err) {
       console.error("POST /api/df/activity-log", err);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // POST /api/df/email-ingest
+  // Make.com watches a dedicated capture address/label (Greig forwards or BCCs relevant
+  // emails there) and POSTs each new message here. Accepts a few field-name aliases since
+  // different Make email modules (Gmail vs. Email/IMAP) name things slightly differently.
+  //
+  // Item matching is deliberately conservative: only looks for the "Suffix NNN" convention
+  // already used everywhere else in this codebase, and only links the entry to a Task when
+  // that produces exactly one match (see findTaskByItemNo above). No project context comes
+  // through from an email subject, so anything unmatched or ambiguous logs with no Task —
+  // it'll still show up in the global feed, just needs a manual Task relation added in
+  // Notion afterward. Tag defaults to #info (the same "when in doubt" default used
+  // elsewhere) since reliably inferring intent from arbitrary email text is a later,
+  // AI-assisted step, not this one.
+  //
+  // Attachments are out of scope for this first version — subject + body text only.
+
+  app.post("/api/df/email-ingest", async (req, res) => {
+    if (!ACTIVITY_LOG_DB) return res.status(503).json({ ok: false, error: "NOTION_DB_ACTIVITY_LOG not configured" });
+
+    const body = req.body || {};
+    const rawSubject = body.subject || "";
+    const bodyText    = body.text || body.body || body.bodyPlain || "";
+    const fromEmail   = body.from || body.fromEmail || body.sender || "";
+    const fromName    = body.fromName || body.senderName || "";
+    const messageUrl  = body.messageUrl || body.link || body.permalink || "";
+
+    if (!rawSubject && !bodyText) {
+      return res.status(400).json({ ok: false, error: "subject or body text required" });
+    }
+
+    try {
+      // Strip reply/forward prefixes (Re:, Fwd:, Fw: — possibly stacked) for a cleaner
+      // Entry title; the Source badge already says "Email" so no need to prefix that too.
+      const cleanSubject = rawSubject
+        .replace(/^\s*(re|fwd?)\s*:\s*/i, "")
+        .replace(/^\s*(re|fwd?)\s*:\s*/i, "")
+        .trim() || "(no subject)";
+
+      const itemNo = parseItemNoFromSubject(rawSubject);
+      const task   = itemNo ? await findTaskByItemNo(notion, itemNo) : null;
+
+      const author = fromName || fromEmail || "Unknown";
+
+      await createActivityLogEntry(notion, {
+        taskId: task?.id ?? null,
+        source: "Email",
+        tag:    "#info",
+        author,
+        entry:  cleanSubject,
+        detail: bodyText,
+        link:   messageUrl,
+      });
+
+      console.log(`[email-ingest] "${cleanSubject}" from ${author}${task ? ` → matched Suffix ${itemNo}` : itemNo ? ` → Suffix ${itemNo} not uniquely matched, unlinked` : " → no item number in subject, unlinked"}`);
+
+      res.json({ ok: true, matched: !!task, taskId: task?.id ?? null, itemNo: itemNo ?? null });
+    } catch (err) {
+      console.error("POST /api/df/email-ingest", err);
       res.status(500).json({ ok: false, error: err.message });
     }
   });

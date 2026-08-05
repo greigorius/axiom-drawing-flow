@@ -768,6 +768,7 @@ main {
 .tag-issue       { background: #7f1d1d; } /* red-900    ~10.2:1 */
 .tag-approval    { background: #14532d; } /* green-900  ~11.6:1 */
 .tag-info        { background: #374151; } /* slate-700  ~10:1 */
+.tag-action      { background: #581c87; } /* purple-900 ~10.9:1 */
 
 /* ─── Media attachments ──────────────────────────────────────────────── */
 .activity-row-files {

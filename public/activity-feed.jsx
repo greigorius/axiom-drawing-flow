@@ -12,7 +12,7 @@
 
 const { useState, useEffect, useCallback, useRef } = React;
 
-const TAGS = ["#decision", "#instruction", "#query", "#response", "#issue", "#approval", "#info"];
+const TAGS = ["#decision", "#instruction", "#query", "#response", "#issue", "#approval", "#info", "#action"];
 const DEFAULT_WINDOW_DAYS = 7;
 
 // Detail text arrives from the backend as plain text with real "\n" line breaks and
@@ -228,7 +228,7 @@ const ActivityFeed = () => {
       " · " + d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
   };
 
-  const isEmphasised = (source) => source === "Manual" || source === "Email";
+  const isEmphasised = (source) => source === "Manual" || source === "Email" || source === "Meeting";
 
   // Images render as clickable thumbnails; everything else (PDFs, docs, etc.) renders
   // as a plain file chip with its name. Judged by extension since Notion doesn't expose
