@@ -447,6 +447,23 @@ async function findLatestSubmission(notion, drawingPageId, stage) {
   return res.results[0] ?? null;
 }
 
+// Finds an existing Submission whose Dropbox Path exactly matches — used by ingest to guard
+// against re-processing the same physical file. Make's Watch Files trigger can re-surface a
+// file still sitting in Pending (a manual "Run once", a trigger reset, an at-least-once
+// retry); without this check that would mint a brand-new Submission — and QA Round — every
+// time, even though nothing about the file changed. A genuine resubmission after a bounce
+// always carries a new revision code in its filename, so its Dropbox Path always differs
+// from the previous one — this only catches true re-sends of the identical file.
+async function findSubmissionByDropboxPath(notion, shortPath) {
+  if (!shortPath) return null;
+  const res = await notion.databases.query({
+    database_id: SUBMISSIONS_DB,
+    filter: { property: "Dropbox Path", url: { equals: shortPath } },
+    page_size: 1,
+  });
+  return res.results[0] ?? null;
+}
+
 // Resolve DT name and email from the Team DB.
 async function resolveDT(notion, dtIds) {
   if (!dtIds?.length) return { name: null, email: null };
@@ -641,6 +658,22 @@ module.exports = function mountDrawingFlow(app, notion) {
 
     console.log(`[ingest] ${projectNo}/${stage}/${filename}`);
 
+    // Strip DROPBOX_ROOT prefix up front — used both by the duplicate-ingest guard below and
+    // for the Dropbox Path property written on create. Case-insensitive comparison since
+    // path_lower from Make will be lowercase.
+    const fullRawPath = dropboxPath ?? filePath;
+    const shortPath = fullRawPath.toLowerCase().startsWith(DROPBOX_ROOT.toLowerCase())
+      ? fullRawPath.slice(DROPBOX_ROOT.length).replace(/^\//, "")
+      : fullRawPath;
+
+    try {
+      const dupe = await findSubmissionByDropboxPath(notion, shortPath);
+      if (dupe) {
+        console.log(`[ingest] Duplicate ingest for ${shortPath} — already recorded as ${dupe.id}, skipping.`);
+        return res.json({ ok: true, skipped: true, duplicate: true, submissionId: dupe.id });
+      }
+    } catch (err) { console.warn("[ingest] Duplicate check failed:", err.message); }
+
     let taskPage, drawingPage, dtPage;
 
     try { taskPage = await findTask(notion, projectNo, itemNo); }
@@ -655,41 +688,18 @@ module.exports = function mountDrawingFlow(app, notion) {
     catch (err) { console.warn(`[ingest] DT lookup failed for "${dtInitials}":`, err.message); }
 
     let qaRound = 1;
-    let duplicateOf = null;
     try {
       const prev = await findLatestSubmission(notion, drawingPage.id, stage);
       if (prev) {
-        const prevRevision = getProp(prev, "Revision", "select");
-        if (prevRevision === revision) {
-          // Same drawing/stage/revision already has a Submission — this is a redelivery of
-          // a file still sitting in Pending (Make's watch trigger re-detecting it: a scenario
-          // edit resetting its cursor, a manual rerun, a folder re-list), not a new business
-          // event. Treat as a no-op instead of creating a duplicate Submission / bumping QA
-          // Round / superseding the still-open entry it would otherwise supersede.
-          duplicateOf = prev;
-        } else {
-          qaRound = (getProp(prev, "QA Round", "number") ?? 1) + 1;
-          // Only supersede a still-open submission — a Rejected one is already closed
-          const prevStatus = getProp(prev, "Status", "select");
-          if (prevStatus === "Submitted") {
-            notion.pages.update({ page_id: prev.id, properties: { "Status": { select: { name: "Rejected" } } } })
-              .catch((e) => console.warn("[ingest] Supersede failed:", e.message));
-          }
+        qaRound = (getProp(prev, "QA Round", "number") ?? 1) + 1;
+        // Only supersede a still-open submission — a Rejected one is already closed
+        const prevStatus = getProp(prev, "Status", "select");
+        if (prevStatus === "Submitted") {
+          notion.pages.update({ page_id: prev.id, properties: { "Status": { select: { name: "Rejected" } } } })
+            .catch((e) => console.warn("[ingest] Supersede failed:", e.message));
         }
       }
     } catch (err) { console.warn("[ingest] Resubmission check:", err.message); }
-
-    if (duplicateOf) {
-      console.log(`[ingest] Duplicate ingest for ${projectNo}/${stage}/${filename} — already recorded as ${duplicateOf.id}, skipping.`);
-      return res.json({
-        ok: true,
-        submissionId: duplicateOf.id,
-        submissionTitle: getProp(duplicateOf, "Submission", "title"),
-        qaRound: getProp(duplicateOf, "QA Round", "number") ?? 1,
-        isResubmission: false,
-        duplicate: true,
-      });
-    }
 
     const submissionTitle = `${projectNo}-${itemNo.padStart(3, "0")}_${drawingNo}_${stage}_R${qaRound}`;
 
@@ -705,15 +715,7 @@ module.exports = function mountDrawingFlow(app, notion) {
       "Ball In Court": { select:   { name: BIC.SUBMITTED  } },
       "BIC Since":     { date:     { start: now()         } },
     };
-    if (dropboxPath || filePath) {
-      // Strip DROPBOX_ROOT prefix — stored path is relative to Drawing Submissions for tidiness.
-      // Case-insensitive comparison since path_lower from Make will be lowercase.
-      const fullRaw = dropboxPath ?? filePath;
-      const shortPath = fullRaw.toLowerCase().startsWith(DROPBOX_ROOT.toLowerCase())
-        ? fullRaw.slice(DROPBOX_ROOT.length).replace(/^\//, "")
-        : fullRaw;
-      submissionProps["Dropbox Path"] = { url: shortPath };
-    }
+    submissionProps["Dropbox Path"] = { url: shortPath };
     if (dtPage) submissionProps["DT"] = { relation: [{ id: dtPage.id }] };
     if (shareLink) submissionProps["Share Link"] = { url: shareLink };
 
