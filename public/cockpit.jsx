@@ -491,11 +491,21 @@ const Cockpit = () => {
   const [search,               setSearch]               = useState("");
   const [density,              setDensity]              = useState("comfortable");
 
+  // Ingest notifications — separate from the queue data above. Backed by
+  // GET/POST /api/df/notifications (see drawing-flow.js), this is a heads-up feed of
+  // every ingest outcome (created / skipped / errored) so it's obvious the Dropbox
+  // trigger actually ran, without digging through Make/Netlify logs.
+  const [notifications,        setNotifications]        = useState([]);
+  const [notifOpen,            setNotifOpen]            = useState(false);
+  const [toasts,               setToasts]               = useState([]);
+
   // Multi-select: single Set shared across all sections; sections filter to their own IDs
   const [selectedIds, setSelectedIds] = useState(new Set());
 
   const knownIds = useRef(new Set());
   const notifGranted = useRef(false);
+  const seenNotifIds  = useRef(new Set());
+  const notifInitDone = useRef(false);
 
   const toggleSelect = useCallback((id) => {
     setSelectedIds((prev) => {
@@ -641,6 +651,55 @@ const Cockpit = () => {
       window.removeEventListener("online", onOnline);
     };
   }, [fetchQueue]);
+
+  // ── Ingest notifications ─────────────────────────────────────────────────
+  // Polls independently of the queue above — a lightweight feed, not project data.
+  // On the very first load we just record what's already there as "seen" (no
+  // toast storm for a backlog); only entries that show up on later polls toast.
+  const fetchNotifications = useCallback(async () => {
+    try {
+      const res = await fetch("/api/df/notifications");
+      if (!res.ok) return;
+      const body = await res.json();
+      const list = body.notifications || [];
+
+      if (!notifInitDone.current) {
+        list.forEach((n) => seenNotifIds.current.add(n.id));
+        notifInitDone.current = true;
+        setNotifications(list);
+        return;
+      }
+
+      const fresh = list.filter((n) => !seenNotifIds.current.has(n.id));
+      if (fresh.length) {
+        fresh.forEach((n) => seenNotifIds.current.add(n.id));
+        setToasts((prev) => [...fresh, ...prev]);
+        fresh.forEach((n) => {
+          setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== n.id)), 8000);
+        });
+      }
+      setNotifications(list);
+    } catch (_err) { /* best-effort — not core polling, fail silently */ }
+  }, []);
+
+  useEffect(() => {
+    fetchNotifications();
+    const id = setInterval(() => {
+      if (document.hidden || !navigator.onLine) return;
+      fetchNotifications();
+    }, 30_000);
+    return () => clearInterval(id);
+  }, [fetchNotifications]);
+
+  const handleClearNotifications = async () => {
+    setNotifications([]);
+    setNotifOpen(false);
+    try {
+      await fetch("/api/df/notifications/clear", { method: "POST" });
+    } catch (_err) { /* best-effort */ }
+  };
+
+  const notifIcon = (type) => (type === "success" ? "✓" : type === "skip" ? "⏭" : "⚠");
 
   // ── Individual actions ───────────────────────────────────────────────────
   const handleApprove = async (id) => {
@@ -1135,6 +1194,63 @@ const Cockpit = () => {
           onClose={() => setLogStatusTarget(null)}
         />
       )}
+
+      {/* ── Ingest notifications: fixed bell + toasts + dismissable list ───── */}
+      <div className="notif-widget">
+        {toasts.length > 0 && (
+          <div className="notif-toasts" aria-live="polite">
+            {toasts.map((t) => (
+              <div key={t.id} className={`notif-toast notif-${t.type}`}>
+                <span className="notif-icon">{notifIcon(t.type)}</span>
+                <div className="notif-toast-body">
+                  {t.filename && <div className="notif-toast-file">{t.filename}</div>}
+                  <div className="notif-toast-msg">{t.message}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {notifOpen && (
+          <div className="notif-panel">
+            <div className="notif-panel-head">
+              <span>Ingest activity</span>
+              <button className="k-btn" onClick={handleClearNotifications} disabled={notifications.length === 0}>
+                Clear all
+              </button>
+            </div>
+            <div className="notif-panel-list">
+              {notifications.length === 0 ? (
+                <div className="notif-empty">No ingest activity yet</div>
+              ) : (
+                notifications.map((n) => (
+                  <div key={n.id} className={`notif-row notif-${n.type}`}>
+                    <span className="notif-icon">{notifIcon(n.type)}</span>
+                    <div className="notif-row-body">
+                      <div className="notif-row-msg">{n.message}</div>
+                      {n.filename && <div className="notif-row-file">{n.filename}</div>}
+                      <div className="notif-row-time">
+                        {new Date(n.ts).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                      </div>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+
+        <button
+          className="notif-bell"
+          onClick={() => setNotifOpen((v) => !v)}
+          aria-label="Ingest notifications"
+          aria-expanded={notifOpen}
+          title="Ingest notifications — shows the trigger ran"
+        >
+          🔔
+          {notifications.length > 0 && <span className="notif-badge">{notifications.length}</span>}
+        </button>
+      </div>
     </div>
   );
 };

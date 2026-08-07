@@ -8,6 +8,7 @@
     "dev": "node server.js"
   },
   "dependencies": {
+    "@netlify/blobs": "^8.1.0",
     "@notionhq/client": "^2.2.15",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",

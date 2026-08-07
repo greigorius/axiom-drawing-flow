@@ -15,6 +15,8 @@
 //   POST   /api/df/inputs
 //   GET    /api/df/activity-log        ?taskId&limit  — Item Activity Log feed for a task
 //   POST   /api/df/activity-log        manual/backfill entry (also auto-fired on approve/issue/bounce/log-status/ingest)
+//   GET    /api/df/notifications        cockpit ingest-run feed (created/skipped/error), newest first
+//   POST   /api/df/notifications/clear  clears the feed once reviewed
 //
 // Make.com integration:
 //   Scenario 1 (Ingest):      Make watches Dropbox /Pending/ and calls POST /api/df/ingest
@@ -23,6 +25,8 @@
 //                             See docs/MAKE-CONFIG-GUIDE.md for full configuration steps
 
 "use strict";
+
+const { getStore } = require("@netlify/blobs");
 
 // --- DB IDs ---
 const DRAWINGS_DB    = process.env.NOTION_DB_DRAWINGS;
@@ -603,6 +607,58 @@ async function createActivityLogEntry(notion, { taskId, source, tag, author, ent
   }
 }
 
+// --- Cockpit notifications ---
+//
+// A separate, disposable feed from the Activity Log above — this is not project history,
+// it's an operational heads-up so whoever has the cockpit open knows the ingest trigger
+// actually ran and what it did (created / skipped / errored), without having to go digging
+// through Make execution logs or Netlify function logs. The cockpit polls this, toasts new
+// entries, and lets the user clear the list once they're happy everything's been reviewed.
+//
+// Backed by Netlify Blobs (zero setup — auto-provisioned per site) rather than a new Notion
+// database, since this is deliberately ephemeral and shouldn't need sharing/schema work.
+// getStore() only resolves automatically inside a deployed Netlify Function or `netlify dev`
+// — plain `node server.js` locally has no Blobs context, so every call is wrapped and just
+// warns rather than breaking ingest if it fails.
+const NOTIFICATIONS_STORE = "cockpit-notifications";
+const NOTIFICATIONS_KEY   = "feed";
+const NOTIFICATIONS_MAX   = 200;
+
+// type: "success" | "skip" | "error"
+async function addNotification({ type, filename, message }) {
+  try {
+    const store   = getStore(NOTIFICATIONS_STORE);
+    const current = (await store.get(NOTIFICATIONS_KEY, { type: "json" })) || [];
+    const entry = {
+      id:       `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      ts:       new Date().toISOString(),
+      type,
+      filename: filename ?? null,
+      message,
+    };
+    // Simple read-modify-write — fine at this volume (a handful of ingests per poll window);
+    // not worth adding locking for the rare case two land in the same instant.
+    await store.setJSON(NOTIFICATIONS_KEY, [entry, ...current].slice(0, NOTIFICATIONS_MAX));
+  } catch (err) {
+    console.warn("[notifications] write failed:", err.message);
+  }
+}
+
+async function getNotifications() {
+  try {
+    const store = getStore(NOTIFICATIONS_STORE);
+    return (await store.get(NOTIFICATIONS_KEY, { type: "json" })) || [];
+  } catch (err) {
+    console.warn("[notifications] read failed:", err.message);
+    return [];
+  }
+}
+
+async function clearNotifications() {
+  const store = getStore(NOTIFICATIONS_STORE);
+  await store.setJSON(NOTIFICATIONS_KEY, []);
+}
+
 // --- Inputs helpers ---
 
 function extractInputsFromPage(page) {
@@ -646,14 +702,23 @@ module.exports = function mountDrawingFlow(app, notion) {
 
   app.post("/api/df/ingest", async (req, res) => {
     const { filePath, dropboxLink, dropboxPath, shareLink } = req.body;
-    if (!filePath) return res.status(400).json({ ok: false, error: "Missing filePath" });
+    if (!filePath) {
+      await addNotification({ type: "error", filename: null, message: "Ingest call missing filePath" });
+      return res.status(400).json({ ok: false, error: "Missing filePath" });
+    }
 
     const pathParts = parsePath(filePath);
-    if (!pathParts) return res.status(400).json({ ok: false, error: "Path does not match protocol", received: filePath });
+    if (!pathParts) {
+      await addNotification({ type: "error", filename: filePath, message: "Path does not match expected protocol" });
+      return res.status(400).json({ ok: false, error: "Path does not match protocol", received: filePath });
+    }
     const { projectNo, stage, filename } = pathParts;
 
     const fileParts = parseFilename(filename);
-    if (!fileParts) return res.status(400).json({ ok: false, error: "Filename does not match convention", received: filename });
+    if (!fileParts) {
+      await addNotification({ type: "error", filename, message: "Filename does not match naming convention" });
+      return res.status(400).json({ ok: false, error: "Filename does not match convention", received: filename });
+    }
     const { itemNo, drawingNo, revision, dtInitials } = fileParts;
 
     console.log(`[ingest] ${projectNo}/${stage}/${filename}`);
@@ -670,6 +735,7 @@ module.exports = function mountDrawingFlow(app, notion) {
       const dupe = await findSubmissionByDropboxPath(notion, shortPath);
       if (dupe) {
         console.log(`[ingest] Duplicate ingest for ${shortPath} — already recorded as ${dupe.id}, skipping.`);
+        await addNotification({ type: "skip", filename, message: "Duplicate ingest — already recorded as an existing Submission, skipped." });
         return res.json({ ok: true, skipped: true, duplicate: true, submissionId: dupe.id });
       }
     } catch (err) { console.warn("[ingest] Duplicate check failed:", err.message); }
@@ -677,12 +743,24 @@ module.exports = function mountDrawingFlow(app, notion) {
     let taskPage, drawingPage, dtPage;
 
     try { taskPage = await findTask(notion, projectNo, itemNo); }
-    catch (err) { return res.status(500).json({ ok: false, error: "Task lookup failed", detail: err.message }); }
-    if (!taskPage) return res.status(422).json({ ok: false, error: "Task not found", detail: `No Task for item "${itemNo}" in ${projectNo}` });
+    catch (err) {
+      await addNotification({ type: "error", filename, message: `Task lookup failed: ${err.message}` });
+      return res.status(500).json({ ok: false, error: "Task lookup failed", detail: err.message });
+    }
+    if (!taskPage) {
+      await addNotification({ type: "error", filename, message: `Task not found for item "${itemNo}" in ${projectNo}` });
+      return res.status(422).json({ ok: false, error: "Task not found", detail: `No Task for item "${itemNo}" in ${projectNo}` });
+    }
 
     try { drawingPage = await findDrawing(notion, drawingNo, taskPage.id); }
-    catch (err) { return res.status(500).json({ ok: false, error: "Drawing lookup failed", detail: err.message }); }
-    if (!drawingPage) return res.status(422).json({ ok: false, error: "Drawing not found in MDS", detail: `No MDS row for "${drawingNo}"` });
+    catch (err) {
+      await addNotification({ type: "error", filename, message: `Drawing lookup failed: ${err.message}` });
+      return res.status(500).json({ ok: false, error: "Drawing lookup failed", detail: err.message });
+    }
+    if (!drawingPage) {
+      await addNotification({ type: "error", filename, message: `Drawing not found in MDS for "${drawingNo}"` });
+      return res.status(422).json({ ok: false, error: "Drawing not found in MDS", detail: `No MDS row for "${drawingNo}"` });
+    }
 
     try { dtPage = await findDT(notion, dtInitials); }
     catch (err) { console.warn(`[ingest] DT lookup failed for "${dtInitials}":`, err.message); }
@@ -723,6 +801,7 @@ module.exports = function mountDrawingFlow(app, notion) {
     try {
       newSubmission = await notion.pages.create({ parent: { database_id: SUBMISSIONS_DB }, properties: submissionProps });
     } catch (err) {
+      await addNotification({ type: "error", filename, message: `Failed to create Submission: ${err.message}` });
       return res.status(500).json({ ok: false, error: "Failed to create Submission", detail: err.message });
     }
 
@@ -750,7 +829,29 @@ module.exports = function mountDrawingFlow(app, notion) {
     });
 
     console.log(`[ingest] created ${submissionTitle} (${newSubmission.id})`);
+    await addNotification({ type: "success", filename, message: `Created ${submissionTitle} (QA Round ${qaRound})` });
     return res.json({ ok: true, submissionId: newSubmission.id, submissionTitle, qaRound, isResubmission: qaRound > 1 });
+  });
+
+  // GET /api/df/notifications
+  // Cockpit ingest-run feed — newest first. Purely operational, not project history.
+  app.get("/api/df/notifications", async (req, res) => {
+    try {
+      const notifications = await getNotifications();
+      res.json({ ok: true, notifications });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // POST /api/df/notifications/clear
+  app.post("/api/df/notifications/clear", async (req, res) => {
+    try {
+      await clearNotifications();
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
   });
 
   // GET /api/df/queue
