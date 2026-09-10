@@ -20,7 +20,7 @@ are retired as of Sept 2026.)
 The system automates:
 - **Ingestion** — Make.com detects new PDFs in Dropbox and registers them in Notion
 - **QA review** — the DM approves, bounces, or logs a client grade via a browser cockpit
-- **File management** — Make.com moves files in Dropbox (Pending → Rejected/Approved folders) based on backend instructions
+- **File management** — Make.com moves files in Dropbox (01_Pending → 02_Rejected / 03_Ready For Issue → 04_Issued) based on backend instructions
 - **Notifications** — batch email to DTs on review outcomes, and grade notifications after client sign-off
 - **Master Drawing Schedule (MDS) sync** — all submission events automatically update the Notion drawings database
 
@@ -83,10 +83,10 @@ Accessed at the app root (`/`). Designed to sit open permanently on the DM's des
 
 | Action | Trigger | What it does |
 |--------|---------|-------------|
-| **Approve** | Button on For Review card | Status → Approved; Make moves the (Drawboard-reviewed) PDF to `{Project}/Approved/`, name unchanged |
-| **Bounce** | Button on For Review card | Confirm modal → status Rejected, BIC → DT; Make moves the marked-up PDF to `{Project}/Rejected/{name}_R{n}.pdf` |
+| **Approve** | Button on For Review card | Status → Approved; Make moves the (Drawboard-reviewed) PDF to `{Project}/03_Ready For Issue/`, name unchanged |
+| **Bounce** | Button on For Review card | Confirm modal → status Rejected, BIC → DT; Make moves the marked-up PDF to `{Project}/02_Rejected/{name}_R{n}.pdf` |
 | **Issue** | Button on Awaiting Issue card | Sets status to Issued, updates MDS, fires Make.com issue webhook |
-| **Grade (Log Status)** | Button on any Issued card, incl. Review Client Comments | Records the client grade (A/B/C/NA for S4/S5, Approved/Rejected for A4.5/AB). Moves logged client comment PDFs to `Client Comments/Reviewed/R_…`; A4.5 Rejected moves the C01 PDF to `Grade Returns/` |
+| **Grade (Log Status)** | Button on any Issued card, incl. Review Client Comments | Records the client grade (A/B/C/NA for S4/S5, Approved/Rejected for A4.5/AB). Moves logged client comment PDFs to `Client Comments/Reviewed/R_…`; A4.5 Rejected moves the C01 PDF to `05_Client Comments/Grade Returns/` |
 | **Send DT Emails** | Batch button | Fires one summary email per DT covering all their pending notifications |
 | **Send Grade Emails** | Batch button | Fires grade notification emails to DTs for all graded submissions |
 | **Scan Comments** | Button | Triggers Make Scenario 3 to find new client comment PDFs in `Client Comments/` folders → MDS comment files + card moves to Review Client Comments |
@@ -116,11 +116,11 @@ All routes are mounted from `drawing-flow.js` under `/api/df/`.
 
 | Method | Route | Description |
 |--------|-------|-------------|
-| `POST` | `/api/df/ingest` | Called by Make.com when a new PDF lands in Dropbox `/Pending/`. Parses the file path and filename, creates a Submission row in Notion, and updates the MDS. |
+| `POST` | `/api/df/ingest` | Called by Make.com when a new PDF lands in a project's `01_Pending/`. Parses the file path and filename, creates a Submission row in Notion, and updates the MDS. |
 | `PATCH` | `/api/df/submissions/:id/approve` | Approves a submission. Updates Notion status + MDS, returns Dropbox move instructions. |
-| `PATCH` | `/api/df/submissions/:id/issue` | Confirms official issue. Updates status to Issued. |
+| `PATCH` | `/api/df/submissions/:id/issue` | Confirms official issue. Updates status to Issued and fires `move-files` to move the PDF from `03_Ready For Issue/` to `04_Issued/` (name unchanged). |
 | `PATCH` | `/api/df/submissions/:id/bounce` | Bounces a submission back to DT. Increments QA round, returns Dropbox move instructions. |
-| `PATCH` | `/api/df/submissions/:id/log-status` | Logs client grade. Updates MDS grade fields; fires `move-files` for client comments (→ Reviewed/R_) and A4.5 Rejected (→ Grade Returns). |
+| `PATCH` | `/api/df/submissions/:id/log-status` | Logs client grade. Updates MDS grade fields; fires `move-files` for client comments (→ Reviewed/R_) and A4.5 Rejected (→ 05_Client Comments/Grade Returns). |
 | `POST` | `/api/df/cr-ingest` | Called by Make Scenario 3 per client comment PDF. Stage from the Issued submission (or legacy stage folder); stores the path in `Comment Paths`. |
 
 ### Notifications
@@ -219,27 +219,32 @@ The backend writes to these MDS properties on Approve, Bounce, and Log Status:
 /DESIGN KNOW HOW/TMJ Interiors/
   └── Drawing Submissions/
         └── {ProjectNo}/            e.g. 24-367
-              ├── Pending/          ← DTs upload ALL stages here: {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}.pdf
-              ├── Approved/         ← Approve moves the PDF here (filename unchanged); DTs add DWGs here
-              ├── Rejected/         ← Bounce moves the PDF here as {original name}_R{n}.pdf
-              ├── Grade Returns/    ← A4.5 (C01) Rejected returns only, moved here at Log Status
-              └── Client Comments/  ← DM drops client comment PDFs here: {Client}_{YYMMDD}_{DrawingNo}_{Rev}.pdf
-                    └── Reviewed/   ← graded comment PDFs moved here as R_{original name}
+              ├── 01_Pending/           ← DTs upload ALL stages here: {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}.pdf
+              ├── 02_Rejected/          ← Bounce moves the PDF here as {original name}_R{n}.pdf
+              ├── 03_Ready For Issue/   ← Approve moves the PDF here (filename unchanged); DT email links here; DTs add DWGs here
+              ├── 04_Issued/            ← Issue (cockpit) moves the PDF here, filename unchanged (DWGs stay in 03)
+              └── 05_Client Comments/   ← DM drops client comment PDFs here: {Client}_{YYMMDD}_{DrawingNo}_{Rev}.pdf
+                    ├── Reviewed/       ← graded comment PDFs moved here as R_{original name}
+                    └── Grade Returns/  ← A4.5 (C01) Rejected returns, moved here at Log Status (not scanned as comments)
 ```
+
+Folder matching ignores the `NN_` prefix, so un-numbered folders (`Pending`, `Rejected`, …) still work.
+If a Pending folder is renamed, files that re-surface at the new path are matched to their existing
+Submitted row by filename and repointed — not ingested twice.
 
 Grade Returns file name: `{Item}_{Stage}_{Rev}_{DrawingNo}_{Grade}_{YYMMDD}.pdf`.
 Legacy stage-level `{Project}/{Stage}/Client Comments/` folders still work (stage taken from the folder).
 
-`Pending/`, `Rejected/` and `Client Comments/` are set up per project by hand (the Bounce route
-moves straight into `Rejected/` without creating it). `Approved/`, `Grade Returns/` and
-`Client Comments/Reviewed/` are created by Make on first use.
+`01_Pending/`, `02_Rejected/` and `05_Client Comments/` are set up per project by hand (the Bounce
+route moves straight into `02_Rejected/` without creating it). `03_Ready For Issue/`, `04_Issued/`,
+`05_Client Comments/Grade Returns/` and `Reviewed/` are created by Make on first use if missing.
 
 The `DROPBOX_ROOT` constant in `drawing-flow.js` is set to `/DESIGN KNOW HOW/TMJ Interiors`. Notion stores only the relative path from `Drawing Submissions/` onward; the backend reconstructs the full path when returning move instructions.
 
 **Legacy:** the old per-stage layout (`{ProjectNo}/{Stage}/Pending/`, approved files in
 `{ProjectNo}/{Stage}/Suffix NNN/`) is still understood by the backend so drawings already in
-flight keep working. In-flight legacy files are moved to the new project-level `Approved/` /
-`Rejected/` folders when actioned. Legacy branches are marked `LEGACY` in `drawing-flow.js`.
+flight keep working. In-flight legacy files are moved to the new project-level `03_Ready For Issue/` /
+`02_Rejected/` folders when actioned. Legacy branches are marked `LEGACY` in `drawing-flow.js`.
 
 ### Filename Convention
 
@@ -264,7 +269,7 @@ Files that don't match are rejected at ingest with a specific reason in the cock
 
 | Scenario | Trigger | What it does |
 |----------|---------|-------------|
-| **Scenario 1 — Ingest** | New PDF in any project `/Pending/` folder (recursive watch on `Drawing Submissions`) | Calls `POST /api/df/ingest`; backend parses path and filename, creates Submission row |
+| **Scenario 1 — Ingest** | New PDF in any project `01_Pending/` folder (filter: path contains `pending/`) (recursive watch on `Drawing Submissions`) | Calls `POST /api/df/ingest`; backend parses path and filename, creates Submission row |
 | **Scenario 2 — Actions Hub** | Webhook from backend (`MAKE_ACTIONS_WEBHOOK`) | Handles Dropbox file moves (approve/bounce), sends DT notification emails, triggers client review ingest |
 
 ### Make.com Webhook Actions
@@ -275,7 +280,7 @@ The backend fires `MAKE_ACTIONS_WEBHOOK` with an `action` field. Make.com routes
 |--------|-------------|---------|
 | `approve` | Approve endpoint | `dropboxMove` (`from`, `toFolderParent`, `toFolderName`, `toFolder`, `newFilename`) |
 | `bounce` | Bounce endpoint | `dropboxMove` (same shape — Make **moves**, never deletes) |
-| `move-files` | Log Status | `moves[]` of the same shape — client comments → Reviewed/R_, A4.5 Rejected → Grade Returns |
+| `move-files` | Log Status, Issue | `moves[]` of the same shape — client comments → Reviewed/R_, A4.5 Rejected → 05_Client Comments/Grade Returns, Issue → 04_Issued |
 | `dt-summary` | Send DT Emails button | Per-DT summary of actioned submissions for email |
 | `issue` | Issue endpoint | Submission details for issue notification |
 | `grade-summary` | Send Grade Emails button | Per-DT summary; folder block per return folder (Reviewed or Grade Returns) |

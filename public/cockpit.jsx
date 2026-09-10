@@ -86,7 +86,7 @@ const BounceModal = ({ submission, onConfirm, onClose }) => {
         </div>
         <p style={{ fontSize: 13, color: "var(--text2)", margin: "16px 0 0" }}>
           Returns the drawing to the DT. Your Drawboard markup travels with the PDF — it moves to the
-          project's <strong>Rejected</strong> folder as <code>…_R{submission.qaRound ?? 1}.pdf</code> and the folder
+          project's <strong>02_Rejected</strong> folder as <code>…_R{submission.qaRound ?? 1}.pdf</code> and the folder
           link goes out in the next DT email.
         </p>
         <p style={{ fontSize: 12, color: "var(--warn)", margin: "10px 0 0" }}>
@@ -161,13 +161,13 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
         </div>
         {submission.hasComments && (
           <div style={{ marginTop: 8, fontSize: 11, color: "var(--text3)" }}>
-            Client comment PDFs for this drawing move to <code>Client Comments/Reviewed</code> with an <code>R_</code> prefix —
+            Client comment PDFs for this drawing move to <code>05_Client Comments/Reviewed</code> with an <code>R_</code> prefix —
             sync them in Drawboard first.
           </div>
         )}
         {isA45 && (
           <div style={{ marginTop: 8, fontSize: 11, color: "var(--text3)" }}>
-            Rejected moves the issued C01 PDF to <code>Grade Returns</code>; Approved leaves it in <code>Approved</code>.
+            Rejected moves the issued C01 PDF to <code>05_Client Comments/Grade Returns</code>; Approved leaves it in <code>04_Issued</code>.
           </div>
         )}
       </div>
@@ -196,7 +196,8 @@ const IssueModal = ({ submission, onConfirm, onClose }) => {
           {submission.dtName ? ` · ${submission.dtName}` : ""}
         </div>
         <p style={{ fontSize: 13, color: "var(--text2)", margin: "16px 0 0" }}>
-          Confirm you have issued the drawings to the client. Notion and the MDS will be updated and the DT will be notified.
+          Confirm you have issued the drawings to the client. The PDF moves from <code>03_Ready For Issue</code> to{" "}
+          <code>04_Issued</code> (DWGs stay put), Notion and the MDS are updated, and the DT is notified.
         </p>
         <div className="modal-actions">
           <button className="btn btn-ghost" onClick={onClose} disabled={busy}>Cancel</button>
@@ -1051,8 +1052,10 @@ const Cockpit = () => {
       );
     }
     // Client comments are reviewed in Drawboard, then graded here — Log Status moves the
-    // comment PDFs to Client Comments/Reviewed/R_… (the Comment Reviewer app is retired).
-    else if (colId === "signoff" || colId === "awaiting-comments" || colId === "comments") primary = (
+    // comment PDFs to 05_Client Comments/Reviewed/R_… (the Comment Reviewer app is retired).
+    // "Awaiting Comments" cards have no Grade button: they're graded once the client's
+    // comments arrive (Scan Comments moves them to Review Client Comments). Hold still shows.
+    else if (colId === "signoff" || colId === "comments") primary = (
       <button className="k-act go" onClick={(e) => { e.stopPropagation(); setLogStatusTarget(s); }}
         title={colId === "comments" ? "Review the comment PDF in Drawboard, then grade" : "Log the client grade"}>Grade</button>
     );

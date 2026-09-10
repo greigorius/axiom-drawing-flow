@@ -1,7 +1,7 @@
 // Unit tests for the pure path/filename helpers in drawing-flow.js.  Run: node tests/parsing.test.js
 const fs = require("fs"), vm = require("vm"), assert = require("assert");
 const src = fs.readFileSync(fs.existsSync(__dirname + "/drawing-flow.js") ? __dirname + "/drawing-flow.js" : __dirname + "/../drawing-flow.js", "utf8") +
-  "\n;module.exports.__t = { parsePath, parseFilename, parseSubmissionName, computeDropboxMove, gradeReturnsFolder, toShortDropboxPath, locateProject, computeReviewedMove, computeGradeReturnMove };";
+  "\n;module.exports.__t = { parsePath, parseFilename, parseSubmissionName, computeDropboxMove, gradeReturnsFolder, toShortDropboxPath, locateProject, computeReviewedMove, computeGradeReturnMove, computeIssueMove };";
 const mod = { exports: {} };
 vm.runInNewContext(src, { module: mod, exports: mod.exports, require: (n) => n === "@netlify/blobs" ? { getStore(){} } : require(n), process, console, Date });
 const t = mod.exports.__t;
@@ -46,41 +46,50 @@ const P = "Drawing Submissions/24-367";
 const full = (p) => `/DESIGN KNOW HOW/TMJ Interiors/${p}`;
 ok("approve new", () => { const m = t.computeDropboxMove(`${P}/Pending/003_S4_P01_A-101_GF.pdf`, "approve");
   assert.strictEqual(m.from, full(`${P}/Pending/003_S4_P01_A-101_GF.pdf`));
-  assert.strictEqual(m.toFolder, full(`${P}/Approved`));
-  assert.strictEqual(m.toFolderParent, full(P)); assert.strictEqual(m.toFolderName, "Approved");
-  assert.strictEqual(m.newFilename, "003_S4_P01_A-101_GF.pdf"); assert.strictEqual(m.to, full(`${P}/Approved/003_S4_P01_A-101_GF.pdf`));
+  assert.strictEqual(m.toFolder, full(`${P}/03_Ready For Issue`));
+  assert.strictEqual(m.toFolderParent, full(P)); assert.strictEqual(m.toFolderName, "03_Ready For Issue");
+  assert.strictEqual(m.newFilename, "003_S4_P01_A-101_GF.pdf"); assert.strictEqual(m.to, full(`${P}/03_Ready For Issue/003_S4_P01_A-101_GF.pdf`));
   assert.strictEqual(m.itemNo, "003"); assert.strictEqual(m.drawingNo, "A-101"); assert.strictEqual(m.stage, "S4"); });
 ok("bounce new", () => { const m = t.computeDropboxMove(`${P}/Pending/003_A4.5_C01_A-101_GF.pdf`, "bounce", 2);
-  assert.strictEqual(m.toFolder, full(`${P}/Rejected`)); assert.strictEqual(m.toFolderName, "Rejected");
-  assert.strictEqual(m.newFilename, "003_A4.5_C01_A-101_GF_R2.pdf"); assert.strictEqual(m.to, full(`${P}/Rejected/003_A4.5_C01_A-101_GF_R2.pdf`));
+  assert.strictEqual(m.toFolder, full(`${P}/02_Rejected`)); assert.strictEqual(m.toFolderName, "02_Rejected");
+  assert.strictEqual(m.newFilename, "003_A4.5_C01_A-101_GF_R2.pdf"); assert.strictEqual(m.to, full(`${P}/02_Rejected/003_A4.5_C01_A-101_GF_R2.pdf`));
   assert.strictEqual(m.stage, "A4.5"); assert.strictEqual(m.drawingNo, "A-101"); });
 ok("bounce default round 1", () => assert.strictEqual(t.computeDropboxMove(`${P}/Pending/003_S4_P01_A-101_GF.pdf`, "bounce").newFilename, "003_S4_P01_A-101_GF_R1.pdf"));
 ok("move still parses a pre-change 4-section name", () => assert.strictEqual(t.computeDropboxMove(`${P}/Pending/003_S4_P01_A-101.pdf`, "approve").drawingNo, "A-101"));
 ok("approve legacy in-flight → project Approved", () => { const m = t.computeDropboxMove(`${P}/S4/Pending/003_A-101_P01_GF.pdf`, "approve");
-  assert.strictEqual(m.toFolder, full(`${P}/Approved`)); assert.strictEqual(m.newFilename, "003_A-101_P01_GF.pdf");
+  assert.strictEqual(m.toFolder, full(`${P}/03_Ready For Issue`)); assert.strictEqual(m.newFilename, "003_A-101_P01_GF.pdf");
   assert.strictEqual(m.drawingNo, "A-101"); assert.strictEqual(m.stage, "S4"); });
-ok("bounce legacy in-flight → project Rejected", () => assert.strictEqual(
-  t.computeDropboxMove(`${P}/S5/Pending/003_A-101_P01_GF.pdf`, "bounce", 3).to, full(`${P}/Rejected/003_A-101_P01_GF_R3.pdf`)));
+ok("bounce legacy in-flight → project 02_Rejected", () => assert.strictEqual(
+  t.computeDropboxMove(`${P}/S5/Pending/003_A-101_P01_GF.pdf`, "bounce", 3).to, full(`${P}/02_Rejected/003_A-101_P01_GF_R3.pdf`)));
 ok("full path input accepted", () => assert.ok(t.computeDropboxMove(full(`${P}/Pending/003_S4_P01_A-101.pdf`), "approve")));
-ok("not in Pending → null", () => assert.strictEqual(t.computeDropboxMove(`${P}/Approved/003_S4_P01_A-101.pdf`, "approve"), null));
+ok("not in Pending → null", () => assert.strictEqual(t.computeDropboxMove(`${P}/03_Ready For Issue/003_S4_P01_A-101.pdf`, "approve"), null));
+ok("numbered 01_Pending path parsed", () => assert.deepStrictEqual({...t.parsePath(`${R}/24-367/01_Pending/003_S4_P01_A-101_GF.pdf`)},
+  { projectNo: "24-367", folderStage: null, filename: "003_S4_P01_A-101_GF.pdf", layout: "project" }));
+ok("approve from 01_Pending → 03_Ready For Issue", () => assert.strictEqual(
+  t.computeDropboxMove(`${P}/01_Pending/003_S4_P01_A-101_GF.pdf`, "approve").to, full(`${P}/03_Ready For Issue/003_S4_P01_A-101_GF.pdf`)));
+ok("issue move Ready For Issue → 04_Issued", () => { const m = t.computeIssueMove(`${P}/03_Ready For Issue/003_S4_P01_A-101_GF.pdf`);
+  assert.strictEqual(m.to, full(`${P}/04_Issued/003_S4_P01_A-101_GF.pdf`)); assert.strictEqual(m.toFolderName, "04_Issued"); assert.strictEqual(m.toFolderParent, full(P)); });
+ok("issue move from this morning's un-numbered Approved folder", () => assert.strictEqual(
+  t.computeIssueMove(`${P}/Approved/003_S4_P01_A-101_GF.pdf`).to, full(`${P}/04_Issued/003_S4_P01_A-101_GF.pdf`)));
+ok("issue leaves legacy Suffix copies alone", () => assert.strictEqual(t.computeIssueMove(`${P}/S4/Suffix 003/A-101.pdf`), null));
 ok("null path → null", () => assert.strictEqual(t.computeDropboxMove(null, "approve"), null));
 
 // ---- Grade Returns / Reviewed
-ok("grade returns new", () => assert.strictEqual(t.gradeReturnsFolder(`${P}/Approved/003_A4.5_C01_A-101.pdf`), full(`${P}/Grade Returns`)));
+ok("grade returns new → 05_Client Comments/Grade Returns", () => assert.strictEqual(t.gradeReturnsFolder(`${P}/04_Issued/003_A4.5_C01_A-101.pdf`), full(`${P}/05_Client Comments/Grade Returns`)));
 ok("grade returns legacy", () => assert.strictEqual(t.gradeReturnsFolder(`${P}/A4.5/Suffix 003/A-101.pdf`), full(`${P}/A4.5/Grade Returns`)));
-ok("grade return move A4.5 rejected", () => { const m = t.computeGradeReturnMove(`${P}/Approved/003_A4.5_C01_A-101.pdf`,
+ok("grade return move A4.5 rejected", () => { const m = t.computeGradeReturnMove(`${P}/04_Issued/003_A4.5_C01_A-101.pdf`,
     { itemNo: "003", stage: "A4.5", revision: "C01", drawingNo: "A-101", grade: "Rejected", date: "2026-09-10" });
-  assert.strictEqual(m.from, full(`${P}/Approved/003_A4.5_C01_A-101.pdf`));
-  assert.strictEqual(m.toFolderParent, full(P)); assert.strictEqual(m.toFolderName, "Grade Returns");
+  assert.strictEqual(m.from, full(`${P}/04_Issued/003_A4.5_C01_A-101.pdf`));
+  assert.strictEqual(m.toFolderParent, full(`${P}/05_Client Comments`)); assert.strictEqual(m.toFolderName, "Grade Returns");
   assert.strictEqual(m.newFilename, "003_A4.5_C01_A-101_Rejected_260910.pdf"); });
-ok("grade return move skipped when already returned", () => assert.strictEqual(t.computeGradeReturnMove(`${P}/Grade Returns/x.pdf`,
+ok("grade return move skipped when already returned", () => assert.strictEqual(t.computeGradeReturnMove(`${P}/05_Client Comments/Grade Returns/x.pdf`,
     { itemNo: "003", stage: "A4.5", revision: "C01", drawingNo: "A-101", grade: "Rejected" }), null));
-ok("reviewed move project-level", () => { const m = t.computeReviewedMove(`${P}/Client Comments/MC_260910_A-101_P01.pdf`);
-  assert.strictEqual(m.toFolderParent, full(`${P}/Client Comments`)); assert.strictEqual(m.toFolderName, "Reviewed");
-  assert.strictEqual(m.to, full(`${P}/Client Comments/Reviewed/R_MC_260910_A-101_P01.pdf`)); });
+ok("reviewed move project-level", () => { const m = t.computeReviewedMove(`${P}/05_Client Comments/MC_260910_A-101_P01.pdf`);
+  assert.strictEqual(m.toFolderParent, full(`${P}/05_Client Comments`)); assert.strictEqual(m.toFolderName, "Reviewed");
+  assert.strictEqual(m.to, full(`${P}/05_Client Comments/Reviewed/R_MC_260910_A-101_P01.pdf`)); });
 ok("reviewed move legacy stage-level", () => assert.strictEqual(t.computeReviewedMove(`${P}/S4/Client Comments/MC_260910_A-101_P01.pdf`).to,
   full(`${P}/S4/Client Comments/Reviewed/R_MC_260910_A-101_P01.pdf`)));
 ok("reviewed move skips already-reviewed", () => { assert.strictEqual(t.computeReviewedMove(`${P}/Client Comments/Reviewed/R_x.pdf`), null);
   assert.strictEqual(t.computeReviewedMove(`${P}/Client Comments/R_x.pdf`), null); });
-ok("short path roundtrip", () => assert.strictEqual(t.toShortDropboxPath(full(`${P}/Approved/x.pdf`)), `${P}/Approved/x.pdf`));
+ok("short path roundtrip", () => assert.strictEqual(t.toShortDropboxPath(full(`${P}/03_Ready For Issue/x.pdf`)), `${P}/03_Ready For Issue/x.pdf`));
 console.log(`\n${n} tests passed`);

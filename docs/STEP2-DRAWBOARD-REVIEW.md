@@ -5,6 +5,12 @@
 **Notion:** `Comment Paths` (text) added to the Submissions DB. Already done.
 **Make:** Actions Hub needs 3 changes after deploy (§5). Ingest and Client Comment Ingest need none.
 
+> **Update 10 Sept (later):** project folders are now numbered — `01_Pending`, `02_Rejected`,
+> `03_Ready For Issue` (was `Approved`), `04_Issued`, `05_Client Comments`. Approve moves the PDF to
+> `03_Ready For Issue` (name unchanged; DT email link and DWG uploads point there), and **Issue** now
+> moves it on to `04_Issued`. C01 (A4.5) Rejected returns go to `05_Client Comments/Grade Returns`. Folder names below that say `Pending`/`Rejected`/`Approved`/`Client Comments`
+> map to the numbered folders. See `AXIOM-DRAWING-FLOW.md` for the current layout.
+
 ---
 
 ## 1. How it now works
