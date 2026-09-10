@@ -167,7 +167,7 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
         )}
         {isA45 && (
           <div style={{ marginTop: 8, fontSize: 11, color: "var(--text3)" }}>
-            Rejected moves the issued C01 PDF to <code>05_Client Comments/Grade Returns</code>; Approved leaves it in <code>04_Issued</code>.
+            Rejected moves the issued C01 PDF to <code>05_Client Comments</code> as <code>…_Rejected_YYMMDD.pdf</code>; Approved moves it to <code>06_Signed Off</code>.
           </div>
         )}
       </div>

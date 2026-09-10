@@ -198,9 +198,11 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(r.json.skipped, true);
   ok("cr-ingest ignores Reviewed/R_ files");
 
-  r = await call("POST /api/df/cr-ingest", { body: { filePath: `${R}/24-367/05_Client Comments/Grade Returns/003_A4.5_C01_${DWG}_Rejected_260910.pdf` } });
+  r = await call("POST /api/df/cr-ingest", { body: { filePath: `${R}/24-367/05_Client Comments/003_A4.5_C01_${DWG}_Rejected_260910.pdf` } });
+  assert.strictEqual(r.json.skipped, true); assert.match(r.json.reason, /grade return/);
+  r = await call("POST /api/df/cr-ingest", { body: { filePath: `${R}/24-367/A4.5/Grade Returns/003_A4.5_C01_${DWG}_Rejected_260910.pdf` } });
   assert.strictEqual(r.json.skipped, true);
-  ok("cr-ingest ignores C01 files in 05_Client Comments/Grade Returns");
+  ok("cr-ingest ignores C01 returns in 05_Client Comments (by filename) and legacy Grade Returns/");
 
   // Grade S5 with a logged comment → move-files to Reviewed/R_
   submissions = [issued("subI", "S5", "P02", { "DM Action": sel("Review Comments"),
@@ -225,20 +227,37 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(hook("move-files"), undefined);
   ok("re-grade → no duplicate moves");
 
-  // A4.5 Rejected → Grade Returns with new naming; Approved → no move
+  // A4.5 Rejected → 05_Client Comments with the grade-return name
   submissions = [issued("subC", "A4.5", "C01", { "Submission": title(`24-367-003_${DWG}_A4.5_R1`),
-    "Dropbox Path": { url: `Drawing Submissions/24-367/04_Issued/003_A4.5_C01_${DWG}.pdf` } })];
+    "Dropbox Path": { url: `Drawing Submissions/24-367/04_Issued/003_A4.5_C01_${DWG}_GF.pdf` } })];
   webhooks.length = 0; updates.length = 0;
   r = await call("PATCH /api/df/submissions/:id/log-status", { params: { id: "subC" }, body: { grade: "Rejected" } });
   mv = hook("move-files");
   assert.strictEqual(mv.moves.length, 1);
-  assert.strictEqual(mv.moves[0].toFolderParent, `${R}/24-367/05_Client Comments`); assert.strictEqual(mv.moves[0].toFolderName, "Grade Returns");
+  assert.strictEqual(mv.moves[0].toFolder, `${R}/24-367/05_Client Comments`);
+  assert.strictEqual(mv.moves[0].toFolderParent, `${R}/24-367`); assert.strictEqual(mv.moves[0].toFolderName, "05_Client Comments");
   assert.match(mv.moves[0].newFilename, new RegExp(`^003_A4\\.5_C01_${DWG}_Rejected_\\d{6}\\.pdf$`));
-  assert.match(updates[0].properties["Dropbox Path"].url, /^Drawing Submissions\/24-367\/05_Client Comments\/Grade Returns\/003_A4\.5_C01_/);
+  assert.match(updates[0].properties["Dropbox Path"].url, /^Drawing Submissions\/24-367\/05_Client Comments\/003_A4\.5_C01_/);
+  // …and re-grading it once it's already in 05_Client Comments moves nothing
+  submissions[0].properties["Dropbox Path"] = { url: updates[0].properties["Dropbox Path"].url };
   webhooks.length = 0;
-  r = await call("PATCH /api/df/submissions/:id/log-status", { params: { id: "subC" }, body: { grade: "Approved" } });
+  r = await call("PATCH /api/df/submissions/:id/log-status", { params: { id: "subC" }, body: { grade: "Rejected" } });
   assert.strictEqual(hook("move-files"), undefined);
-  ok("A4.5 Rejected → 05_Client Comments/Grade Returns/{Item}_{Stage}_{Rev}_{DrawingNo}_Rejected_{YYMMDD}.pdf; Approved stays put");
+  ok("A4.5 Rejected → 05_Client Comments/{Item}_{Stage}_{Rev}_{DrawingNo}_Rejected_{YYMMDD}.pdf; re-grade doesn't move twice");
+
+  // A4.5 Approved → 06_Signed Off, filename unchanged
+  submissions = [issued("subD", "A4.5", "C01", { "Submission": title(`24-367-003_${DWG}_A4.5_R1`),
+    "Dropbox Path": { url: `Drawing Submissions/24-367/04_Issued/003_A4.5_C01_${DWG}_GF.pdf` } })];
+  webhooks.length = 0; updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/log-status", { params: { id: "subD" }, body: { grade: "Approved" } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  mv = hook("move-files");
+  assert.strictEqual(mv.moves.length, 1);
+  assert.strictEqual(mv.moves[0].from, `${R}/24-367/04_Issued/003_A4.5_C01_${DWG}_GF.pdf`);
+  assert.strictEqual(mv.moves[0].toFolderParent, `${R}/24-367`); assert.strictEqual(mv.moves[0].toFolderName, "06_Signed Off");
+  assert.strictEqual(mv.moves[0].newFilename, `003_A4.5_C01_${DWG}_GF.pdf`);
+  assert.strictEqual(updates[0].properties["Dropbox Path"].url, `Drawing Submissions/24-367/06_Signed Off/003_A4.5_C01_${DWG}_GF.pdf`);
+  ok("A4.5 Approved → 06_Signed Off/{filename}, path written with the grade");
 
   // ── Issue: 03_Ready For Issue → 04_Issued ─────────────────────────────
   submissions = [{ id: "subR", properties: { "Status": sel("Awaiting Issue"), "Stage": sel("S4"), "Drawing": rel("dwg1"), "Item": rel(),
@@ -263,16 +282,20 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
       "Comment Paths": rt(`Drawing Submissions/24-367/05_Client Comments/Reviewed/R_MC_260910_${DWG}_P02.pdf`) } },
     { id: "g2", properties: { "Status": sel("Graded"), "DT Notified": { checkbox: false }, "Stage": sel("A4.5"), "Client Grade": sel("Rejected"), "Revision": sel("C01"),
       "Submission": title(`24-367-003_${DWG}_A4.5_R1`), "DT": rel("dtAI"), "Drawing": rel(),
-      "Dropbox Path": { url: `Drawing Submissions/24-367/05_Client Comments/Grade Returns/003_A4.5_C01_${DWG}_Rejected_260910.pdf` } } },
+      "Dropbox Path": { url: `Drawing Submissions/24-367/05_Client Comments/003_A4.5_C01_${DWG}_Rejected_260910.pdf` } } },
+    { id: "g3", properties: { "Status": sel("Graded"), "DT Notified": { checkbox: false }, "Stage": sel("A4.5"), "Client Grade": sel("Approved"), "Revision": sel("C01"),
+      "Submission": title(`24-367-004_${DWG}_A4.5_R1`), "DT": rel("dtAI"), "Drawing": rel(),
+      "Dropbox Path": { url: `Drawing Submissions/24-367/06_Signed Off/004_A4.5_C01_${DWG}_GF.pdf` } } },
   ];
   webhooks.length = 0;
   r = await call("POST /api/df/send-grade-emails", { body: {} });
   const gs = hook("grade-summary");
   const heads = gs.folderBlocks.map((f) => f.folderHtml);
   assert.ok(heads.includes("<strong>24-367/05_Client Comments/Reviewed</strong>"), heads.join(" | "));
-  assert.ok(heads.includes("<strong>24-367/05_Client Comments/Grade Returns</strong>"), heads.join(" | "));
+  assert.ok(heads.includes("<strong>24-367/05_Client Comments</strong>"), heads.join(" | "));
+  assert.ok(heads.includes("<strong>24-367/06_Signed Off</strong>"), heads.join(" | "));
   assert.ok(gs.folderBlocks.some((f) => /R_/.test(f.drawingsHtml)) && gs.folderBlocks.some((f) => /\{Item\}_\{Stage\}/.test(f.drawingsHtml)));
-  ok("grade email: S5 → 05_Client Comments/Reviewed, A4.5 → 05_Client Comments/Grade Returns");
+  ok("grade email: S5 → 05_Client Comments/Reviewed, A4.5 Rejected → 05_Client Comments, A4.5 Approved → 06_Signed Off");
 
   // ── stage-upload ───────────────────────────────────────────────────────
   const seen = []; const q = notion.databases.query;

@@ -24,8 +24,8 @@
 //                             filename = {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}.pdf
 //   Scenario 2 (Actions Hub): backend fires MAKE_ACTIONS_WEBHOOK with action=dt-summary|grade-summary
 //                             (batch emails), action=approve|bounce (Dropbox move + folder link), or
-//                             action=move-files (client comments → Reviewed/R_, A4.5 → 05_Client Comments/Grade Returns,
-//                             Issue → 04_Issued)
+//                             action=move-files (client comments → Reviewed/R_, A4.5 Rejected → 05_Client Comments,
+//                             A4.5 Approved → 06_Signed Off, Issue → 04_Issued)
 //   Review happens in Drawboard PDF, synced back to the same Dropbox file before the DM acts.
 //                             See docs/MAKE-CONFIG-GUIDE.md for full configuration steps
 
@@ -150,8 +150,10 @@ const DROPBOX_ROOT = "/DESIGN KNOW HOW/TMJ Interiors";
 //     02_Rejected/           ← Bounce moves the file here as {original name}_R{n}.pdf
 //     03_Ready For Issue/    ← Approve moves the file here, filename unchanged; DTs add DWGs here
 //     04_Issued/             ← Issue (cockpit) moves the PDF here, filename unchanged
-//     05_Client Comments/    ← client comment PDFs; graded ones → Reviewed/R_{name}
-//       Grade Returns/       ← A4.5 (C01) Rejected returns, moved here at Log Status
+//     05_Client Comments/    ← all client returns, told apart by filename:
+//                               client comment PDFs  {Client}_{YYMMDD}_{DrawingNo}_{Rev}.pdf  (graded → Reviewed/R_{name})
+//                               A4.5 (C01) Rejected  {Item}_{Stage}_{Rev}_{DrawingNo}_Rejected_{YYMMDD}.pdf
+//     06_Signed Off/         ← A4.5 (C01) Approved: the PDF moves here from 04_Issued, filename unchanged
 //
 // Folder matching ignores the "NN_" prefix, so un-numbered folders (Pending, Rejected …)
 // from before the numbering still work.
@@ -166,7 +168,8 @@ const FOLDER = {
   READY_FOR_ISSUE: "03_Ready For Issue",
   ISSUED:          "04_Issued",
   CLIENT_COMMENTS: "05_Client Comments",
-  GRADE_RETURNS:   "Grade Returns",     // A4.5 (C01) returns only — a subfolder of 05_Client Comments
+  SIGNED_OFF:      "06_Signed Off",     // A4.5 (C01) Approved
+  GRADE_RETURNS:   "Grade Returns",     // LEGACY stage-folder layout only: {ProjectNo}/{Stage}/Grade Returns
   REVIEWED:        "Reviewed",          // …/Client Comments/Reviewed/R_{name} once the DM has graded
 };
 const REVIEWED_PREFIX = "R_";
@@ -217,15 +220,23 @@ function locateProject(rawPath) {
   };
 }
 
-// Where graded client returns for this submission live.
-// New layout → {ProjectNo}/05_Client Comments/Grade Returns (C01 returns sit with the client comments).
+// Where C01 (A4.5) Rejected returns for this submission live.
+// New layout → {ProjectNo}/05_Client Comments itself — architect or principal contractor, it's all
+// "the client". No subfolder: the filename tells a C01 return apart from a client comment PDF.
 // Legacy stage-folder paths keep {ProjectNo}/{Stage}/Grade Returns.
 function gradeReturnsFolder(rawPath) {
   const loc = locateProject(rawPath);
   if (!loc) return null;
   return loc.stageSeg
     ? `${loc.projectRoot}/${loc.stageSeg}/${FOLDER.GRADE_RETURNS}`
-    : `${loc.projectRoot}/${FOLDER.CLIENT_COMMENTS}/${FOLDER.GRADE_RETURNS}`;
+    : `${loc.projectRoot}/${FOLDER.CLIENT_COMMENTS}`;
+}
+
+// {Item}_{Stage}_{Rev}_{DrawingNo}_{Grade}_{YYMMDD}.pdf — a C01 return written by Log Status.
+// Scan Comments skips these: they sit in 05_Client Comments but aren't client comment PDFs.
+const GRADE_RETURN_NAME_RE = /_(Rejected|Approved)_\d{6}\.pdf$/i;
+function isGradeReturnName(name) {
+  return GRADE_RETURN_NAME_RE.test(name || "");
 }
 
 // Client comment PDF → {its Client Comments folder}/Reviewed/R_{name}, fired when the DM logs
@@ -247,7 +258,7 @@ function computeReviewedMove(rawPath) {
            toFolderName: FOLDER.REVIEWED, newFilename };
 }
 
-// A4.5 (C01) Rejected: the issued copy moves out of 04_Issued/ into 05_Client Comments/Grade Returns, renamed in
+// A4.5 (C01) Rejected: the issued copy moves out of 04_Issued/ into 05_Client Comments/, renamed in
 // the submission order with the grade and date appended:
 //   {Item}_{Stage}_{Rev}_{DrawingNo}_{Grade}_{YYMMDD}.pdf
 function computeGradeReturnMove(rawPath, { itemNo, stage, revision, drawingNo, grade, date }) {
@@ -255,12 +266,31 @@ function computeGradeReturnMove(rawPath, { itemNo, stage, revision, drawingNo, g
   const toFolder = gradeReturnsFolder(rawPath);
   if (!full || !toFolder || !itemNo || !drawingNo) return null;
   const parent = full.split("/").filter(Boolean).slice(-2, -1)[0] || "";
-  if (isFolder(parent, FOLDER.GRADE_RETURNS)) return null;   // already returned (re-grade)
+  // Already returned (re-grade) — nothing to move.
+  if (isFolder(parent, FOLDER.CLIENT_COMMENTS) || isFolder(parent, FOLDER.GRADE_RETURNS)) return null;
   const dateTag     = (date || now()).replace(/-/g, "").slice(2);   // YYYY-MM-DD → YYMMDD
   const newFilename = `${itemNo}_${stage}_${revision}_${drawingNo}_${grade}_${dateTag}.pdf`;
-  const toFolderParent = toFolder.split("/").slice(0, -1).join("/");
+  const toFolderParts  = toFolder.split("/");
+  const toFolderParent = toFolderParts.slice(0, -1).join("/");
   return { from: full, to: `${toFolder}/${newFilename}`, toFolder, toFolderParent,
-           toFolderName: FOLDER.GRADE_RETURNS, newFilename };
+           toFolderName: toFolderParts[toFolderParts.length - 1], newFilename };
+}
+
+// A4.5 (C01) Approved: the issued PDF moves to {ProjectNo}/06_Signed Off/, filename unchanged.
+// Only a project-level copy moves (04_Issued, or 03_Ready For Issue / "Approved" if it was never
+// issued through the cockpit). Legacy {Stage}/… copies and anything already signed off stay put.
+function computeSignedOffMove(rawPath) {
+  const loc = locateProject(rawPath);
+  if (!loc) return null;
+  const { segs, fullPath, projectRoot } = loc;
+  const parent = segs[segs.length - 2];
+  const fromOk = isFolder(parent, FOLDER.ISSUED) || isFolder(parent, FOLDER.READY_FOR_ISSUE) || isFolder(parent, "Approved");
+  if (!fromOk) return null;
+  if (segs.length - 2 !== segs.findIndex((s) => s.toLowerCase() === "drawing submissions") + 2) return null;
+  const filename = segs[segs.length - 1];
+  const toFolder = `${projectRoot}/${FOLDER.SIGNED_OFF}`;
+  return { from: fullPath, to: `${toFolder}/${filename}`, toFolder, toFolderParent: projectRoot,
+           toFolderName: FOLDER.SIGNED_OFF, newFilename: filename };
 }
 
 // Notion rich_text segments are capped at 2000 chars — split long newline lists across segments.
@@ -1721,12 +1751,19 @@ module.exports = function mountDrawingFlow(app, notion) {
         const dt = await resolveDT(notion, dtIds);
 
         // Where the DT finds the returned file:
-        //   A4.5 Rejected → {ProjectNo}/05_Client Comments/Grade Returns/ (moved there at Log Status)
+        //   A4.5 Rejected → {ProjectNo}/05_Client Comments/ (moved there at Log Status)
+        //   A4.5 Approved → {ProjectNo}/06_Signed Off/ (if the PDF was moved there at Log Status)
         //   S4/S5 etc.   → the Reviewed/ folder the client comment PDFs were moved into
-        //   otherwise    → no file (e.g. A4.5 Approved, or graded without client comments)
+        //   otherwise    → no file (e.g. graded without client comments)
         let returnFolder = null, returnKind = null;
         if (stage === "A4.5") {
           if (grade === "Rejected") { returnFolder = gradeReturnsFolder(rawPath); returnKind = "grade-returns"; }
+          if (grade === "Approved") {
+            const segs = (toFullDropboxPath(rawPath) || "").split("/");
+            if (isFolder(segs[segs.length - 2], FOLDER.SIGNED_OFF)) {
+              returnFolder = segs.slice(0, -1).join("/"); returnKind = "signed-off";
+            }
+          }
         } else {
           const reviewedPath = readPathList(page, "Comment Paths").find((p) => /\/reviewed\//i.test(p));
           if (reviewedPath) {
@@ -1798,7 +1835,9 @@ module.exports = function mountDrawingFlow(app, notion) {
           const folderHtml  = shortFolder ? `<strong>${shortFolder}</strong>` : "<strong>No return file</strong>";
 
           const note = bucket.returnKind === "grade-returns"
-            ? "Returned C01 drawings are named <code>{Item}_{Stage}_{Rev}_{DrawingNo}_{Grade}_{YYMMDD}.pdf</code>"
+            ? "Returned C01 drawings sit with the client comments, named <code>{Item}_{Stage}_{Rev}_{DrawingNo}_{Grade}_{YYMMDD}.pdf</code>"
+            : bucket.returnKind === "signed-off"
+            ? "Signed-off C01 drawings — filename unchanged"
             : bucket.returnKind === "reviewed"
               ? "Client comments reviewed by the DM — files prefixed <code>R_</code>, named <code>R_{Client}_{YYMMDD}_{DrawingNo}_{Rev}.pdf</code>"
               : "No marked-up file for these — see the grade and action.";
@@ -1976,12 +2015,13 @@ module.exports = function mountDrawingFlow(app, notion) {
       const name = filename || pathStr.split("/").pop();
       if (!name) return res.status(400).json({ ok: false, error: "filename required" });
 
-      // Already-reviewed files (moved to Reviewed/ with R_) are never re-ingested, and the C01
-      // returns in Client Comments/Grade Returns/ aren't client comments at all.
+      // Already-reviewed files (moved to Reviewed/ with R_) are never re-ingested, and C01 returns
+      // ({Item}_{Stage}_{Rev}_{DrawingNo}_{Grade}_{YYMMDD}.pdf in 05_Client Comments, or a legacy
+      // Grade Returns/ folder) aren't client comments at all.
       if (name.toUpperCase().startsWith(REVIEWED_PREFIX) || /\/reviewed\//i.test(pathStr)) {
         return res.json({ ok: true, skipped: true, reason: "already reviewed" });
       }
-      if (/\/grade returns\//i.test(pathStr)) {
+      if (isGradeReturnName(name) || /\/grade returns\//i.test(pathStr)) {
         return res.json({ ok: true, skipped: true, reason: "grade return, not a client comment" });
       }
 
@@ -2477,8 +2517,8 @@ module.exports = function mountDrawingFlow(app, notion) {
   //   • every client comment PDF logged on this submission (Comment Paths)
   //       → {its Client Comments folder}/Reviewed/R_{name}
   //   • A4.5 Rejected: the issued copy in 04_Issued/
-  //       → {ProjectNo}/05_Client Comments/Grade Returns/{Item}_{Stage}_{Rev}_{DrawingNo}_Rejected_{YYMMDD}.pdf
-  //     (A4.5 Approved stays in 04_Issued/ — that copy is the final record until As Builts.)
+  //       → {ProjectNo}/05_Client Comments/{Item}_{Stage}_{Rev}_{DrawingNo}_Rejected_{YYMMDD}.pdf
+  //   • A4.5 Approved: the issued copy in 04_Issued/ → {ProjectNo}/06_Signed Off/{filename}
 
   app.patch("/api/df/submissions/:id/log-status", async (req, res) => {
     const { id } = req.params;
@@ -2535,13 +2575,15 @@ module.exports = function mountDrawingFlow(app, notion) {
     const moves         = commentMoves.map((c) => c.move).filter(Boolean);
     const newCommentPaths = commentMoves.map((c) => c.move ? toShortDropboxPath(c.move.to) : c.p);
 
-    let gradeReturnMove = null;
-    if (stage === "A4.5" && grade === "Rejected") {
-      gradeReturnMove = computeGradeReturnMove(getProp(submissionPage, "Dropbox Path", "url"), {
-        itemNo, stage, revision, drawingNo: logStatusDrawingNo, grade, date: gradedAt,
-      });
-      if (gradeReturnMove) moves.push(gradeReturnMove);
-      else console.warn(`[log-status] Could not work out the Grade Returns move for submission ${id}`);
+    // A4.5: the C01 PDF itself moves — Rejected → 05_Client Comments (renamed), Approved → 06_Signed Off.
+    let pdfMove = null;
+    if (stage === "A4.5") {
+      const pdfPath = getProp(submissionPage, "Dropbox Path", "url");
+      pdfMove = grade === "Rejected"
+        ? computeGradeReturnMove(pdfPath, { itemNo, stage, revision, drawingNo: logStatusDrawingNo, grade, date: gradedAt })
+        : computeSignedOffMove(pdfPath);
+      if (pdfMove) moves.push(pdfMove);
+      else console.warn(`[log-status] No C01 PDF move for submission ${id} (${grade}) — path: ${pdfPath || "none"}`);
     }
 
     try {
@@ -2555,7 +2597,7 @@ module.exports = function mountDrawingFlow(app, notion) {
         "Ball In Court": newBIC ? { select: { name: newBIC    } } : { select: null },
         "BIC Since":     newBIC ? { date:   { start: gradedAt } } : { date:   null },
         ...(commentPaths.length ? { "Comment Paths": { rich_text: richTextChunks(newCommentPaths.join("\n")) } } : {}),
-        ...(gradeReturnMove ? { "Dropbox Path": { url: toShortDropboxPath(gradeReturnMove.to) } } : {}),
+        ...(pdfMove ? { "Dropbox Path": { url: toShortDropboxPath(pdfMove.to) } } : {}),
       }});
     } catch (err) {
       return res.status(500).json({ ok: false, error: "Submission update failed", detail: err.message });

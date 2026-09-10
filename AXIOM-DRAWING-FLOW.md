@@ -86,7 +86,7 @@ Accessed at the app root (`/`). Designed to sit open permanently on the DM's des
 | **Approve** | Button on For Review card | Status → Approved; Make moves the (Drawboard-reviewed) PDF to `{Project}/03_Ready For Issue/`, name unchanged |
 | **Bounce** | Button on For Review card | Confirm modal → status Rejected, BIC → DT; Make moves the marked-up PDF to `{Project}/02_Rejected/{name}_R{n}.pdf` |
 | **Issue** | Button on Awaiting Issue card | Sets status to Issued, updates MDS, fires Make.com issue webhook |
-| **Grade (Log Status)** | Button on any Issued card, incl. Review Client Comments | Records the client grade (A/B/C/NA for S4/S5, Approved/Rejected for A4.5/AB). Moves logged client comment PDFs to `Client Comments/Reviewed/R_…`; A4.5 Rejected moves the C01 PDF to `05_Client Comments/Grade Returns/` |
+| **Grade (Log Status)** | Button on any Issued card, incl. Review Client Comments | Records the client grade (A/B/C/NA for S4/S5, Approved/Rejected for A4.5/AB). Moves logged client comment PDFs to `Client Comments/Reviewed/R_…`; A4.5 Rejected moves the C01 PDF to `05_Client Comments/` (renamed `…_Rejected_{YYMMDD}.pdf`); A4.5 Approved moves it to `06_Signed Off/` |
 | **Send DT Emails** | Batch button | Fires one summary email per DT covering all their pending notifications |
 | **Send Grade Emails** | Batch button | Fires grade notification emails to DTs for all graded submissions |
 | **Scan Comments** | Button | Triggers Make Scenario 3 to find new client comment PDFs in `Client Comments/` folders → MDS comment files + card moves to Review Client Comments |
@@ -120,7 +120,7 @@ All routes are mounted from `drawing-flow.js` under `/api/df/`.
 | `PATCH` | `/api/df/submissions/:id/approve` | Approves a submission. Updates Notion status + MDS, returns Dropbox move instructions. |
 | `PATCH` | `/api/df/submissions/:id/issue` | Confirms official issue. Updates status to Issued and fires `move-files` to move the PDF from `03_Ready For Issue/` to `04_Issued/` (name unchanged). |
 | `PATCH` | `/api/df/submissions/:id/bounce` | Bounces a submission back to DT. Increments QA round, returns Dropbox move instructions. |
-| `PATCH` | `/api/df/submissions/:id/log-status` | Logs client grade. Updates MDS grade fields; fires `move-files` for client comments (→ Reviewed/R_) and A4.5 Rejected (→ 05_Client Comments/Grade Returns). |
+| `PATCH` | `/api/df/submissions/:id/log-status` | Logs client grade. Updates MDS grade fields; fires `move-files` for client comments (→ Reviewed/R_) A4.5 Rejected (→ 05_Client Comments, renamed) and A4.5 Approved (→ 06_Signed Off). |
 | `POST` | `/api/df/cr-ingest` | Called by Make Scenario 3 per client comment PDF. Stage from the Issued submission (or legacy stage folder); stores the path in `Comment Paths`. |
 
 ### Notifications
@@ -223,21 +223,24 @@ The backend writes to these MDS properties on Approve, Bounce, and Log Status:
               ├── 02_Rejected/          ← Bounce moves the PDF here as {original name}_R{n}.pdf
               ├── 03_Ready For Issue/   ← Approve moves the PDF here (filename unchanged); DT email links here; DTs add DWGs here
               ├── 04_Issued/            ← Issue (cockpit) moves the PDF here, filename unchanged (DWGs stay in 03)
-              └── 05_Client Comments/   ← DM drops client comment PDFs here: {Client}_{YYMMDD}_{DrawingNo}_{Rev}.pdf
-                    ├── Reviewed/       ← graded comment PDFs moved here as R_{original name}
-                    └── Grade Returns/  ← A4.5 (C01) Rejected returns, moved here at Log Status (not scanned as comments)
+              ├── 05_Client Comments/   ← all client returns (architect or principal contractor), told apart by filename:
+              │     │                     client comment PDFs (DM drops in): {Client}_{YYMMDD}_{DrawingNo}_{Rev}.pdf
+              │     │                     A4.5 (C01) Rejected (Log Status):  {Item}_{Stage}_{Rev}_{DrawingNo}_Rejected_{YYMMDD}.pdf
+              │     └── Reviewed/       ← graded comment PDFs moved here as R_{original name}
+              └── 06_Signed Off/        ← A4.5 (C01) Approved: Log Status moves the PDF here from 04_Issued, filename unchanged
 ```
 
 Folder matching ignores the `NN_` prefix, so un-numbered folders (`Pending`, `Rejected`, …) still work.
 If a Pending folder is renamed, files that re-surface at the new path are matched to their existing
 Submitted row by filename and repointed — not ingested twice.
 
-Grade Returns file name: `{Item}_{Stage}_{Rev}_{DrawingNo}_{Grade}_{YYMMDD}.pdf`.
+C01 return file name: `{Item}_{Stage}_{Rev}_{DrawingNo}_{Grade}_{YYMMDD}.pdf`. Scan Comments skips any file
+named like this (backend and Make filter), so it's never mistaken for a client comment.
 Legacy stage-level `{Project}/{Stage}/Client Comments/` folders still work (stage taken from the folder).
 
 `01_Pending/`, `02_Rejected/` and `05_Client Comments/` are set up per project by hand (the Bounce
 route moves straight into `02_Rejected/` without creating it). `03_Ready For Issue/`, `04_Issued/`,
-`05_Client Comments/Grade Returns/` and `Reviewed/` are created by Make on first use if missing.
+`06_Signed Off/` and `Reviewed/` are created by Make on first use if missing.
 
 The `DROPBOX_ROOT` constant in `drawing-flow.js` is set to `/DESIGN KNOW HOW/TMJ Interiors`. Notion stores only the relative path from `Drawing Submissions/` onward; the backend reconstructs the full path when returning move instructions.
 
@@ -280,10 +283,10 @@ The backend fires `MAKE_ACTIONS_WEBHOOK` with an `action` field. Make.com routes
 |--------|-------------|---------|
 | `approve` | Approve endpoint | `dropboxMove` (`from`, `toFolderParent`, `toFolderName`, `toFolder`, `newFilename`) |
 | `bounce` | Bounce endpoint | `dropboxMove` (same shape — Make **moves**, never deletes) |
-| `move-files` | Log Status, Issue | `moves[]` of the same shape — client comments → Reviewed/R_, A4.5 Rejected → 05_Client Comments/Grade Returns, Issue → 04_Issued |
+| `move-files` | Log Status, Issue | `moves[]` of the same shape — client comments → Reviewed/R_, A4.5 Rejected → 05_Client Comments, A4.5 Approved → 06_Signed Off, Issue → 04_Issued |
 | `dt-summary` | Send DT Emails button | Per-DT summary of actioned submissions for email |
 | `issue` | Issue endpoint | Submission details for issue notification |
-| `grade-summary` | Send Grade Emails button | Per-DT summary; folder block per return folder (Reviewed or Grade Returns) |
+| `grade-summary` | Send Grade Emails button | Per-DT summary; folder block per return folder (Reviewed, 05_Client Comments for C01 rejections, or 06_Signed Off) |
 | `cr-ingest` | Client Review ingest | Triggers Scenario 1 equivalent for comment PDFs |
 
 ---
