@@ -21,7 +21,7 @@
 // Make.com integration:
 //   Scenario 1 (Ingest):      Make watches Dropbox Drawing Submissions (recursive), filters /pending/,
 //                             and calls POST /api/df/ingest. One Pending folder per project;
-//                             filename = {Item}_{Stage}_{Rev}_{DrawingNo}[_{Initials}].pdf
+//                             filename = {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}.pdf
 //   Scenario 2 (Actions Hub): backend fires MAKE_ACTIONS_WEBHOOK with action=dt-summary|grade-summary
 //                             (batch emails), action=approve|bounce (Dropbox move + folder link), or
 //                             action=move-files (client comments → Reviewed/R_, A4.5 → Grade Returns)
@@ -144,7 +144,7 @@ const DROPBOX_ROOT = "/DESIGN KNOW HOW/TMJ Interiors";
 // goes into ONE Pending folder — the stage travels in the filename, not the folder.
 //
 //   Drawing Submissions/{ProjectNo}/
-//     Pending/        ← DTs upload here: {Item}_{Stage}_{Rev}_{DrawingNo}[_{Initials}].pdf
+//     Pending/        ← DTs upload here: {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}.pdf
 //     Approved/       ← Approve moves the file here, filename unchanged
 //     Rejected/       ← Bounce moves the file here as {original name}_R{n}.pdf
 //     Grade Returns/  ← graded client returns (A4.5 Rejected is moved here automatically)
@@ -270,7 +270,9 @@ function computeDropboxMove(rawPath, action, qaRound) {
   if ((segs[segs.length - 2] || "").toLowerCase() !== "pending") return null;
 
   const filename  = segs[segs.length - 1];
-  const parsed    = parseFilename(filename);
+  // Lenient parse — the file is already ingested; we only want item/drawing/stage for the payload.
+  const dotIdx    = filename.lastIndexOf(".");
+  const parsed    = parseSubmissionName(dotIdx > 0 ? filename.slice(0, dotIdx) : filename, { requireInitials: false });
   const itemNo    = parsed.ok ? parsed.itemNo    : (filename.split("_")[0] ?? "");
   const drawingNo = parsed.ok ? parsed.drawingNo : null;
   const stage     = (parsed.ok && parsed.stage) || (loc.stageSeg ? loc.stageSeg.toUpperCase() : null);
@@ -338,11 +340,13 @@ const INITIALS_RE = /^[A-Z]{2,4}$/;              // GF, AI
 const DRAWING_NO_RE = /^[A-Z0-9][A-Z0-9.\-]*$/i;  // EIT-TMJ-AA-B2-D-I-45120
 
 // Parses a submission name WITHOUT caring about the extension (so it also works for DWGs).
-//   new:    {Item}_{Stage}_{Rev}_{DrawingNo}[_{DTInitials}]   e.g. 003_S4_P01_EIT-TMJ-AA-B2-D-I-45120_GF
-//   legacy: {Item}_{DrawingNo}_{Rev}_{DTInitials}             e.g. 003_A-101_P01_GF   (no stage — comes from folder)
+//   new:    {Item}_{Stage}_{Rev}_{DrawingNo}_{DTInitials}   e.g. 003_S4_P01_EIT-TMJ-AA-B2-D-I-45120_GF
+//           (initials are required for PDF submissions — they set the DT on the Notion row;
+//            pass { requireInitials: false } for DWGs, which may omit them)
+//   legacy: {Item}_{DrawingNo}_{Rev}_{DTInitials}           e.g. 003_A-101_P01_GF   (no stage — comes from folder)
 // Returns { ok: true, format, itemNo, stage, revision, drawingNo, dtInitials }
 //      or { ok: false, error } with a message written for the DT, shown in the cockpit feed.
-function parseSubmissionName(baseName) {
+function parseSubmissionName(baseName, { requireInitials = true } = {}) {
   const fail  = (error) => ({ ok: false, error });
   // Dropbox / Drawboard duplicate copies: "… (1)", "… (Greig's conflicted copy 2026-09-10)".
   if (/\((?:\d+|[^)]*conflicted copy[^)]*|[^)]*copy)\)\s*$/i.test(baseName || "")) {
@@ -350,13 +354,14 @@ function parseSubmissionName(baseName) {
   }
   const parts = (baseName || "").trim().split("_").map((s) => s.trim());
   if (parts.length < 2 || parts.some((p) => !p)) {
-    return fail("Filename should be {Item}_{Stage}_{Rev}_{DrawingNo} — check for missing sections or double/trailing underscores");
+    return fail("Filename should be {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials} — check for missing sections or double/trailing underscores");
   }
 
   // New convention — the stage is the 2nd section.
   if (isStage(parts[1])) {
-    if (parts.length < 4) return fail(`Only ${parts.length} sections — expected {Item}_{Stage}_{Rev}_{DrawingNo}`);
-    if (parts.length > 5) return fail("Too many underscores — use hyphens inside the drawing number; only an optional 5th section (DT initials) is allowed");
+    if (parts.length < 4) return fail(`Only ${parts.length} sections — expected {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}`);
+    if (parts.length === 4 && requireInitials) return fail("DT initials missing — add them at the end: {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}.pdf (e.g. …_GF.pdf)");
+    if (parts.length > 5) return fail("Too many underscores — use hyphens inside the drawing number; the 5th section is your initials");
     const [itemNo, stageRaw, revRaw, drawingRaw, initialsRaw] = parts;
     if (!ITEM_RE.test(itemNo)) return fail(`Item "${itemNo}" should be the item number in digits, e.g. 003`);
     const revision = revRaw.toUpperCase();
@@ -365,7 +370,7 @@ function parseSubmissionName(baseName) {
     let dtInitials = null;
     if (initialsRaw !== undefined) {
       dtInitials = initialsRaw.toUpperCase();
-      if (!INITIALS_RE.test(dtInitials)) return fail(`5th section "${initialsRaw}" should be DT initials (2–4 letters), or leave it off`);
+      if (!INITIALS_RE.test(dtInitials)) return fail(`5th section "${initialsRaw}" should be your initials (2–4 letters, e.g. GF)`);
     }
     return { ok: true, format: "v2", itemNo, stage: stageRaw.toUpperCase(), revision, drawingNo: drawingRaw.toUpperCase(), dtInitials };
   }
@@ -381,7 +386,7 @@ function parseSubmissionName(baseName) {
                drawingNo: drawingNoRaw.toUpperCase(), dtInitials: dtParts.join("_").toUpperCase() || null };
     }
   }
-  return fail(`2nd section "${parts[1]}" isn't a stage — expected {Item}_{Stage}_{Rev}_{DrawingNo} with stage ${VALID_STAGES.join("/")}`);
+  return fail(`2nd section "${parts[1]}" isn't a stage — expected {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials} with stage ${VALID_STAGES.join("/")}`);
 }
 
 function parseFilename(filename) {
@@ -888,26 +893,8 @@ module.exports = function mountDrawingFlow(app, notion) {
     }
     const { projectNo, folderStage, filename, layout } = pathParts;
 
-    const fileParts = parseFilename(filename);
-    if (!fileParts.ok) {
-      await addNotification({ type: "error", filename, message: fileParts.error });
-      return res.status(400).json({ ok: false, error: "Filename does not match convention", detail: fileParts.error, received: filename });
-    }
-    // Old-style names carry no stage, so they only work in the legacy per-stage Pending folders.
-    if (fileParts.format === "legacy" && !folderStage) {
-      const message = "Old-style filename — rename to {Item}_{Stage}_{Rev}_{DrawingNo}.pdf (e.g. 003_S4_P01_A-101.pdf)";
-      await addNotification({ type: "error", filename, message });
-      return res.status(400).json({ ok: false, error: "Filename does not match convention", detail: message, received: filename });
-    }
-    const { itemNo, drawingNo, revision, dtInitials } = fileParts;
-    // Filename stage wins; the legacy folder stage is only a fallback for old-style names.
-    const stage = fileParts.stage || folderStage;
-    if (fileParts.stage && folderStage && fileParts.stage !== folderStage) {
-      console.warn(`[ingest] ${filename}: filename stage ${fileParts.stage} differs from legacy folder ${folderStage} — using filename`);
-    }
-
-    console.log(`[ingest] ${projectNo}/${stage}/${filename} (${layout} layout, ${fileParts.format} name)`);
-
+    // Duplicate guard runs BEFORE filename validation, so a Drawboard re-save of a file that's
+    // already recorded (even one named under an older convention) is skipped quietly.
     // Strip DROPBOX_ROOT prefix up front — used both by the duplicate-ingest guard below and
     // for the Dropbox Path property written on create. Case-insensitive comparison since
     // path_lower from Make will be lowercase.
@@ -925,6 +912,26 @@ module.exports = function mountDrawingFlow(app, notion) {
         return res.json({ ok: true, skipped: true, duplicate: true, submissionId: dupe.id });
       }
     } catch (err) { console.warn("[ingest] Duplicate check failed:", err.message); }
+
+    const fileParts = parseFilename(filename);
+    if (!fileParts.ok) {
+      await addNotification({ type: "error", filename, message: fileParts.error });
+      return res.status(400).json({ ok: false, error: "Filename does not match convention", detail: fileParts.error, received: filename });
+    }
+    // Old-style names carry no stage, so they only work in the legacy per-stage Pending folders.
+    if (fileParts.format === "legacy" && !folderStage) {
+      const message = "Old-style filename — rename to {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}.pdf (e.g. 003_S4_P01_A-101_GF.pdf)";
+      await addNotification({ type: "error", filename, message });
+      return res.status(400).json({ ok: false, error: "Filename does not match convention", detail: message, received: filename });
+    }
+    const { itemNo, drawingNo, revision, dtInitials } = fileParts;
+    // Filename stage wins; the legacy folder stage is only a fallback for old-style names.
+    const stage = fileParts.stage || folderStage;
+    if (fileParts.stage && folderStage && fileParts.stage !== folderStage) {
+      console.warn(`[ingest] ${filename}: filename stage ${fileParts.stage} differs from legacy folder ${folderStage} — using filename`);
+    }
+
+    console.log(`[ingest] ${projectNo}/${stage}/${filename} (${layout} layout, ${fileParts.format} name)`);
 
     let taskPage, drawingPage, dtPage;
 
@@ -948,8 +955,8 @@ module.exports = function mountDrawingFlow(app, notion) {
       return res.status(422).json({ ok: false, error: "Drawing not found in MDS", detail: `No MDS row for "${drawingNo}"` });
     }
 
-    // DT: initials in the (optional) 5th filename section win; otherwise fall back to the
-    // Person assigned on the Item in the Tasks DB.
+    // DT: the initials in the (required) 5th filename section set the DT. If they don't match
+    // anyone in the Team DB, fall back to the Person assigned on the Item and flag it.
     let dtSource = null;
     if (dtInitials) {
       try { dtPage = await findDT(notion, dtInitials); if (dtPage) dtSource = "initials"; }
@@ -1037,7 +1044,9 @@ module.exports = function mountDrawingFlow(app, notion) {
 
     console.log(`[ingest] created ${submissionTitle} (${newSubmission.id})`);
     const dtNote = dtPage
-      ? ""
+      ? (dtInitials && dtSource === "item"
+          ? ` — no DT matched initials "${dtInitials}"; used the Item's Person (${getProp(dtPage, "Name", "title") ?? "?"}) — check the initials`
+          : "")
       : dtInitials
         ? ` — no DT matched initials "${dtInitials}" and no Person on the Item; set DT manually`
         : " — no DT assigned (no initials in filename, no Person on the Item); set DT manually";
@@ -1539,7 +1548,7 @@ module.exports = function mountDrawingFlow(app, notion) {
           const instruction = firstAction === "QA Approved"
             ? "Upload DWGs to the Approved folder link above."
             : firstAction.startsWith("Bounced")
-              ? "Your marked-up drawings are in the Rejected folder link above (suffixed _R#). Revise to the DM comments and upload the revised PDF to the project's Pending folder, named {Item}_{Stage}_{Rev}_{DrawingNo}.pdf."
+              ? "Your marked-up drawings are in the Rejected folder link above (suffixed _R#). Revise to the DM comments and upload the revised PDF to the project's Pending folder, named {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}.pdf."
               : null;
           const instructionRow = instruction
             ? `<tr><td colspan="3" style="padding:4px 8px 10px;font-size:12px;color:#888;font-style:italic;">${instruction}</td></tr>`
@@ -2254,13 +2263,13 @@ module.exports = function mountDrawingFlow(app, notion) {
 
     // Stage: legacy DWGs sat in a {ProjectNo}/{Stage}/... folder; in the new layout DWGs go
     // into {ProjectNo}/Approved/, so take the stage from the filename if it follows
-    // {Item}_{Stage}_{Rev}_{DrawingNo}. If neither gives a stage, match every Approved
+    // {Item}_{Stage}_{Rev}_{DrawingNo}[_{Initials}]. If neither gives a stage, match every Approved
     // submission with BIC=DT for the project.
     let stage = isStage(parts[dsIdx + 2]) ? parts[dsIdx + 2].toUpperCase() : null;
     if (!stage) {
       const fname = parts[parts.length - 1] || "";
       const dot   = fname.lastIndexOf(".");
-      const named = parseSubmissionName(dot > 0 ? fname.slice(0, dot) : fname);
+      const named = parseSubmissionName(dot > 0 ? fname.slice(0, dot) : fname, { requireInitials: false });
       if (named.ok && named.stage) stage = named.stage;
     }
 

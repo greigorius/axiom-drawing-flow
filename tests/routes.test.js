@@ -74,15 +74,15 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
 
 (async () => {
   // ── Ingest ──────────────────────────────────────────────────────────────
-  let r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/003_S4_P01_${DWG}.pdf`, dropboxPath: `${R}/24-367/Pending/003_S4_P01_${DWG}.pdf` } });
+  let r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/003_S4_P01_${DWG}_AI.pdf`, dropboxPath: `${R}/24-367/Pending/003_S4_P01_${DWG}_AI.pdf` } });
   assert.strictEqual(r.status, 200, JSON.stringify(r.json));
-  assert.strictEqual(r.json.dtSource, "item");
+  assert.strictEqual(r.json.dtSource, "initials");
   let p = created[0].properties;
   assert.strictEqual(p.Stage.select.name, "S4"); assert.strictEqual(p.Revision.select.name, "P01");
   assert.strictEqual(p.DT.relation[0].id, "dtAI");
-  assert.strictEqual(p["Dropbox Path"].url, `Drawing Submissions/24-367/Pending/003_S4_P01_${DWG}.pdf`);
+  assert.strictEqual(p["Dropbox Path"].url, `Drawing Submissions/24-367/Pending/003_S4_P01_${DWG}_AI.pdf`);
   assert.strictEqual(p.Submission.title[0].text.content, `24-367-003_${DWG}_S4_R1`);
-  ok("ingest v2 → DT from Item Person, stage from filename");
+  ok("ingest v2 → DT from initials, stage from filename");
 
   r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/003_A4.5_C01_${DWG}_GF.pdf` } });
   assert.strictEqual(r.json.dtSource, "initials"); assert.strictEqual(created[1].properties.DT.relation[0].id, "dtGF");
@@ -90,22 +90,32 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   ok("ingest v2 with initials → DT from initials");
 
   r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/004_S5_P02_${DWG}.pdf` } });
-  assert.strictEqual(r.status, 200); assert.ok(!created[2].properties.DT); assert.match(feed[0].message, /no DT assigned/);
-  ok("ingest with no DT source → created + flagged");
+  assert.strictEqual(r.status, 400); assert.match(feed[0].message, /initials missing/);
+  ok("missing initials → rejected with rename hint");
+
+  r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/003_S5_P02_${DWG}_ZZ.pdf` } });
+  assert.strictEqual(r.status, 200); assert.strictEqual(r.json.dtSource, "item");
+  assert.strictEqual(created[2].properties.DT.relation[0].id, "dtAI");
+  assert.match(feed[0].message, /no DT matched initials "ZZ"/);
+  ok("unknown initials → falls back to Item Person + flagged");
+
+  r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/004_S5_P02_${DWG}_ZZ.pdf` } });
+  assert.strictEqual(r.status, 200); assert.ok(!created[3].properties.DT); assert.match(feed[0].message, /set DT manually/);
+  ok("unknown initials + no Item Person → created, DT flagged for manual set");
 
   r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/S5/Pending/003_${DWG}_P03_GF.pdf` } });
-  assert.strictEqual(r.status, 200); assert.strictEqual(created[3].properties.Stage.select.name, "S5");
+  assert.strictEqual(r.status, 200); assert.strictEqual(created[4].properties.Stage.select.name, "S5");
   ok("legacy stage-folder ingest still works");
 
   r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/003_${DWG}_P01_GF.pdf` } });
   assert.strictEqual(r.status, 400); assert.match(feed[0].message, /Old-style filename/);
   ok("old-style name in new Pending → clear error");
 
-  r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/003_S6_P01_A-101.pdf` } });
+  r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/003_S6_P01_A-101_GF.pdf` } });
   assert.strictEqual(r.status, 400); assert.match(feed[0].message, /isn't a stage/);
   ok("typo'd stage → clear error");
 
-  r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/003_S4_P01_${DWG} (Greig's conflicted copy).pdf` } });
+  r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/003_S4_P01_${DWG}_GF (Greig's conflicted copy).pdf` } });
   assert.strictEqual(r.status, 400); assert.match(feed[0].message, /duplicate copy/);
   ok("conflicted copy rejected");
 
@@ -114,40 +124,40 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   const feedLen = feed.length;
   r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/003_S4_P01_A-101.pdf` } });
   assert.strictEqual(r.json.duplicate, true); assert.strictEqual(feed.length, feedLen);
-  ok("Drawboard re-save of a Submitted file → skipped, no feed noise");
+  ok("Drawboard re-save of a Submitted file (even pre-initials name) → skipped, no feed noise");
 
   // Same rev re-appearing after an Approve → created but flagged
   submissions = [{ id: "subOld", properties: { "Drawing": rel("dwg1"), "Stage": sel("S4"), "QA Round": { number: 1 }, "Revision": sel("P01"), "Status": sel("Approved"),
     "Dropbox Path": { url: `Drawing Submissions/24-367/Approved/003_S4_P01_${DWG}.pdf` } } }];
-  r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/003_S4_P01_${DWG}.pdf` } });
+  r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/003_S4_P01_${DWG}_GF.pdf` } });
   assert.strictEqual(r.status, 200); assert.match(feed[0].message, /same Rev as QA R1 \(Approved\)/);
   ok("same-rev resubmission flagged as possible Drawboard re-sync");
 
   // ── Approve / Bounce ───────────────────────────────────────────────────
   const sub = (id, extra) => ({ id, properties: { "Status": sel("Submitted"), "Stage": sel("S4"), "Submission": title(`24-367-003_${DWG}_S4_R1`),
     "DT": rel("dtAI"), "Item": rel(), "Revision": sel("P01"), ...extra } });
-  submissions = [sub("subA", { "Dropbox Path": { url: `Drawing Submissions/24-367/Pending/003_S4_P01_${DWG}.pdf` } })];
+  submissions = [sub("subA", { "Dropbox Path": { url: `Drawing Submissions/24-367/Pending/003_S4_P01_${DWG}_GF.pdf` } })];
   webhooks.length = 0; updates.length = 0;
   r = await call("PATCH /api/df/submissions/:id/approve", { params: { id: "subA" } });
   assert.strictEqual(r.status, 200);
   let a = hook("approve");
   assert.strictEqual(a.dropboxMove.toFolderParent, `${R}/24-367`); assert.strictEqual(a.dropboxMove.toFolderName, "Approved");
-  assert.strictEqual(a.dropboxMove.newFilename, `003_S4_P01_${DWG}.pdf`);
+  assert.strictEqual(a.dropboxMove.newFilename, `003_S4_P01_${DWG}_GF.pdf`);
   assert.strictEqual(a.suffixFolderPath, `${R}/24-367/Approved`); assert.strictEqual(a.uploadPath, `${R}/24-367/Approved`);
   assert.deepStrictEqual(a.approvedDrawingNos, [DWG]);
-  assert.strictEqual(updates[0].properties["Dropbox Path"].url, `Drawing Submissions/24-367/Approved/003_S4_P01_${DWG}.pdf`);
+  assert.strictEqual(updates[0].properties["Dropbox Path"].url, `Drawing Submissions/24-367/Approved/003_S4_P01_${DWG}_GF.pdf`);
   assert.strictEqual(updates[0].properties.Status.select.name, "Approved");
   ok("approve → {Project}/Approved, filename unchanged, path written with status");
 
-  submissions = [sub("subB", { "QA Round": { number: 2 }, "Revision": sel("P02"), "Dropbox Path": { url: `Drawing Submissions/24-367/Pending/003_S4_P02_${DWG}.pdf` } })];
+  submissions = [sub("subB", { "QA Round": { number: 2 }, "Revision": sel("P02"), "Dropbox Path": { url: `Drawing Submissions/24-367/Pending/003_S4_P02_${DWG}_GF.pdf` } })];
   webhooks.length = 0; updates.length = 0;
   r = await call("PATCH /api/df/submissions/:id/bounce", { params: { id: "subB" }, body: {} });
   let b = hook("bounce");
   assert.strictEqual(b.bounceFolderPath, `${R}/24-367/Rejected`);
   assert.strictEqual(b.dropboxMove.toFolderParent, `${R}/24-367`); assert.strictEqual(b.dropboxMove.toFolderName, "Rejected");
-  assert.strictEqual(b.dropboxMove.newFilename, `003_S4_P02_${DWG}_R2.pdf`);
+  assert.strictEqual(b.dropboxMove.newFilename, `003_S4_P02_${DWG}_GF_R2.pdf`);
   assert.ok(!("hasAnnotatedPdf" in b) && !("miroLink" in b) && !("annotatedDropboxPath" in b));
-  assert.strictEqual(updates[0].properties["Dropbox Path"].url, `Drawing Submissions/24-367/Rejected/003_S4_P02_${DWG}_R2.pdf`);
+  assert.strictEqual(updates[0].properties["Dropbox Path"].url, `Drawing Submissions/24-367/Rejected/003_S4_P02_${DWG}_GF_R2.pdf`);
   ok("bounce → {Project}/Rejected/…_R2.pdf, no DT Checker/Miro fields");
 
   submissions[0].properties.Status = sel("Rejected");

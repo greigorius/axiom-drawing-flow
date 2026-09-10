@@ -10,7 +10,7 @@
 ## 1. How it now works
 
 ### DT review (S3 / S4 / S5 / A4.5 / AB submissions)
-1. The DT uploads `{Item}_{Stage}_{Rev}_{DrawingNo}.pdf` to `{Project}/Pending/`. The card appears under **Submitted**.
+1. The DT uploads `{Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}.pdf` to `{Project}/Pending/`. The initials set the DT in Notion. The card appears under **Submitted**.
 2. You open it in **Drawboard** straight from Dropbox and mark it up. **Press *Sync Document now*, then close it.**
 3. In the Hub:
    - **Approve:** Make moves the PDF to `{Project}/Approved/` with its name unchanged.
@@ -39,6 +39,7 @@
 | Approve / Bounce | Both now refuse anything that isn't `Submitted` (409), so a double-click can't send a second move for a file that's already gone. The new Dropbox Path is written in the same Notion call as the status. It used to be a separate call that nothing waited for, which Netlify can drop. |
 | Ingest | Drawboard saves change the file in Pending, so Make picks it up again. The duplicate guard skips it **without** a feed entry while it's still Submitted. |
 | Ingest | If the same Rev turns up again for a drawing+stage, the file is still created and the feed adds `⚠ same Rev as QA R1 (Approved) — … may be a Drawboard re-sync`. |
+| Ingest | **DT initials are now required** as a 5th section: `{Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}.pdf`. A file without them is rejected with *"DT initials missing — add them at the end…"*. If the initials don't match anyone in the Team DB, the DT falls back to the Item's Person and the feed flags it. Files ingested before this change still skip quietly on a Drawboard re-save, because the duplicate check now runs before the name check. |
 | Ingest | Dropbox/Drawboard copies (`… (1).pdf`, `… (conflicted copy).pdf`) and drawing numbers with spaces are rejected with a clear message. |
 | cr-ingest | Stage now comes from the Issued submission (the legacy stage folder still wins if present), no longer from a folder default of S4. The path is stored in `Comment Paths`. `Reviewed/` and `R_` files are ignored. A line is added to the feed. |
 | Log Status | The *"grade it in the Comment Reviewer"* block is **removed**. One `move-files` webhook moves client comments to `Reviewed/R_…` and, for A4.5 Rejected, the C01 PDF to Grade Returns. Paths in Notion are updated in the same write. Grading the same drawing again doesn't move anything twice. |
@@ -63,16 +64,15 @@ Drawboard syncs on a timer unless you press **Sync Document now**. If you act be
 
 1. `push-to-github.bat`. Netlify deploys.
 2. Tell me it's live and I'll apply §5 to the Actions Hub straight away. Or do it by hand from §5. **Don't bounce or grade anything until this is done.**
-3. Create `{Project}/Pending/` and `{Project}/Client Comments/` in active projects.
+3. Make sure every active project has `Pending/`, `Rejected/` and `Client Comments/`. `Rejected/` must exist, because Bounce no longer creates it.
 4. Check `MAKE_CR_INGEST_WEBHOOK` in Netlify points at Scenario 3's hook. That scenario has never run, so Scan Comments may not currently reach it.
 
 ---
 
 ## 5. Make: Actions Hub (5993716)
 
-**a. Bounce route.** Stop deleting, start moving (carried over from step 1):
-- Module 5, Create Folder: name `{{1.dropboxMove.toFolderName}}`, path `{{1.dropboxMove.toFolderParent}}`
-- Module 6, Delete a File: **replace** with Move a File/Folder. Path `{{1.dropboxMove.from}}`, destination `{{1.dropboxMove.toFolder}}`, new name `{{1.dropboxMove.newFilename}}`, autorename No. Error handler: Break, retry 5 × 1 min.
+**a. Bounce route.** Stop deleting, start moving (carried over from step 1). *Applied 10 Sept. Create Folder was later removed because `Rejected/` already exists in each project:*
+- Module 6, Delete a File: **replaced** with Move a File/Folder. Path `{{1.dropboxMove.from}}`, destination `{{1.dropboxMove.toFolder}}`, new name `{{1.dropboxMove.newFilename}}`, autorename No. Error handler: Break, retry 5 × 1 min.
 
 **b. New route `move-files`.** Filter `{{1.action}}` = `move-files`:
 Iterator over `{{1.moves}}` → Create Folder (name `{{it.toFolderName}}`, path `{{it.toFolderParent}}`, error handler Resume) → Move a File/Folder (path `{{it.from}}`, destination `{{it.toFolder}}`, new name `{{it.newFilename}}`, autorename No, error handler Break retry).
@@ -93,3 +93,5 @@ The `grade-reject`, `cr-upload` and `issue` routes are no longer triggered. They
 - [ ] Send DT Email (grades) → the block heading reads `24-367/Client Comments/Reviewed`.
 - [ ] A4.5 → Grade **Rejected** → the file moves to `Grade Returns/003_A4.5_C01_…_Rejected_YYMMDD.pdf`.
 - [ ] Rename a file `… (1).pdf` in Pending → the feed shows "Looks like a duplicate copy".
+- [ ] Upload `003_S4_P01_{DrawingNo}.pdf` (no initials) → the feed shows "DT initials missing".
+- [ ] Upload with the wrong initials (e.g. `_ZZ`) → the card is created with the Item's Person, and the feed says to check the initials.

@@ -219,7 +219,7 @@ The backend writes to these MDS properties on Approve, Bounce, and Log Status:
 /DESIGN KNOW HOW/TMJ Interiors/
   └── Drawing Submissions/
         └── {ProjectNo}/            e.g. 24-367
-              ├── Pending/          ← DTs upload ALL stages here; Make picks up /pending/
+              ├── Pending/          ← DTs upload ALL stages here: {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}.pdf
               ├── Approved/         ← Approve moves the PDF here (filename unchanged); DTs add DWGs here
               ├── Rejected/         ← Bounce moves the PDF here as {original name}_R{n}.pdf
               ├── Grade Returns/    ← A4.5 (C01) Rejected returns only, moved here at Log Status
@@ -230,8 +230,9 @@ The backend writes to these MDS properties on Approve, Bounce, and Log Status:
 Grade Returns file name: `{Item}_{Stage}_{Rev}_{DrawingNo}_{Grade}_{YYMMDD}.pdf`.
 Legacy stage-level `{Project}/{Stage}/Client Comments/` folders still work (stage taken from the folder).
 
-`Pending/` must be created per project by hand. `Approved/`, `Rejected/` and `Grade Returns/`
-are created by Make on first use.
+`Pending/`, `Rejected/` and `Client Comments/` are set up per project by hand (the Bounce route
+moves straight into `Rejected/` without creating it). `Approved/`, `Grade Returns/` and
+`Client Comments/Reviewed/` are created by Make on first use.
 
 The `DROPBOX_ROOT` constant in `drawing-flow.js` is set to `/DESIGN KNOW HOW/TMJ Interiors`. Notion stores only the relative path from `Drawing Submissions/` onward; the backend reconstructs the full path when returning move instructions.
 
@@ -243,17 +244,18 @@ flight keep working. In-flight legacy files are moved to the new project-level `
 ### Filename Convention
 
 ```
-{Item}_{Stage}_{Rev}_{DrawingNo}.pdf            e.g. 003_S4_P01_EIT-TMJ-AA-B2-D-I-45120.pdf
-{Item}_{Stage}_{Rev}_{DrawingNo}_{DT}.pdf       e.g. 003_A4.5_C01_EIT-TMJ-AA-B2-D-I-45120_GF.pdf
+{Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}.pdf     e.g. 003_S4_P01_EIT-TMJ-AA-B2-D-I-45120_GF.pdf
 ```
 
 - `Item` — item number in digits, matching "Suffix NNN" in the Tasks DB (e.g. `003`)
 - `Stage` — `S3`, `S4`, `S5`, `A4.5` or `AB` (case-insensitive)
 - `Rev` — e.g. `P01`–`P03` (preliminary) or `C01`–`C03` (construction)
 - `DrawingNo` — full drawing number; hyphens only, **no underscores**
-- `DT` — optional DT initials (derived from the Team DB name, e.g. Greig Fensome → `GF`).
-  If omitted or unmatched, the DT is taken from the Item's `Person` relation in the Tasks DB.
-  If neither resolves, the Submission is still created and the cockpit feed flags it.
+- `Initials` — **required**; the DT's initials, matched against the Team DB name (e.g. Greig
+  Fensome → `GF`) to set the `DT` relation on the Submission. A file without initials is rejected.
+  If the initials don't match anyone, the DT falls back to the Item's `Person` (Tasks DB) and the
+  cockpit feed flags it; if that's empty too, the Submission is created with no DT and flagged.
+- Bounced files keep the full name plus `_R{n}`, e.g. `003_S4_P01_…_GF_R1.pdf`.
 
 Files that don't match are rejected at ingest with a specific reason in the cockpit feed
 (wrong section count, unknown stage, bad rev, old-style name, etc.).
