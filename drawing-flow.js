@@ -19,9 +19,13 @@
 //   POST   /api/df/notifications/clear  clears the feed once reviewed
 //
 // Make.com integration:
-//   Scenario 1 (Ingest):      Make watches Dropbox /Pending/ and calls POST /api/df/ingest
-//   Scenario 2 (Actions Hub): backend fires MAKE_ACTIONS_WEBHOOK with action=dt-summary (batch email)
-//                             or action=approve|bounce (Dropbox moves only — no immediate email)
+//   Scenario 1 (Ingest):      Make watches Dropbox Drawing Submissions (recursive), filters /pending/,
+//                             and calls POST /api/df/ingest. One Pending folder per project;
+//                             filename = {Item}_{Stage}_{Rev}_{DrawingNo}[_{Initials}].pdf
+//   Scenario 2 (Actions Hub): backend fires MAKE_ACTIONS_WEBHOOK with action=dt-summary|grade-summary
+//                             (batch emails), action=approve|bounce (Dropbox move + folder link), or
+//                             action=move-files (client comments → Reviewed/R_, A4.5 → Grade Returns)
+//   Review happens in Drawboard PDF, synced back to the same Dropbox file before the DM acts.
 //                             See docs/MAKE-CONFIG-GUIDE.md for full configuration steps
 
 "use strict";
@@ -136,6 +140,29 @@ const INPUTS_FIELDS = [
 // Stored path starts from "Drawing Submissions/..." — full path is reconstructed on move.
 const DROPBOX_ROOT = "/DESIGN KNOW HOW/TMJ Interiors";
 
+// Project-level folder layout (Sept 2026 restructure). Every submission for a project
+// goes into ONE Pending folder — the stage travels in the filename, not the folder.
+//
+//   Drawing Submissions/{ProjectNo}/
+//     Pending/        ← DTs upload here: {Item}_{Stage}_{Rev}_{DrawingNo}[_{Initials}].pdf
+//     Approved/       ← Approve moves the file here, filename unchanged
+//     Rejected/       ← Bounce moves the file here as {original name}_R{n}.pdf
+//     Grade Returns/  ← graded client returns (A4.5 Rejected is moved here automatically)
+//
+// LEGACY: the old per-stage layout — Drawing Submissions/{ProjectNo}/{Stage}/Pending/ with
+// {Item}_{DrawingNo}_{Rev}_{Initials}.pdf filenames — is still understood, so drawings that
+// were already in flight when the restructure landed keep working. Once nothing is left in
+// the old stage Pending folders, the legacy branches below can be deleted.
+const FOLDER = {
+  PENDING:         "Pending",
+  APPROVED:        "Approved",
+  REJECTED:        "Rejected",
+  GRADE_RETURNS:   "Grade Returns",     // A4.5 (C01) returns only
+  CLIENT_COMMENTS: "Client Comments",   // S4/S5 client comment PDFs land here (project- or stage-level)
+  REVIEWED:        "Reviewed",          // …/Client Comments/Reviewed/R_{name} once the DM has graded
+};
+const REVIEWED_PREFIX = "R_";
+
 function toFullDropboxPath(rawPath) {
   if (!rawPath) return null;
   // Case-insensitive check — path_lower from Make will be lowercase
@@ -143,36 +170,129 @@ function toFullDropboxPath(rawPath) {
   return `${DROPBOX_ROOT}/${rawPath.replace(/^\//, "")}`;
 }
 
-function computeDropboxMove(rawPath, action, qaRound) {
-  const fullPath = toFullDropboxPath(rawPath);
+// Inverse of toFullDropboxPath — the form stored in Notion's "Dropbox Path" property.
+function toShortDropboxPath(fullPath) {
   if (!fullPath) return null;
-  // Case-insensitive check — path_lower from Make will be lowercase
-  const idx = fullPath.toLowerCase().indexOf("/pending/");
-  if (idx < 0) return null;
-  const before  = fullPath.slice(0, idx);          // everything before /Pending/
-  const filename = fullPath.slice(idx + "/pending/".length); // filename after /Pending/
-  if (action === "bounce") {
-    const fileParts      = filename.split("_");
-    const itemNo         = fileParts[0] ?? "";
-    const toFolderParent = `${before}/Rejected`;
-    const toFolderName   = `R${qaRound}`;
-    const rFolder        = `${toFolderParent}/${toFolderName}`;
-    const toFolder       = itemNo ? `${rFolder}/Suffix ${itemNo}` : rFolder;
-    const to             = `${toFolder}/${filename}`;
-    return { from: fullPath, to, toFolder, rFolder, toFolderParent, toFolderName, itemNo };
-  }
+  return fullPath.toLowerCase().startsWith(DROPBOX_ROOT.toLowerCase())
+    ? fullPath.slice(DROPBOX_ROOT.length).replace(/^\//, "")
+    : fullPath;
+}
+
+function isStage(seg) {
+  return VALID_STAGES.includes((seg || "").toUpperCase());
+}
+
+// Finds the Drawing Submissions/{ProjectNo} anchor in any Dropbox path.
+//   projectRoot — full path to the {ProjectNo} folder (move destinations hang off this)
+//   stageSeg    — set only for LEGACY paths, where a stage folder sits directly under the project
+function locateProject(rawPath) {
+  const full = toFullDropboxPath(rawPath);
+  if (!full) return null;
+  const segs  = full.replace(/\\/g, "/").split("/").filter(Boolean);
+  const dsIdx = segs.findIndex((s) => s.toLowerCase() === "drawing submissions");
+  if (dsIdx < 0 || dsIdx + 1 >= segs.length) return null;
+  const next = segs[dsIdx + 2];
+  return {
+    fullPath:    "/" + segs.join("/"),
+    segs,
+    projectNo:   segs[dsIdx + 1],
+    projectRoot: "/" + segs.slice(0, dsIdx + 2).join("/"),
+    stageSeg:    isStage(next) ? next : null,
+  };
+}
+
+// Where graded client returns for this submission live.
+// New layout → {ProjectNo}/Grade Returns. Legacy stage-folder paths keep {ProjectNo}/{Stage}/Grade Returns.
+function gradeReturnsFolder(rawPath) {
+  const loc = locateProject(rawPath);
+  if (!loc) return null;
+  return loc.stageSeg
+    ? `${loc.projectRoot}/${loc.stageSeg}/${FOLDER.GRADE_RETURNS}`
+    : `${loc.projectRoot}/${FOLDER.GRADE_RETURNS}`;
+}
+
+// Client comment PDF → {its Client Comments folder}/Reviewed/R_{name}, fired when the DM logs
+// the grade in the Hub (after reviewing the PDF in Drawboard). Works for both the new
+// {ProjectNo}/Client Comments/ and legacy {ProjectNo}/{Stage}/Client Comments/ locations.
+// Returns null for anything already reviewed (in Reviewed/ or R_-prefixed).
+function computeReviewedMove(rawPath) {
+  const full = toFullDropboxPath(rawPath);
+  if (!full) return null;
+  const segs     = full.split("/").filter(Boolean);
+  const filename = segs[segs.length - 1];
+  const parent   = segs[segs.length - 2] || "";
+  if (parent.toLowerCase() === FOLDER.REVIEWED.toLowerCase()) return null;
+  if (filename.toUpperCase().startsWith(REVIEWED_PREFIX)) return null;
+  const toFolderParent = "/" + segs.slice(0, -1).join("/");
+  const toFolder       = `${toFolderParent}/${FOLDER.REVIEWED}`;
+  const newFilename    = `${REVIEWED_PREFIX}${filename}`;
+  return { from: "/" + segs.join("/"), to: `${toFolder}/${newFilename}`, toFolder, toFolderParent,
+           toFolderName: FOLDER.REVIEWED, newFilename };
+}
+
+// A4.5 (C01) Rejected: the issued copy moves out of Approved/ into Grade Returns, renamed in
+// the submission order with the grade and date appended:
+//   {Item}_{Stage}_{Rev}_{DrawingNo}_{Grade}_{YYMMDD}.pdf
+function computeGradeReturnMove(rawPath, { itemNo, stage, revision, drawingNo, grade, date }) {
+  const full     = toFullDropboxPath(rawPath);
+  const toFolder = gradeReturnsFolder(rawPath);
+  if (!full || !toFolder || !itemNo || !drawingNo) return null;
+  const parent = full.split("/").filter(Boolean).slice(-2, -1)[0] || "";
+  if (parent.toLowerCase() === FOLDER.GRADE_RETURNS.toLowerCase()) return null;   // already returned (re-grade)
+  const dateTag     = (date || now()).replace(/-/g, "").slice(2);   // YYYY-MM-DD → YYMMDD
+  const newFilename = `${itemNo}_${stage}_${revision}_${drawingNo}_${grade}_${dateTag}.pdf`;
+  const toFolderParent = toFolder.split("/").slice(0, -1).join("/");
+  return { from: full, to: `${toFolder}/${newFilename}`, toFolder, toFolderParent,
+           toFolderName: FOLDER.GRADE_RETURNS, newFilename };
+}
+
+// Notion rich_text segments are capped at 2000 chars — split long newline lists across segments.
+function richTextChunks(str, max = 1900) {
+  const out = [];
+  for (let i = 0; i < (str || "").length; i += max) out.push({ type: "text", text: { content: str.slice(i, i + max) } });
+  return out;
+}
+function readPathList(page, prop) {
+  return (getProp(page, prop, "rich_text") || "").split("\n").map((p) => p.trim()).filter(Boolean);
+}
+
+// Dropbox move instruction for approve / bounce. Only a file still sitting directly in a
+// Pending folder can be moved — anything else returns null (as before).
+//   approve → {ProjectNo}/Approved/{filename}            (filename unchanged)
+//   bounce  → {ProjectNo}/Rejected/{name}_R{qaRound}.pdf
+// Legacy stage-folder files go to the same project-level folders, so there's one place to look.
+// Field names match what the Make Actions Hub routes already map (toFolderParent/toFolderName
+// for Create Folder, from/toFolder/newFilename for Move).
+function computeDropboxMove(rawPath, action, qaRound) {
+  const loc = locateProject(rawPath);
+  if (!loc) return null;
+  const { segs, fullPath, projectRoot } = loc;
+  if ((segs[segs.length - 2] || "").toLowerCase() !== "pending") return null;
+
+  const filename  = segs[segs.length - 1];
+  const parsed    = parseFilename(filename);
+  const itemNo    = parsed.ok ? parsed.itemNo    : (filename.split("_")[0] ?? "");
+  const drawingNo = parsed.ok ? parsed.drawingNo : null;
+  const stage     = (parsed.ok && parsed.stage) || (loc.stageSeg ? loc.stageSeg.toUpperCase() : null);
+  const toFolderParent = projectRoot;
+
   if (action === "approve") {
-    // Filename format: {itemNo}_{drawingNo}_{revision}_{dtInitials}.pdf
-    const fileParts    = filename.split("_");
-    const itemNo       = fileParts[0] ?? "";
-    const drawingNo    = fileParts[1] ?? "";
-    const ext          = filename.split(".").pop().toLowerCase();
-    const toFolderParent = before;
-    const toFolderName   = `Suffix ${itemNo}`;
-    const toFolder       = `${toFolderParent}/${toFolderName}`;
-    const newFilename    = drawingNo ? `${drawingNo}.${ext}` : filename;
-    const to             = `${toFolder}/${newFilename}`;
-    return { from: fullPath, to, toFolder, toFolderParent, toFolderName, newFilename, itemNo, drawingNo };
+    const toFolderName = FOLDER.APPROVED;
+    const toFolder     = `${toFolderParent}/${toFolderName}`;
+    const newFilename  = filename;
+    return { from: fullPath, to: `${toFolder}/${newFilename}`, toFolder, toFolderParent, toFolderName,
+             newFilename, itemNo, drawingNo, stage };
+  }
+  if (action === "bounce") {
+    const round        = qaRound ?? 1;
+    const toFolderName = FOLDER.REJECTED;
+    const toFolder     = `${toFolderParent}/${toFolderName}`;
+    const dot          = filename.lastIndexOf(".");
+    const newFilename  = dot > 0
+      ? `${filename.slice(0, dot)}_R${round}${filename.slice(dot)}`
+      : `${filename}_R${round}`;
+    return { from: fullPath, to: `${toFolder}/${newFilename}`, toFolder, toFolderParent, toFolderName,
+             rFolder: toFolder, newFilename, itemNo, drawingNo, stage, qaRound: round };
   }
   return null;
 }
@@ -193,29 +313,83 @@ function inferDwgType(drawingNo) {
 
 // --- Path / filename parsers ---
 
+// Accepts a file sitting DIRECTLY inside a Pending folder under Drawing Submissions:
+//   new:    Drawing Submissions/{ProjectNo}/Pending/{file}
+//   legacy: Drawing Submissions/{ProjectNo}/{Stage}/Pending/{file}
+// Returns { projectNo, folderStage (legacy only, else null), filename, layout } or null.
 function parsePath(filePath) {
-  const parts = filePath.replace(/\\/g, "/").split("/").filter(Boolean);
+  const parts      = (filePath || "").replace(/\\/g, "/").split("/").filter(Boolean);
   const pendingIdx = parts.findIndex((p) => p.toLowerCase() === "pending");
-  if (pendingIdx < 3 || pendingIdx >= parts.length - 1) return null;
-  const projectNo = parts[pendingIdx - 2].toUpperCase();
-  const stage     = parts[pendingIdx - 1].toUpperCase();
-  const filename  = parts[pendingIdx + 1];
-  if (!VALID_STAGES.includes(stage)) return null;
-  return { projectNo, stage, filename };
+  if (pendingIdx < 2 || pendingIdx !== parts.length - 2) return null;   // file must sit directly in Pending/
+  const filename = parts[pendingIdx + 1];
+  const above    = parts[pendingIdx - 1];
+
+  if (isStage(above)) {
+    if (pendingIdx < 3 || parts[pendingIdx - 3].toLowerCase() !== "drawing submissions") return null;
+    return { projectNo: parts[pendingIdx - 2].toUpperCase(), folderStage: above.toUpperCase(), filename, layout: "legacy" };
+  }
+  if (parts[pendingIdx - 2].toLowerCase() !== "drawing submissions") return null;
+  return { projectNo: above.toUpperCase(), folderStage: null, filename, layout: "project" };
+}
+
+const ITEM_RE     = /^\d{1,4}$/;                 // 003, 112
+const REV_RE      = /^[A-Z]{1,2}\d{1,3}[A-Z]?$/; // P01, C01, P01A
+const INITIALS_RE = /^[A-Z]{2,4}$/;              // GF, AI
+const DRAWING_NO_RE = /^[A-Z0-9][A-Z0-9.\-]*$/i;  // EIT-TMJ-AA-B2-D-I-45120
+
+// Parses a submission name WITHOUT caring about the extension (so it also works for DWGs).
+//   new:    {Item}_{Stage}_{Rev}_{DrawingNo}[_{DTInitials}]   e.g. 003_S4_P01_EIT-TMJ-AA-B2-D-I-45120_GF
+//   legacy: {Item}_{DrawingNo}_{Rev}_{DTInitials}             e.g. 003_A-101_P01_GF   (no stage — comes from folder)
+// Returns { ok: true, format, itemNo, stage, revision, drawingNo, dtInitials }
+//      or { ok: false, error } with a message written for the DT, shown in the cockpit feed.
+function parseSubmissionName(baseName) {
+  const fail  = (error) => ({ ok: false, error });
+  // Dropbox / Drawboard duplicate copies: "… (1)", "… (Greig's conflicted copy 2026-09-10)".
+  if (/\((?:\d+|[^)]*conflicted copy[^)]*|[^)]*copy)\)\s*$/i.test(baseName || "")) {
+    return fail("Looks like a duplicate copy (\"(1)\" / \"conflicted copy\") — check which version is current, then delete or rename it");
+  }
+  const parts = (baseName || "").trim().split("_").map((s) => s.trim());
+  if (parts.length < 2 || parts.some((p) => !p)) {
+    return fail("Filename should be {Item}_{Stage}_{Rev}_{DrawingNo} — check for missing sections or double/trailing underscores");
+  }
+
+  // New convention — the stage is the 2nd section.
+  if (isStage(parts[1])) {
+    if (parts.length < 4) return fail(`Only ${parts.length} sections — expected {Item}_{Stage}_{Rev}_{DrawingNo}`);
+    if (parts.length > 5) return fail("Too many underscores — use hyphens inside the drawing number; only an optional 5th section (DT initials) is allowed");
+    const [itemNo, stageRaw, revRaw, drawingRaw, initialsRaw] = parts;
+    if (!ITEM_RE.test(itemNo)) return fail(`Item "${itemNo}" should be the item number in digits, e.g. 003`);
+    const revision = revRaw.toUpperCase();
+    if (!REV_RE.test(revision)) return fail(`Rev "${revRaw}" not recognised — expected e.g. P01 or C01`);
+    if (!DRAWING_NO_RE.test(drawingRaw)) return fail(`Drawing number "${drawingRaw}" has spaces or odd characters — letters, digits, hyphens and dots only`);
+    let dtInitials = null;
+    if (initialsRaw !== undefined) {
+      dtInitials = initialsRaw.toUpperCase();
+      if (!INITIALS_RE.test(dtInitials)) return fail(`5th section "${initialsRaw}" should be DT initials (2–4 letters), or leave it off`);
+    }
+    return { ok: true, format: "v2", itemNo, stage: stageRaw.toUpperCase(), revision, drawingNo: drawingRaw.toUpperCase(), dtInitials };
+  }
+
+  // Legacy convention — only valid in the old per-stage Pending folders (ingest enforces that).
+  if (parts.length >= 4) {
+    const [itemNo, drawingNoRaw, revisionRaw, ...dtParts] = parts;
+    const revision = revisionRaw.toUpperCase();
+    // Drawing numbers always contain hyphens — this stops a mistyped stage (e.g. "S6") being
+    // read as an old-style drawing number.
+    if (ITEM_RE.test(itemNo) && drawingNoRaw.includes("-") && REV_RE.test(revision)) {
+      return { ok: true, format: "legacy", itemNo, stage: null, revision,
+               drawingNo: drawingNoRaw.toUpperCase(), dtInitials: dtParts.join("_").toUpperCase() || null };
+    }
+  }
+  return fail(`2nd section "${parts[1]}" isn't a stage — expected {Item}_{Stage}_{Rev}_{DrawingNo} with stage ${VALID_STAGES.join("/")}`);
 }
 
 function parseFilename(filename) {
-  const ext = filename.split(".").pop().toLowerCase();
-  if (ext !== "pdf") return null;
-  const base  = filename.slice(0, -(ext.length + 1));
-  const parts = base.split("_");
-  if (parts.length < 4) return null;
-  const [itemNo, drawingNoRaw, revisionRaw, ...dtParts] = parts;
-  const drawingNo  = drawingNoRaw?.toUpperCase();
-  const revision   = revisionRaw?.toUpperCase();
-  const dtInitials = dtParts.join("_").toUpperCase();
-  if (!itemNo || !drawingNo || !revision || !dtInitials) return null;
-  return { itemNo, drawingNo, revision, dtInitials };
+  const name = (filename || "").trim();
+  const dot  = name.lastIndexOf(".");
+  const ext  = dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
+  if (ext !== "pdf") return { ok: false, error: "Not a PDF" };
+  return parseSubmissionName(name.slice(0, dot));
 }
 
 function parseSubmissionTitle(title, stage) {
@@ -709,33 +883,45 @@ module.exports = function mountDrawingFlow(app, notion) {
 
     const pathParts = parsePath(filePath);
     if (!pathParts) {
-      await addNotification({ type: "error", filename: filePath, message: "Path does not match expected protocol" });
+      await addNotification({ type: "error", filename: filePath, message: "Not directly inside a project Pending folder (Drawing Submissions/{Project}/Pending/)" });
       return res.status(400).json({ ok: false, error: "Path does not match protocol", received: filePath });
     }
-    const { projectNo, stage, filename } = pathParts;
+    const { projectNo, folderStage, filename, layout } = pathParts;
 
     const fileParts = parseFilename(filename);
-    if (!fileParts) {
-      await addNotification({ type: "error", filename, message: "Filename does not match naming convention" });
-      return res.status(400).json({ ok: false, error: "Filename does not match convention", received: filename });
+    if (!fileParts.ok) {
+      await addNotification({ type: "error", filename, message: fileParts.error });
+      return res.status(400).json({ ok: false, error: "Filename does not match convention", detail: fileParts.error, received: filename });
+    }
+    // Old-style names carry no stage, so they only work in the legacy per-stage Pending folders.
+    if (fileParts.format === "legacy" && !folderStage) {
+      const message = "Old-style filename — rename to {Item}_{Stage}_{Rev}_{DrawingNo}.pdf (e.g. 003_S4_P01_A-101.pdf)";
+      await addNotification({ type: "error", filename, message });
+      return res.status(400).json({ ok: false, error: "Filename does not match convention", detail: message, received: filename });
     }
     const { itemNo, drawingNo, revision, dtInitials } = fileParts;
+    // Filename stage wins; the legacy folder stage is only a fallback for old-style names.
+    const stage = fileParts.stage || folderStage;
+    if (fileParts.stage && folderStage && fileParts.stage !== folderStage) {
+      console.warn(`[ingest] ${filename}: filename stage ${fileParts.stage} differs from legacy folder ${folderStage} — using filename`);
+    }
 
-    console.log(`[ingest] ${projectNo}/${stage}/${filename}`);
+    console.log(`[ingest] ${projectNo}/${stage}/${filename} (${layout} layout, ${fileParts.format} name)`);
 
     // Strip DROPBOX_ROOT prefix up front — used both by the duplicate-ingest guard below and
     // for the Dropbox Path property written on create. Case-insensitive comparison since
     // path_lower from Make will be lowercase.
-    const fullRawPath = dropboxPath ?? filePath;
-    const shortPath = fullRawPath.toLowerCase().startsWith(DROPBOX_ROOT.toLowerCase())
-      ? fullRawPath.slice(DROPBOX_ROOT.length).replace(/^\//, "")
-      : fullRawPath;
+    const shortPath = toShortDropboxPath(dropboxPath ?? filePath);
 
     try {
       const dupe = await findSubmissionByDropboxPath(notion, shortPath);
       if (dupe) {
         console.log(`[ingest] Duplicate ingest for ${shortPath} — already recorded as ${dupe.id}, skipping.`);
-        await addNotification({ type: "skip", filename, message: "Duplicate ingest — already recorded as an existing Submission, skipped." });
+        // A still-Submitted duplicate is expected: saving Drawboard markup back to Pending
+        // modifies the file and Make re-surfaces it. Don't clutter the feed with those.
+        if (getProp(dupe, "Status", "select") !== "Submitted") {
+          await addNotification({ type: "skip", filename, message: "Duplicate ingest — already recorded as an existing Submission, skipped." });
+        }
         return res.json({ ok: true, skipped: true, duplicate: true, submissionId: dupe.id });
       }
     } catch (err) { console.warn("[ingest] Duplicate check failed:", err.message); }
@@ -762,14 +948,35 @@ module.exports = function mountDrawingFlow(app, notion) {
       return res.status(422).json({ ok: false, error: "Drawing not found in MDS", detail: `No MDS row for "${drawingNo}"` });
     }
 
-    try { dtPage = await findDT(notion, dtInitials); }
-    catch (err) { console.warn(`[ingest] DT lookup failed for "${dtInitials}":`, err.message); }
+    // DT: initials in the (optional) 5th filename section win; otherwise fall back to the
+    // Person assigned on the Item in the Tasks DB.
+    let dtSource = null;
+    if (dtInitials) {
+      try { dtPage = await findDT(notion, dtInitials); if (dtPage) dtSource = "initials"; }
+      catch (err) { console.warn(`[ingest] DT lookup failed for "${dtInitials}":`, err.message); }
+    }
+    if (!dtPage) {
+      const personIds = getProp(taskPage, "Person", "relation");
+      if (personIds?.length) {
+        try {
+          dtPage = await withNotionRetry(() => notion.pages.retrieve({ page_id: personIds[0] }));
+          dtSource = "item";
+        } catch (err) { console.warn("[ingest] Item Person lookup failed:", err.message); }
+      }
+    }
 
     let qaRound = 1;
+    let sameRevNote = "";
     try {
       const prev = await findLatestSubmission(notion, drawingPage.id, stage);
       if (prev) {
         qaRound = (getProp(prev, "QA Round", "number") ?? 1) + 1;
+        // Same rev as last time is either a DT resubmitting without bumping the rev, or a
+        // Drawboard sync recreating a file that Approve/Bounce already moved out of Pending.
+        const prevRev = getProp(prev, "Revision", "select");
+        if (prevRev && prevRev.toUpperCase() === revision) {
+          sameRevNote = ` — ⚠ same Rev as QA R${qaRound - 1} (${getProp(prev, "Status", "select") ?? "?"}); if that was just actioned, this may be a Drawboard re-sync`;
+        }
         // Only supersede a still-open submission — a Rejected one is already closed
         const prevStatus = getProp(prev, "Status", "select");
         if (prevStatus === "Submitted") {
@@ -819,7 +1026,7 @@ module.exports = function mountDrawingFlow(app, notion) {
       await notion.pages.update({ page_id: drawingPage.id, properties: mdsProps });
     } catch (err) { console.warn("[ingest] MDS update failed:", err.message); }
 
-    const dtName = dtPage ? (getProp(dtPage, "Name", "title") ?? dtInitials) : dtInitials;
+    const dtName = dtPage ? (getProp(dtPage, "Name", "title") ?? dtInitials) : (dtInitials || "Unknown DT");
     await createActivityLogEntry(notion, {
       taskId: taskPage.id,
       source: "Drawing Flow",
@@ -829,8 +1036,13 @@ module.exports = function mountDrawingFlow(app, notion) {
     });
 
     console.log(`[ingest] created ${submissionTitle} (${newSubmission.id})`);
-    await addNotification({ type: "success", filename, message: `Created ${submissionTitle} (QA Round ${qaRound})` });
-    return res.json({ ok: true, submissionId: newSubmission.id, submissionTitle, qaRound, isResubmission: qaRound > 1 });
+    const dtNote = dtPage
+      ? ""
+      : dtInitials
+        ? ` — no DT matched initials "${dtInitials}" and no Person on the Item; set DT manually`
+        : " — no DT assigned (no initials in filename, no Person on the Item); set DT manually";
+    await addNotification({ type: "success", filename, message: `Created ${submissionTitle} (QA Round ${qaRound})${dtNote}${sameRevNote}` });
+    return res.json({ ok: true, submissionId: newSubmission.id, submissionTitle, qaRound, isResubmission: qaRound > 1, dtSource });
   });
 
   // GET /api/df/notifications
@@ -1057,7 +1269,7 @@ module.exports = function mountDrawingFlow(app, notion) {
             ? toFullDropboxPath(rawPath).split("/").slice(0, -1).join("/")
             : null;
           const folderSegs = folderPath ? folderPath.split("/").filter(Boolean) : [];
-          const folderName = folderSegs.slice(-1).join("") || null;
+          const folderName = folderSegs.slice(-2).join(" / ") || null;   // e.g. "24-367 / Approved"
           return {
             id: page.id, title, taskCode, drawingNo, dtName, dtEmail: dt.email, stage,
             status, dmAction,
@@ -1249,7 +1461,7 @@ module.exports = function mountDrawingFlow(app, notion) {
         const fullPath   = toFullDropboxPath(rawPath);
         const folderPath = fullPath ? fullPath.split("/").slice(0, -1).join("/") : null;
         const folderSegs = folderPath ? folderPath.split("/").filter(Boolean) : [];
-        const folderName = folderSegs.slice(-1)[0] || null;
+        const folderName = folderSegs.slice(-2).join(" / ") || null;   // e.g. "24-367 / Approved"
 
         // Human-readable action label
         const actionLabel = (() => {
@@ -1325,9 +1537,9 @@ module.exports = function mountDrawingFlow(app, notion) {
           // Instruction row — derive from the first drawing's actionLabel (all drawings in a folder share the same action)
           const firstAction = folder.drawings[0]?.actionLabel ?? "";
           const instruction = firstAction === "QA Approved"
-            ? "Upload dwg's to the Item folder link"
+            ? "Upload DWGs to the Approved folder link above."
             : firstAction.startsWith("Bounced")
-              ? "Commented drawings are in the Item folder link. Revise drawings to comments and re-upload PDF's to the 'Pending' folder for further review."
+              ? "Your marked-up drawings are in the Rejected folder link above (suffixed _R#). Revise to the DM comments and upload the revised PDF to the project's Pending folder, named {Item}_{Stage}_{Rev}_{DrawingNo}.pdf."
               : null;
           const instructionRow = instruction
             ? `<tr><td colspan="3" style="padding:4px 8px 10px;font-size:12px;color:#888;font-style:italic;">${instruction}</td></tr>`
@@ -1434,17 +1646,18 @@ module.exports = function mountDrawingFlow(app, notion) {
         const { drawingNo } = parseSubmissionTitle(title, stage);
         const dt = await resolveDT(notion, dtIds);
 
-        // Derive Grade Returns folder path from submission's Dropbox path
-        // path: /Drawing Submissions/{project}/{stage}/Pending/{file}
-        // Grade Returns: /Drawing Submissions/{project}/{stage}/Grade Returns/
-        let gradeReturnsPath = null;
-        if (rawPath) {
-          const full   = toFullDropboxPath(rawPath);
-          const segs   = full ? full.split("/").filter(Boolean) : [];
-          // segs: ["Drawing Submissions", project, stage, "Pending", file]
-          const stageIdx = segs.findIndex((s) => ["S3","S4","S5","A4.5","AB"].includes(s.toUpperCase()));
-          if (stageIdx !== -1) {
-            gradeReturnsPath = "/" + segs.slice(0, stageIdx + 1).join("/") + "/Grade Returns";
+        // Where the DT finds the returned file:
+        //   A4.5 Rejected → {ProjectNo}/Grade Returns/ (the C01 copy moved there at Log Status)
+        //   S4/S5 etc.   → the Reviewed/ folder the client comment PDFs were moved into
+        //   otherwise    → no file (e.g. A4.5 Approved, or graded without client comments)
+        let returnFolder = null, returnKind = null;
+        if (stage === "A4.5") {
+          if (grade === "Rejected") { returnFolder = gradeReturnsFolder(rawPath); returnKind = "grade-returns"; }
+        } else {
+          const reviewedPath = readPathList(page, "Comment Paths").find((p) => /\/reviewed\//i.test(p));
+          if (reviewedPath) {
+            returnFolder = toFullDropboxPath(reviewedPath).split("/").slice(0, -1).join("/");
+            returnKind   = "reviewed";
           }
         }
 
@@ -1454,9 +1667,13 @@ module.exports = function mountDrawingFlow(app, notion) {
           ? "Review this drawing with the DM — do not revise independently"
           : grade === "NA"
             ? "Not applicable — no action required"
-            : isProductionRev
-              ? "Update drawings for production"
-              : "Update to next revision";
+            : grade === "Rejected"
+              ? "Revise to the returned comments and resubmit"
+              : grade === "Approved" && stage === "A4.5"
+                ? "Approved — proceed with production"
+                : isProductionRev
+                  ? "Update drawings for production"
+                  : "Update to next revision";
 
         // Completion date: return date + revision days from Projects DB
         // Falls back to today if "Reviewed" was never set on this submission (there is no
@@ -1471,7 +1688,8 @@ module.exports = function mountDrawingFlow(app, notion) {
           pageId: page.id,
           dtName: dt.name,
           dtEmail: dt.email,
-          gradeReturnsPath,
+          returnFolder,
+          returnKind,
           drawingNo,
           stage,
           grade,
@@ -1484,14 +1702,14 @@ module.exports = function mountDrawingFlow(app, notion) {
         };
       }));
 
-      // Group by DT → by gradeReturnsPath (project+stage bucket)
+      // Group by DT → by the folder the returned files are in
       const byDT = {};
       for (const item of enriched) {
         const dtKey = item.dtEmail || item.dtName || "unknown";
         if (!byDT[dtKey]) byDT[dtKey] = { dtName: item.dtName, dtEmail: item.dtEmail, buckets: {}, pageIds: [] };
-        const bucketKey = item.gradeReturnsPath || "_no_path";
+        const bucketKey = item.returnFolder || "_no_file";
         if (!byDT[dtKey].buckets[bucketKey]) {
-          byDT[dtKey].buckets[bucketKey] = { gradeReturnsPath: item.gradeReturnsPath, drawings: [] };
+          byDT[dtKey].buckets[bucketKey] = { returnFolder: item.returnFolder, returnKind: item.returnKind, drawings: [] };
         }
         byDT[dtKey].buckets[bucketKey].drawings.push(item);
         byDT[dtKey].pageIds.push(item.pageId);
@@ -1500,13 +1718,18 @@ module.exports = function mountDrawingFlow(app, notion) {
       // Build folderBlocks per DT (matches dt-summary email structure)
       for (const group of Object.values(byDT)) {
         group.folderBlocks = Object.values(group.buckets).map((bucket) => {
-          const pathText    = bucket.gradeReturnsPath || "Grade Returns folder";
-          const folderHtml  = `<strong>${pathText}</strong>`;
+          const shortFolder = bucket.returnFolder
+            ? toShortDropboxPath(bucket.returnFolder).replace(/^Drawing Submissions\//i, "")
+            : null;
+          const folderHtml  = shortFolder ? `<strong>${shortFolder}</strong>` : "<strong>No return file</strong>";
 
+          const note = bucket.returnKind === "grade-returns"
+            ? "Returned C01 drawings are named <code>{Item}_{Stage}_{Rev}_{DrawingNo}_{Grade}_{YYMMDD}.pdf</code>"
+            : bucket.returnKind === "reviewed"
+              ? "Client comments reviewed by the DM — files prefixed <code>R_</code>, named <code>R_{Client}_{YYMMDD}_{DrawingNo}_{Rev}.pdf</code>"
+              : "No marked-up file for these — see the grade and action.";
           const filenameFormatNote =
-            `<tr><td colspan="5" style="padding:4px 8px 10px;font-size:11px;color:#888;font-style:italic;">` +
-            `Files in this folder are named: <code>{SuffixNo}_{DrawingNo}_{Rev}_{Grade}_{YYMMDD}.pdf</code>` +
-            `</td></tr>`;
+            `<tr><td colspan="6" style="padding:4px 8px 10px;font-size:11px;color:#888;font-style:italic;">${note}</td></tr>`;
 
           const drawingRows = bucket.drawings.map((d) =>
             `<tr>
@@ -1657,46 +1880,82 @@ module.exports = function mountDrawingFlow(app, notion) {
   });
 
   // POST /api/df/cr-ingest
-  // Called by the Make cr-ingest scenario once per new client-comment PDF.
-  // Body: { filePath | dropboxPath, shareLink, filename }
-  // Parses the filename + folder path, finds the MDS drawing, and appends the comment file
-  // (hyperlinked) to `<stage> Comment Files` and the client acronym to `<stage> Client Reviewers`.
-  // Existing values are preserved (multiple clients may comment on the same drawing/stage).
+  // Called by the Make cr-ingest scenario (Scenario 3) once per client-comment PDF found in a
+  // Client Comments/ folder. Body: { filePath | dropboxPath, shareLink, filename }
+  //
+  // Filename: {ClientAcronym}_{YYMMDD}_{DrawingNo}_{Rev}.pdf
+  // Folder:   {ProjectNo}/Client Comments/            (new — stage taken from the Issued submission)
+  //           {ProjectNo}/{Stage}/Client Comments/    (legacy — stage taken from the folder)
+  //
+  // Effects:
+  //   MDS drawing   → appends the file (hyperlinked) to `<stage> Comment Files` and the client to
+  //                   `<stage> Client Reviewers` (existing values preserved)
+  //   Submission    → Ball In Court = DM, DM Action = "Review Comments" (drives the cockpit's
+  //                   Review Client Comments column), and the file's Dropbox path is added to
+  //                   `Comment Paths` so Log Status can move it to Reviewed/R_… afterwards.
+  // The DM reviews the PDF in Drawboard (synced back in place), then grades in the Hub.
 
   app.post("/api/df/cr-ingest", async (req, res) => {
     try {
       const { filePath, dropboxPath, shareLink, filename } = req.body || {};
-      const pathStr = (filePath || dropboxPath || "");
+      const pathStr = (filePath || dropboxPath || "").replace(/\\/g, "/");
       const name = filename || pathStr.split("/").pop();
       if (!name) return res.status(400).json({ ok: false, error: "filename required" });
+
+      // Already-reviewed files (moved to Reviewed/ with R_) are never re-ingested.
+      if (name.toUpperCase().startsWith(REVIEWED_PREFIX) || /\/reviewed\//i.test(pathStr)) {
+        return res.json({ ok: true, skipped: true, reason: "already reviewed" });
+      }
 
       // Parse {ClientAcronym}_{YYMMDD}_{DrawingNo}_{Rev}.pdf
       const baseName = name.replace(/\.pdf$/i, "");
       const parts = baseName.split("_");
-      if (parts.length < 4) return res.status(400).json({ ok: false, error: `Could not parse filename: ${name}` });
+      if (parts.length < 4) {
+        await addNotification({ type: "error", filename: name, message: "Client comment filename should be {Client}_{YYMMDD}_{DrawingNo}_{Rev}.pdf" });
+        return res.status(400).json({ ok: false, error: `Could not parse filename: ${name}` });
+      }
       const clientAcronym = parts[0];
+      const revision      = parts[parts.length - 1].toUpperCase();
       const drawingNo     = parts.slice(2, parts.length - 1).join("_");
-
-      // Stage from the folder path
-      const norm  = pathStr.replace(/\\/g, "/");
-      const stage = /\/A4\.5\//i.test(norm) ? "A4.5" : /\/S5\//i.test(norm) ? "S5" : "S4";
-      const commentProp  = `${stage} Comment Files`;
-      const reviewerProp = `${stage} Client Reviewers`;
 
       const matches = await queryAll(notion, DRAWINGS_DB, {
         property: "Drawing Number", title: { contains: drawingNo },
       });
-      if (!matches.length) return res.json({ ok: true, matched: false, note: `No MDS drawing for ${drawingNo}` });
+      if (!matches.length) {
+        await addNotification({ type: "error", filename: name, message: `No MDS drawing for ${drawingNo}` });
+        return res.json({ ok: true, matched: false, note: `No MDS drawing for ${drawingNo}` });
+      }
       const drawing = matches[0];
 
-      // Append hyperlinked filename to the stage's Comment Files rich_text (preserve existing)
-      const existingRT = drawing.properties?.[commentProp]?.rich_text ?? [];
+      // Stage: a legacy stage folder in the path wins; otherwise it comes from the drawing's
+      // Issued submission (matching the comment's rev when there's more than one).
+      const loc         = locateProject(pathStr);
+      const folderStage = loc?.stageSeg ? loc.stageSeg.toUpperCase() : null;
+      const issued = await queryAll(notion, SUBMISSIONS_DB, {
+        and: [
+          { property: "Drawing", relation: { contains: drawing.id } },
+          { property: "Status",  select:   { equals: "Issued"     } },
+          ...(folderStage ? [{ property: "Stage", select: { equals: folderStage } }] : []),
+        ],
+      });
+      const byRound  = (a, b) => (getProp(b, "QA Round", "number") ?? 0) - (getProp(a, "QA Round", "number") ?? 0);
+      const revMatch = issued.filter((p) => (getProp(p, "Revision", "select") || "").toUpperCase() === revision);
+      const target   = (revMatch.length ? revMatch : issued).sort(byRound)[0] ?? null;
+      const stage    = folderStage || (target ? getProp(target, "Stage", "select") : null);
+
+      if (!stage) {
+        const message = `No Issued submission for ${drawingNo} — can't tell which stage these comments belong to`;
+        await addNotification({ type: "error", filename: name, message });
+        return res.json({ ok: true, matched: false, note: message });
+      }
+
+      const commentProp  = `${stage} Comment Files`;
+      const reviewerProp = `${stage} Client Reviewers`;
 
       // Deduplicate — skip if this filename (with or without R_ prefix) is already recorded.
       // Case-insensitive: Dropbox/Make can return the same file's extension in a different
-      // case on different list passes (seen in practice — "_P01.pdf" vs "_P01.PDF" for the
-      // same file), which a case-sensitive check treats as a new, distinct filename and
-      // appends a duplicate entry.
+      // case on different list passes ("_P01.pdf" vs "_P01.PDF").
+      const existingRT   = drawing.properties?.[commentProp]?.rich_text ?? [];
       const existingText = existingRT.map((r) => r.text?.content ?? "").join("").toLowerCase();
       const baseScanName = name.replace(/^R_/i, "").toLowerCase();
       if (existingText.includes(baseScanName)) {
@@ -1707,8 +1966,7 @@ module.exports = function mountDrawingFlow(app, notion) {
       const separator  = existingRT.length ? [{ type: "text", text: { content: ", " } }] : [];
       const newSegment = { type: "text", text: { content: name, link: shareLink ? { url: shareLink } : null } };
 
-      // Add client acronym to the stage's Client Reviewers multi-select (preserve existing)
-      const existingMS = drawing.properties?.[reviewerProp]?.multi_select ?? [];
+      const existingMS  = drawing.properties?.[reviewerProp]?.multi_select ?? [];
       const multiSelect = existingMS.some((o) => o.name === clientAcronym)
         ? existingMS.map((o) => ({ name: o.name }))
         : [...existingMS.map((o) => ({ name: o.name })), { name: clientAcronym }];
@@ -1718,42 +1976,32 @@ module.exports = function mountDrawingFlow(app, notion) {
         [reviewerProp]: { multi_select: multiSelect },
       }});
 
-      // Hand the submission back to the DM for comment review. Status stays "Issued" —
-      // receiving client comments doesn't change the ISO stage, just who needs to act next.
-      // Ball In Court → DM is what the cockpit's "Review Client Comments" column is keyed off.
+      // Hand the submission back to the DM for comment review. Status stays "Issued".
       let submissionId = null;
-      try {
-        const subs = await queryAll(notion, SUBMISSIONS_DB, {
-          and: [
-            { property: "Drawing", relation: { contains: drawing.id } },
-            { property: "Stage",   select:   { equals: stage        } },
-            { property: "Status",  select:   { equals: "Issued"     } },
-          ],
-        });
-        if (subs.length) {
-          // Most recent QA round wins if more than one Issued submission matches.
-          const target = subs.sort(
-            (a, b) => (getProp(b, "QA Round", "number") ?? 0) - (getProp(a, "QA Round", "number") ?? 0)
-          )[0];
-          submissionId = target.id;
-          const receivedAt = now();
+      if (target) {
+        submissionId = target.id;
+        const shortPath = toShortDropboxPath(pathStr);
+        const paths = readPathList(target, "Comment Paths");
+        if (shortPath && !paths.some((p) => p.toLowerCase() === shortPath.toLowerCase())) paths.push(shortPath);
+        const receivedAt = now();
+        try {
           await notion.pages.update({ page_id: target.id, properties: {
             "Ball In Court": { select: { name: BIC.COMMENTS_RECEIVED } },
             "BIC Since":     { date:   { start: receivedAt           } },
-            // Unlike every other DM Action value (Approve/Bounce/Log Status — all stamped
-            // as a record of an action already taken), this one is prescriptive: it flags
-            // that reviewing the comments is the action now required. Chosen deliberately
-            // over a separate field so it's visible in the same column as everything else.
+            // Prescriptive, unlike Approve/Bounce/Log Status: flags that reviewing the
+            // comments is the action now required. Cleared when the DM logs the grade.
             "DM Action":     { select: { name: "Review Comments"    } },
+            "Comment Paths": { rich_text: richTextChunks(paths.join("\n")) },
           }});
-        } else {
-          console.warn(`[cr-ingest] no Issued submission found for ${drawingNo} ${stage} — Comment Files written but Ball In Court not updated`);
+        } catch (err) {
+          console.warn(`[cr-ingest] Submission update failed for ${drawingNo} ${stage}:`, err.message);
         }
-      } catch (err) {
-        console.warn(`[cr-ingest] Ball In Court update failed for ${drawingNo} ${stage}:`, err.message);
+      } else {
+        console.warn(`[cr-ingest] no Issued submission found for ${drawingNo} ${stage} — Comment Files written but Ball In Court not updated`);
       }
 
       console.log(`[cr-ingest] ${name} → ${drawingNo} ${stage} (${clientAcronym})`);
+      await addNotification({ type: "success", filename: name, message: `Client comments (${clientAcronym}) logged against ${drawingNo} ${stage}` });
       res.json({ ok: true, matched: true, drawingId: drawing.id, submissionId, stage, clientAcronym, drawingNo });
     } catch (err) {
       console.error("[cr-ingest]", err);
@@ -1777,12 +2025,12 @@ module.exports = function mountDrawingFlow(app, notion) {
       dtEmail:      req.body?.testEmail || "test@example.com",
       folderBlocks: [
         {
-          folderHtml:   "<a href=\"https://www.dropbox.com/sh/test\" style=\"color:#4f7fff;font-weight:600;\">Suffix 001</a>",
+          folderHtml:   "<a href=\"https://www.dropbox.com/sh/test\" style=\"color:#4f7fff;font-weight:600;\">24-367 / Approved</a>",
           drawingsHtml: "<tr><td style=\"padding:4px 8px;color:#333;\">A-101</td><td style=\"padding:4px 8px;color:#555;\">S4</td><td style=\"padding:4px 8px;color:#555;\">QA Approved</td></tr><tr><td style=\"padding:4px 8px;color:#333;\">A-102</td><td style=\"padding:4px 8px;color:#555;\">S4</td><td style=\"padding:4px 8px;color:#555;\">QA Approved</td></tr>",
           drawingCount: 2,
         },
         {
-          folderHtml:   "<a href=\"https://www.dropbox.com/sh/test2\" style=\"color:#4f7fff;font-weight:600;\">Rejected/R1</a>",
+          folderHtml:   "<a href=\"https://www.dropbox.com/sh/test2\" style=\"color:#4f7fff;font-weight:600;\">24-367 / Rejected</a>",
           drawingsHtml: "<tr><td style=\"padding:4px 8px;color:#333;\">A-103</td><td style=\"padding:4px 8px;color:#555;\">S5</td><td style=\"padding:4px 8px;color:#555;\">Bounced — returned for revision</td></tr>",
           drawingCount: 1,
         },
@@ -1821,6 +2069,14 @@ module.exports = function mountDrawingFlow(app, notion) {
     const reviewedAt = now();
 
     if (!VALID_STAGES.includes(stage)) return res.status(400).json({ ok: false, error: `Unknown stage: ${stage}` });
+    const currentStatus = getProp(submissionPage, "Status", "select");
+    if (currentStatus !== "Submitted") {
+      return res.status(409).json({ ok: false, error: `Only Submitted drawings can be approved (this one is ${currentStatus})` });
+    }
+
+    // The file Make moves is whatever sits at the Pending path — i.e. the Drawboard-marked
+    // copy, provided Drawboard has synced before Approve is clicked.
+    const dropboxMove = computeDropboxMove(rawPath, "approve", null);
 
     try {
       await notion.pages.update({ page_id: id, properties: {
@@ -1829,12 +2085,13 @@ module.exports = function mountDrawingFlow(app, notion) {
         "Reviewed":      { date:   { start: reviewedAt      } },
         "Ball In Court": { select: { name: "DT"             } },
         "BIC Since":     { date:   { start: reviewedAt      } },
+        // Same awaited call as the status write (see /bounce for why).
+        ...(dropboxMove ? { "Dropbox Path": { url: toShortDropboxPath(dropboxMove.to) } } : {}),
       }});
     } catch (err) {
       return res.status(500).json({ ok: false, error: "Submission update failed", detail: err.message });
     }
 
-    const dropboxMove     = computeDropboxMove(rawPath, "approve", null);
     const submissionTitle = getProp(submissionPage, "Submission", "title");
     const dtIds           = getProp(submissionPage, "DT",         "relation");
     const taskIds         = getProp(submissionPage, "Item",        "relation");
@@ -1845,19 +2102,10 @@ module.exports = function mountDrawingFlow(app, notion) {
     const projectNo    = taskParts.slice(0, -1).join("-");           // "24-367"
     const itemNo       = dropboxMove?.itemNo ?? taskParts[taskParts.length - 1]; // "022"
     const suffixRef    = projectNo && itemNo ? `${projectNo}-${itemNo}` : submissionTitle;
-    const uploadPath   = projectNo && stage && itemNo
-      ? `${DROPBOX_ROOT}/Drawing Submissions/${projectNo}/${stage}/Suffix ${itemNo}`
-      : null;
+    // Approved drawings (and the DT's DWGs) now live in the project-level Approved folder.
+    const uploadPath   = dropboxMove?.toFolder
+      ?? (projectNo ? `${DROPBOX_ROOT}/Drawing Submissions/${projectNo}/${FOLDER.APPROVED}` : null);
 
-    // Update Dropbox Path in Notion to reflect the new location after move
-    if (dropboxMove?.to) {
-      const newShortPath = dropboxMove.to.toLowerCase().startsWith(DROPBOX_ROOT.toLowerCase())
-        ? dropboxMove.to.slice(DROPBOX_ROOT.length).replace(/^\//, "")
-        : dropboxMove.to;
-      notion.pages.update({ page_id: id, properties: {
-        "Dropbox Path": { url: newShortPath }
-      }}).catch(e => console.warn("[approve] Dropbox Path update failed:", e.message));
-    }
 
     // Collect all drawing numbers approved so far in this suffix
     let approvedDrawingNos = [dropboxMove?.drawingNo].filter(Boolean);
@@ -1897,7 +2145,7 @@ module.exports = function mountDrawingFlow(app, notion) {
       suffixRef,
       reviewedAt,
       approvedDrawingNos,
-      suffixFolderPath: dropboxMove?.toFolder ?? null,
+      suffixFolderPath: dropboxMove?.toFolder ?? null,   // now {ProjectNo}/Approved — name kept for the Make mapping
       ...(uploadPath  ? { uploadPath }  : {}),
       ...(dropboxMove ? { dropboxMove } : {}),
       dtName:  dt.name,
@@ -2002,23 +2250,34 @@ module.exports = function mountDrawingFlow(app, notion) {
     if (dsIdx < 0) return res.status(400).json({ ok: false, error: "Path not under Drawing Submissions" });
 
     const projectNo = parts[dsIdx + 1];
-    const stage     = parts[dsIdx + 2]?.toUpperCase();  // path_lower from Dropbox/Make is all lowercase
-    if (!projectNo || !stage) return res.status(400).json({ ok: false, error: "Could not parse project/stage" });
-    if (!VALID_STAGES.includes(stage)) return res.status(400).json({ ok: false, error: `Unknown stage: ${stage}` });
+    if (!projectNo) return res.status(400).json({ ok: false, error: "Could not parse project" });
 
-    console.log(`[stage-upload] ${projectNo}/${stage} — BIC update DT → DM`);
+    // Stage: legacy DWGs sat in a {ProjectNo}/{Stage}/... folder; in the new layout DWGs go
+    // into {ProjectNo}/Approved/, so take the stage from the filename if it follows
+    // {Item}_{Stage}_{Rev}_{DrawingNo}. If neither gives a stage, match every Approved
+    // submission with BIC=DT for the project.
+    let stage = isStage(parts[dsIdx + 2]) ? parts[dsIdx + 2].toUpperCase() : null;
+    if (!stage) {
+      const fname = parts[parts.length - 1] || "";
+      const dot   = fname.lastIndexOf(".");
+      const named = parseSubmissionName(dot > 0 ? fname.slice(0, dot) : fname);
+      if (named.ok && named.stage) stage = named.stage;
+    }
+
+    console.log(`[stage-upload] ${projectNo}/${stage || "any stage"} — BIC update DT → DM`);
 
     try {
       const results = await queryAll(notion, SUBMISSIONS_DB, {
         and: [
-          { property: "Stage",         select: { equals: stage            } },
+          ...(stage ? [{ property: "Stage", select: { equals: stage } }] : []),
           { property: "Status",        select: { equals: "Approved" } },
-          { property: "Ball In Court", select: { equals: "DT"             } },
+          { property: "Ball In Court", select: { equals: "DT"       } },
         ],
       });
 
+      // Titles are "{ProjectNo}-{Item}_..." — match on "{ProjectNo}-" so 24-36 doesn't catch 24-367.
       const matching = results.filter((page) =>
-        (getProp(page, "Submission", "title") ?? "").startsWith(projectNo)
+        (getProp(page, "Submission", "title") ?? "").toUpperCase().startsWith(`${projectNo.toUpperCase()}-`)
       );
 
       if (!matching.length) {
@@ -2042,51 +2301,30 @@ module.exports = function mountDrawingFlow(app, notion) {
   });
 
   // PATCH /api/df/submissions/:id/bounce
-  // After Notion writes: fires Make Scenario 2 (Dropbox move + Gmail share link to DT).
+  // DM has marked up the PDF in Drawboard (synced back to the same file in Pending) and
+  // bounces it. Make moves that marked-up file to {ProjectNo}/Rejected/{name}_R{n}.pdf,
+  // creates a shared link on Rejected/ and PATCHes it back via /folder-link. The DT email
+  // is batched later via POST /api/df/send-dt-emails.
   //
-  // Body: { annotatedDropboxPath, annotatedPdfFilename }
-  //   annotatedDropboxPath: full Dropbox path of the pre-uploaded annotated PDF
-  //   Make moves the file from that path to R{n}/, creates a share link, emails it to DT.
-  //   No PDF bytes transmitted — works for any file size.
-  // GET /api/df/submissions/:id/bounce-dest
-  // Returns the computed Dropbox destination paths for a bounce without committing any changes.
-  // Used by DT Checker to upload the annotated PDF directly to R{n}/ before calling /bounce.
-  app.get("/api/df/submissions/:id/bounce-dest", async (req, res) => {
-    const { id } = req.params;
-    let submissionPage;
-    try { submissionPage = await notion.pages.retrieve({ page_id: id }); }
-    catch { return res.status(404).json({ ok: false, error: "Submission not found" }); }
-
-    const qaRound    = getProp(submissionPage, "QA Round",     "number") ?? 1;
-    const rawPath    = getProp(submissionPage, "Dropbox Path", "url");
-    const dropboxMove = computeDropboxMove(rawPath, "bounce", qaRound);
-
-    if (!dropboxMove) return res.status(400).json({ ok: false, error: "Could not compute bounce destination — check Dropbox Path in Notion" });
-
-    res.json({ ok: true, dropboxMove });
-  });
+  // (Sept 2026: the DT Drawing Checker's annotated-PDF upload path, /bounce-dest and the
+  // Miro link were removed — the markup now lives in the PDF itself.)
 
   app.patch("/api/df/submissions/:id/bounce", async (req, res) => {
     const { id } = req.params;
-    const { annotatedPdfFilename,
-            annotatedPdfBase64 } = req.body || {};  // base64 kept for legacy/small-file fallback
-    let { annotatedDropboxPath } = req.body || {};
 
     let submissionPage;
     try { submissionPage = await notion.pages.retrieve({ page_id: id }); }
     catch { return res.status(404).json({ ok: false, error: "Submission not found" }); }
 
-    const qaRound   = getProp(submissionPage, "QA Round",     "number") ?? 1;
-    const rawPath   = getProp(submissionPage, "Dropbox Path", "url");
-
-    // If DT Checker pre-uploaded the file but didn't send annotatedDropboxPath,
-    // reconstruct it so Make receives hasAnnotatedPdf=true and doesn't overwrite the annotated file.
-    if (!annotatedDropboxPath && !annotatedPdfBase64 && annotatedPdfFilename) {
-      const dm = computeDropboxMove(rawPath, "bounce", qaRound);
-      if (dm?.toFolder) annotatedDropboxPath = `${dm.toFolder}/${annotatedPdfFilename}`;
+    const currentStatus = getProp(submissionPage, "Status", "select");
+    if (currentStatus !== "Submitted") {
+      return res.status(409).json({ ok: false, error: `Only Submitted drawings can be bounced (this one is ${currentStatus})` });
     }
-    const hasAnnotatedPdf = !!(annotatedDropboxPath || annotatedPdfBase64);
-    const bouncedAt = now();
+
+    const qaRound     = getProp(submissionPage, "QA Round",     "number") ?? 1;
+    const rawPath     = getProp(submissionPage, "Dropbox Path", "url");
+    const dropboxMove = computeDropboxMove(rawPath, "bounce", qaRound);
+    const bouncedAt   = now();
 
     try {
       await notion.pages.update({ page_id: id, properties: {
@@ -2095,44 +2333,21 @@ module.exports = function mountDrawingFlow(app, notion) {
         "Reviewed":      { date:   { start: bouncedAt  } },
         "Ball In Court": { select: { name: BIC.BOUNCED } },
         "BIC Since":     { date:   { start: bouncedAt  } },
+        // Written in the same (awaited) call — Netlify freezes un-awaited promises once the
+        // response is sent, which could silently drop a separate path update.
+        ...(dropboxMove ? { "Dropbox Path": { url: toShortDropboxPath(dropboxMove.to) } } : {}),
       }});
     } catch (err) {
       return res.status(500).json({ ok: false, error: "Submission update failed", detail: err.message });
     }
+    if (!dropboxMove) console.warn(`[bounce] ${id}: no Dropbox move — Dropbox Path "${rawPath}" is not in a Pending folder`);
 
-    const dropboxMove     = computeDropboxMove(rawPath, "bounce", qaRound);
     const submissionTitle = getProp(submissionPage, "Submission", "title");
     const stage           = getProp(submissionPage, "Stage",      "select");
     const dtIds           = getProp(submissionPage, "DT",         "relation");
     const taskIds         = getProp(submissionPage, "Item",        "relation");
     const dt              = await resolveDT(notion, dtIds);
 
-    // Update stored Dropbox Path to the annotated PDF destination (or original move target)
-    const destPath = (() => {
-      if (!dropboxMove?.toFolder) return dropboxMove?.to || null;
-      const fname = annotatedPdfFilename || dropboxMove.to?.split("/").pop() || null;
-      return fname ? `${dropboxMove.toFolder}/${fname}` : dropboxMove.to;
-    })();
-    if (destPath) {
-      const short = destPath.startsWith(DROPBOX_ROOT)
-        ? destPath.slice(DROPBOX_ROOT.length).replace(/^\//, "") : destPath;
-      notion.pages.update({ page_id: id, properties: {
-        "Dropbox Path": { url: short }
-      }}).catch(e => console.warn("[bounce] Dropbox Path update failed:", e.message));
-    }
-
-    // Fetch Miro Board Link from the linked Task
-    let miroLink = null;
-    if (taskIds?.length) {
-      try {
-        const taskPage = await notion.pages.retrieve({ page_id: taskIds[0] });
-        miroLink = getProp(taskPage, "Miro Board Link", "url");
-      } catch { /* non-fatal */ }
-    }
-
-    // Fire webhook so Make can: (1) move the file, (2) create shared link on the Rejected folder,
-    // (3) POST the link back via /api/df/submissions/:id/folder-link.
-    // Email is NOT sent here — handled by POST /api/df/send-dt-emails.
     await fireWebhook(process.env.MAKE_ACTIONS_WEBHOOK, {
       action:           "bounce",
       submissionId:     id,
@@ -2140,17 +2355,13 @@ module.exports = function mountDrawingFlow(app, notion) {
       stage,
       qaRound,
       bouncedAt,
-      hasAnnotatedPdf,
       bounceFolderPath: dropboxMove?.toFolder ?? null,
-      ...(miroLink             ? { miroLink }                                   : {}),
-      ...(annotatedDropboxPath ? { annotatedDropboxPath, annotatedPdfFilename } : {}),
-      ...(annotatedPdfBase64 && !annotatedDropboxPath ? { annotatedPdfBase64, annotatedPdfFilename } : {}),
-      ...(dropboxMove          ? { dropboxMove }                                : {}),
+      ...(dropboxMove ? { dropboxMove } : {}),
       dtName:  dt.name,
       dtEmail: dt.email,
     });
 
-    const bounceRevision = getProp(submissionPage, "Revision", "select") ?? "";
+    const bounceRevision  = getProp(submissionPage, "Revision", "select") ?? "";
     const bounceDrawingNo = dropboxMove?.drawingNo ?? parseSubmissionTitle(submissionTitle, stage).drawingNo;
     await createActivityLogEntry(notion, {
       taskId: taskIds?.[0],
@@ -2160,12 +2371,20 @@ module.exports = function mountDrawingFlow(app, notion) {
       entry:  `Drawing ${bounceDrawingNo} Rev ${bounceRevision} bounced — QA Round ${qaRound}. BIC returned to ${dt.name || "DT"}.`,
     });
 
-    console.log(`[bounce] ${id} (path: ${annotatedDropboxPath || "none"}, base64: ${annotatedPdfBase64 ? "yes" : "no"})`);
+    console.log(`[bounce] ${id} → ${dropboxMove?.to ?? "no move"}`);
     res.json({ ok: true, bouncedAt, ...(dropboxMove ? { dropboxMove } : {}) });
   });
 
   // PATCH /api/df/submissions/:id/log-status
-  // After Notion writes: fires Make Scenario 4 (Gmail to DT, routed by stage + grade).
+  // DM logs the client grade in the Hub — A/B/C/NA for S4/S5, Approved/Rejected for A4.5/AB.
+  // Client comments are reviewed in Drawboard first (no separate reviewer app any more).
+  //
+  // File moves (one Make "move-files" webhook, only if there's something to move):
+  //   • every client comment PDF logged on this submission (Comment Paths)
+  //       → {its Client Comments folder}/Reviewed/R_{name}
+  //   • A4.5 Rejected: the issued copy in Approved/
+  //       → {ProjectNo}/Grade Returns/{Item}_{Stage}_{Rev}_{DrawingNo}_Rejected_{YYMMDD}.pdf
+  //     (A4.5 Approved stays in Approved/ — that copy is the final record until As Builts.)
 
   app.patch("/api/df/submissions/:id/log-status", async (req, res) => {
     const { id } = req.params;
@@ -2173,18 +2392,6 @@ module.exports = function mountDrawingFlow(app, notion) {
     let submissionPage;
     try { submissionPage = await notion.pages.retrieve({ page_id: id }); }
     catch (_e) { return res.status(404).json({ ok: false, error: "Submission not found" }); }
-
-    // Client comments received on this submission are graded through the Comment
-    // Reviewer app's pin-based markup review — not here. DM Action reads "Review Comments"
-    // only for that pending window (set by cr-ingest, cleared once the Comment Reviewer app's
-    // Save & Close writes its own DM Action). Blocking here mirrors hiding the cockpit's Grade
-    // button on these cards, so a direct API call can't bypass it either.
-    if (getProp(submissionPage, "DM Action", "select") === "Review Comments") {
-      return res.status(400).json({
-        ok: false,
-        error: "This submission has client comments awaiting review — grade it from the Comment Reviewer app instead of Log Status.",
-      });
-    }
 
     const stage    = getProp(submissionPage, "Stage",     "select");
     const revision = getProp(submissionPage, "Revision",  "select") ?? "";
@@ -2222,15 +2429,39 @@ module.exports = function mountDrawingFlow(app, notion) {
 
     const submissionStatus = isTerminalAB ? "Complete" : "Graded";
 
+    const logStatusTitle = getProp(submissionPage, "Submission", "title");
+    const taskIds = getProp(submissionPage, "Item", "relation");
+    const { taskCode: logStatusTaskCode, drawingNo: logStatusDrawingNo } = parseSubmissionTitle(logStatusTitle, stage);
+    const taskParts = logStatusTaskCode ? logStatusTaskCode.split("-") : [];
+    const itemNo    = taskParts[taskParts.length - 1] ?? "";
+
+    // ── Work out the Dropbox moves up front so their new paths go into the same Notion write.
+    const commentPaths  = readPathList(submissionPage, "Comment Paths");
+    const commentMoves  = commentPaths.map((p) => ({ p, move: computeReviewedMove(p) }));
+    const moves         = commentMoves.map((c) => c.move).filter(Boolean);
+    const newCommentPaths = commentMoves.map((c) => c.move ? toShortDropboxPath(c.move.to) : c.p);
+
+    let gradeReturnMove = null;
+    if (stage === "A4.5" && grade === "Rejected") {
+      gradeReturnMove = computeGradeReturnMove(getProp(submissionPage, "Dropbox Path", "url"), {
+        itemNo, stage, revision, drawingNo: logStatusDrawingNo, grade, date: gradedAt,
+      });
+      if (gradeReturnMove) moves.push(gradeReturnMove);
+      else console.warn(`[log-status] Could not work out the Grade Returns move for submission ${id}`);
+    }
+
     try {
       await notion.pages.update({ page_id: id, properties: {
         "Status":        { select: { name: submissionStatus } },
+        // Also clears a "Review Comments" DM Action set by cr-ingest.
         "DM Action":     { select: { name: "Log Status"     } },
         "Client Grade":  { select: { name: grade            } },
         "Reviewed":      { date:   { start: gradedAt        } },
         "DT Notified":   { checkbox: false                   },
         "Ball In Court": newBIC ? { select: { name: newBIC    } } : { select: null },
         "BIC Since":     newBIC ? { date:   { start: gradedAt } } : { date:   null },
+        ...(commentPaths.length ? { "Comment Paths": { rich_text: richTextChunks(newCommentPaths.join("\n")) } } : {}),
+        ...(gradeReturnMove ? { "Dropbox Path": { url: toShortDropboxPath(gradeReturnMove.to) } } : {}),
       }});
     } catch (err) {
       return res.status(500).json({ ok: false, error: "Submission update failed", detail: err.message });
@@ -2254,53 +2485,13 @@ module.exports = function mountDrawingFlow(app, notion) {
       }
     }
 
-    const logStatusTitle = getProp(submissionPage, "Submission", "title");
-    const taskIds = getProp(submissionPage, "Item", "relation");
-    const { taskCode: logStatusTaskCode, drawingNo: logStatusDrawingNo } = parseSubmissionTitle(logStatusTitle, stage);
-
-    // A4.5 Rejected: the file currently sitting in the Item/Suffix folder (placed there by
-    // the earlier Approve step) is no longer the final record — move it into Grade Returns,
-    // tagged with item/rev/grade so it's uniquely identified like the original Submissions
-    // were, freeing the Item folder for the eventual approved file. Approved A4.5 files are
-    // left exactly where they are — that copy IS the final client-submission record, and
-    // stays in the Item folder until As Builts are required.
-    if (stage === "A4.5" && grade === "Rejected") {
-      const rawPath   = getProp(submissionPage, "Dropbox Path", "url");
-      const taskParts = logStatusTaskCode ? logStatusTaskCode.split("-") : [];
-      const itemNo    = taskParts[taskParts.length - 1] ?? "";
-      const fullPath  = toFullDropboxPath(rawPath);
-
-      if (fullPath && itemNo && logStatusDrawingNo) {
-        const segs     = fullPath.split("/").filter(Boolean);
-        const stageIdx = segs.findIndex((s) => s.toUpperCase() === "A4.5");
-        const toFolder = stageIdx >= 0 ? "/" + segs.slice(0, stageIdx + 1).join("/") + "/Grade Returns" : null;
-
-        if (toFolder) {
-          const dateTag     = gradedAt.replace(/-/g, "").slice(2);   // YYYY-MM-DD -> YYMMDD
-          const newFilename = `${itemNo}_${logStatusDrawingNo}_${revision}_Rejected_${dateTag}.pdf`;
-
-          await fireWebhook(process.env.MAKE_ACTIONS_WEBHOOK, {
-            action:       "grade-reject",
-            fromPath:     fullPath,
-            toFolder,
-            newFilename,
-            submissionId: id,
-          });
-
-          // Optimistic update — mirrors the pattern used in /approve and /bounce.
-          const newFullPath  = `${toFolder}/${newFilename}`;
-          const newShortPath = newFullPath.toLowerCase().startsWith(DROPBOX_ROOT.toLowerCase())
-            ? newFullPath.slice(DROPBOX_ROOT.length).replace(/^\//, "")
-            : newFullPath;
-          notion.pages.update({ page_id: id, properties: {
-            "Dropbox Path": { url: newShortPath }
-          }}).catch((e) => console.warn("[log-status] Dropbox Path update failed:", e.message));
-        } else {
-          console.warn(`[log-status] Could not derive Grade Returns folder from path: ${fullPath}`);
-        }
-      } else {
-        console.warn(`[log-status] Missing data for Grade Returns move (itemNo/drawingNo/path) — submission ${id}`);
-      }
+    if (moves.length) {
+      await fireWebhook(process.env.MAKE_ACTIONS_WEBHOOK, {
+        action:       "move-files",
+        reason:       "log-status",
+        submissionId: id,
+        moves,        // [{ from, to, toFolder, toFolderParent, toFolderName, newFilename }]
+      });
     }
 
     await createActivityLogEntry(notion, {
@@ -2311,8 +2502,9 @@ module.exports = function mountDrawingFlow(app, notion) {
       entry:  `Client grade ${grade} recorded for ${logStatusDrawingNo} Rev ${revision}.`,
     });
 
-    console.log(`[log-status] ${id} => ${grade} (Rev ${revision}) => ${drawingStatus}`);
-    res.json({ ok: true, grade, gradedAt, statusDate, drawingStatus, submissionStatus, isTerminal: isTerminalAB, isA45Approved });
+    console.log(`[log-status] ${id} => ${grade} (Rev ${revision}) => ${drawingStatus}; ${moves.length} file move(s)`);
+    res.json({ ok: true, grade, gradedAt, statusDate, drawingStatus, submissionStatus, isTerminal: isTerminalAB, isA45Approved,
+               filesMoved: moves.map((m) => m.to) });
   });
 
   // GET /api/df/drawings

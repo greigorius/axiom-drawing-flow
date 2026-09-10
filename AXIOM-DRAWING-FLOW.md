@@ -3,13 +3,19 @@
 **Owner:** Greig Fensome (Design Manager, Axiom DL)
 **Repo:** `axiom-drawing-flow`
 **Live URL:** https://axiom-drawing-flow.netlify.app
-**Last updated:** July 2026
+**Last updated:** September 2026
 
 ---
 
 ## Purpose
 
 Axiom Drawing Flow is a drawing submission and QA automation system for Axiom DL, a UK joinery and fit-out company. The Design Manager (DM) oversees multiple remote Design Technicians (DTs) who submit architectural PDF drawings for staged ISO-19650 review. Without this tool, tracking submissions, QA rounds, file moves, and DT notifications was entirely manual.
+
+**Review tool:** all drawing review — DM QA of DT submissions and DM review of client
+comments — happens in **Drawboard PDF**, opened straight from Dropbox and synced back to the
+same file. The Hub is where the DM then acts (Approve / Bounce / Grade); the backend and Make
+rename and move the reviewed files. (The DT Drawing Checker, Client Comment Reviewer and Miro
+are retired as of Sept 2026.)
 
 The system automates:
 - **Ingestion** — Make.com detects new PDFs in Dropbox and registers them in Notion
@@ -77,13 +83,13 @@ Accessed at the app root (`/`). Designed to sit open permanently on the DM's des
 
 | Action | Trigger | What it does |
 |--------|---------|-------------|
-| **Approve** | Button on For Review card | Sets status to Approved, updates MDS submit date + drawing status, sends Dropbox move instruction to Make.com |
-| **Bounce** | Button on For Review card | Opens confirm modal → sets status to Rejected, increments QA round, sets BIC back to DT, sends Dropbox move instruction to Make.com |
+| **Approve** | Button on For Review card | Status → Approved; Make moves the (Drawboard-reviewed) PDF to `{Project}/Approved/`, name unchanged |
+| **Bounce** | Button on For Review card | Confirm modal → status Rejected, BIC → DT; Make moves the marked-up PDF to `{Project}/Rejected/{name}_R{n}.pdf` |
 | **Issue** | Button on Awaiting Issue card | Sets status to Issued, updates MDS, fires Make.com issue webhook |
-| **Log Status** | Button on Issued card | Records client grade (A/B/C/NA or Approved/Rejected) on the submission and MDS row |
+| **Grade (Log Status)** | Button on any Issued card, incl. Review Client Comments | Records the client grade (A/B/C/NA for S4/S5, Approved/Rejected for A4.5/AB). Moves logged client comment PDFs to `Client Comments/Reviewed/R_…`; A4.5 Rejected moves the C01 PDF to `Grade Returns/` |
 | **Send DT Emails** | Batch button | Fires one summary email per DT covering all their pending notifications |
 | **Send Grade Emails** | Batch button | Fires grade notification emails to DTs for all graded submissions |
-| **Scan Comments** | Button | Triggers Make.com to scan Dropbox for comment PDFs and link them to MDS rows |
+| **Scan Comments** | Button | Triggers Make Scenario 3 to find new client comment PDFs in `Client Comments/` folders → MDS comment files + card moves to Review Client Comments |
 | **Scan Pending** | Button | Triggers Make.com Scenario 1 to re-process any missed Dropbox uploads |
 
 ### Other UI Features
@@ -114,7 +120,8 @@ All routes are mounted from `drawing-flow.js` under `/api/df/`.
 | `PATCH` | `/api/df/submissions/:id/approve` | Approves a submission. Updates Notion status + MDS, returns Dropbox move instructions. |
 | `PATCH` | `/api/df/submissions/:id/issue` | Confirms official issue. Updates status to Issued. |
 | `PATCH` | `/api/df/submissions/:id/bounce` | Bounces a submission back to DT. Increments QA round, returns Dropbox move instructions. |
-| `PATCH` | `/api/df/submissions/:id/log-status` | Logs client grade (A/B/C/NA). Updates MDS grade fields. |
+| `PATCH` | `/api/df/submissions/:id/log-status` | Logs client grade. Updates MDS grade fields; fires `move-files` for client comments (→ Reviewed/R_) and A4.5 Rejected (→ Grade Returns). |
+| `POST` | `/api/df/cr-ingest` | Called by Make Scenario 3 per client comment PDF. Stage from the Issued submission (or legacy stage folder); stores the path in `Comment Paths`. |
 
 ### Notifications
 
@@ -170,6 +177,7 @@ All routes are mounted from `drawing-flow.js` under `/api/df/`.
 | `Dropbox Path` | url | Relative path (from `Drawing Submissions/`) — backend reconstructs full path |
 | `Folder Link` | url | Dropbox shared folder link — required before DT can be notified of Approved/Rejected |
 | `Blocked` | checkbox | Manually flag a submission as blocked (excluded from normal queue logic) |
+| `Comment Paths` | rich text | Dropbox paths of client comment PDFs logged by cr-ingest (one per line); rewritten to their `Reviewed/R_…` paths at Log Status |
 
 ### MDS (Drawings DB) — Fields Written by the Backend
 
@@ -205,38 +213,56 @@ The backend writes to these MDS properties on Approve, Bounce, and Log Status:
 
 ## Dropbox & Make.com Integration
 
-### Dropbox Folder Structure
+### Dropbox Folder Structure (Sept 2026 — project-level Pending)
 
 ```
 /DESIGN KNOW HOW/TMJ Interiors/
   └── Drawing Submissions/
-        └── {ProjectNo}/          e.g. 24-367
-              └── {Stage}/        e.g. S4
-                    ├── Pending/  ← DTs upload here; Make.com watches this
-                    ├── Rejected/
-                    │     └── R{N}/  ← bounced files per QA round
-                    └── {approved PDFs live at this level}
+        └── {ProjectNo}/            e.g. 24-367
+              ├── Pending/          ← DTs upload ALL stages here; Make picks up /pending/
+              ├── Approved/         ← Approve moves the PDF here (filename unchanged); DTs add DWGs here
+              ├── Rejected/         ← Bounce moves the PDF here as {original name}_R{n}.pdf
+              ├── Grade Returns/    ← A4.5 (C01) Rejected returns only, moved here at Log Status
+              └── Client Comments/  ← DM drops client comment PDFs here: {Client}_{YYMMDD}_{DrawingNo}_{Rev}.pdf
+                    └── Reviewed/   ← graded comment PDFs moved here as R_{original name}
 ```
 
+Grade Returns file name: `{Item}_{Stage}_{Rev}_{DrawingNo}_{Grade}_{YYMMDD}.pdf`.
+Legacy stage-level `{Project}/{Stage}/Client Comments/` folders still work (stage taken from the folder).
+
+`Pending/` must be created per project by hand. `Approved/`, `Rejected/` and `Grade Returns/`
+are created by Make on first use.
+
 The `DROPBOX_ROOT` constant in `drawing-flow.js` is set to `/DESIGN KNOW HOW/TMJ Interiors`. Notion stores only the relative path from `Drawing Submissions/` onward; the backend reconstructs the full path when returning move instructions.
+
+**Legacy:** the old per-stage layout (`{ProjectNo}/{Stage}/Pending/`, approved files in
+`{ProjectNo}/{Stage}/Suffix NNN/`) is still understood by the backend so drawings already in
+flight keep working. In-flight legacy files are moved to the new project-level `Approved/` /
+`Rejected/` folders when actioned. Legacy branches are marked `LEGACY` in `drawing-flow.js`.
 
 ### Filename Convention
 
 ```
-{ItemNo}_{DrawingNo}_{Revision}_{DTInitials}.pdf
-e.g. 003_A-101_P01_GM.pdf
+{Item}_{Stage}_{Rev}_{DrawingNo}.pdf            e.g. 003_S4_P01_EIT-TMJ-AA-B2-D-I-45120.pdf
+{Item}_{Stage}_{Rev}_{DrawingNo}_{DT}.pdf       e.g. 003_A4.5_C01_EIT-TMJ-AA-B2-D-I-45120_GF.pdf
 ```
 
-- `ItemNo` — numeric suffix matching the Tasks DB item (e.g. `003` for "Suffix 003")
-- `DrawingNo` — drawing number without project prefix (e.g. `A-101`)
-- `Revision` — `P01`–`P03` (preliminary) or `C01`–`C03` (construction)
-- `DTInitials` — must exactly match the `Initials` field in the Team DB
+- `Item` — item number in digits, matching "Suffix NNN" in the Tasks DB (e.g. `003`)
+- `Stage` — `S3`, `S4`, `S5`, `A4.5` or `AB` (case-insensitive)
+- `Rev` — e.g. `P01`–`P03` (preliminary) or `C01`–`C03` (construction)
+- `DrawingNo` — full drawing number; hyphens only, **no underscores**
+- `DT` — optional DT initials (derived from the Team DB name, e.g. Greig Fensome → `GF`).
+  If omitted or unmatched, the DT is taken from the Item's `Person` relation in the Tasks DB.
+  If neither resolves, the Submission is still created and the cockpit feed flags it.
+
+Files that don't match are rejected at ingest with a specific reason in the cockpit feed
+(wrong section count, unknown stage, bad rev, old-style name, etc.).
 
 ### Make.com Scenarios
 
 | Scenario | Trigger | What it does |
 |----------|---------|-------------|
-| **Scenario 1 — Ingest** | New PDF in any `/Pending/` folder | Calls `POST /api/df/ingest`; backend parses path and filename, creates Submission row |
+| **Scenario 1 — Ingest** | New PDF in any project `/Pending/` folder (recursive watch on `Drawing Submissions`) | Calls `POST /api/df/ingest`; backend parses path and filename, creates Submission row |
 | **Scenario 2 — Actions Hub** | Webhook from backend (`MAKE_ACTIONS_WEBHOOK`) | Handles Dropbox file moves (approve/bounce), sends DT notification emails, triggers client review ingest |
 
 ### Make.com Webhook Actions
@@ -245,11 +271,12 @@ The backend fires `MAKE_ACTIONS_WEBHOOK` with an `action` field. Make.com routes
 
 | Action | Triggered by | Payload |
 |--------|-------------|---------|
-| `approve` | Approve endpoint | `dropboxMove` object with `from`/`to` paths |
-| `bounce` | Bounce endpoint | `dropboxMove` object with `from`/`to`/`toFolder` paths |
+| `approve` | Approve endpoint | `dropboxMove` (`from`, `toFolderParent`, `toFolderName`, `toFolder`, `newFilename`) |
+| `bounce` | Bounce endpoint | `dropboxMove` (same shape — Make **moves**, never deletes) |
+| `move-files` | Log Status | `moves[]` of the same shape — client comments → Reviewed/R_, A4.5 Rejected → Grade Returns |
 | `dt-summary` | Send DT Emails button | Per-DT summary of actioned submissions for email |
 | `issue` | Issue endpoint | Submission details for issue notification |
-| `grade` | Log Status endpoint | Grade details for DT grade notification |
+| `grade-summary` | Send Grade Emails button | Per-DT summary; folder block per return folder (Reviewed or Grade Returns) |
 | `cr-ingest` | Client Review ingest | Triggers Scenario 1 equivalent for comment PDFs |
 
 ---
@@ -364,10 +391,10 @@ The backend infers the drawing type (Drawing / Sketch / Model / Schedule) from t
 
 ## Future Development
 
-The following workstreams are documented in `docs/` but not yet built:
-
-- **DT Drawing Checker integration** — Approve/Bounce buttons from within the PDF review tool, exporting marked-up PDFs and pushing PNGs to Miro boards
 - **Workflow 2 (commercial control)** — contract hours vs allocated vs actual, variation handling — see `docs/WORKFLOW-2-BRIEFING.md`. Do not build until explicitly scoped.
 - **Programme Inputs form** — the `/inputs` route has placeholder UI; backend routes exist but the form UI (`inputs.jsx`) is not fully wired
+
+Tests: `node tests/parsing.test.js` and `node tests/routes.test.js` (no dependencies — Notion, Make and
+Netlify Blobs are mocked). Run both plus `node --check drawing-flow.js` before every push.
 
 When extending the backend, mount new routes in `drawing-flow.js` following the existing pattern. All routes receive `(app, notion)` via the module export. Never add routes directly to `app.js` — that file only mounts the drawing-flow module and the static file server.

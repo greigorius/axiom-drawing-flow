@@ -85,7 +85,12 @@ const BounceModal = ({ submission, onConfirm, onClose }) => {
           {submission.dtName ? ` · ${submission.dtName}` : ""}
         </div>
         <p style={{ fontSize: 13, color: "var(--text2)", margin: "16px 0 0" }}>
-          This will return the drawing to the DT. The Miro board link will be included in the notification email so the DT can see the markup.
+          Returns the drawing to the DT. Your Drawboard markup travels with the PDF — it moves to the
+          project's <strong>Rejected</strong> folder as <code>…_R{submission.qaRound ?? 1}.pdf</code> and the folder
+          link goes out in the next DT email.
+        </p>
+        <p style={{ fontSize: 12, color: "var(--warn)", margin: "10px 0 0" }}>
+          Sync the document in Drawboard and close it before bouncing, so the marked-up version is the one that moves.
         </p>
         <div className="modal-actions">
           <button className="btn btn-ghost" onClick={onClose} disabled={busy}>Cancel</button>
@@ -154,6 +159,17 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
         <div style={{ marginTop: 12, fontSize: 11, color: "var(--text3)" }}>
           {hint}
         </div>
+        {submission.hasComments && (
+          <div style={{ marginTop: 8, fontSize: 11, color: "var(--text3)" }}>
+            Client comment PDFs for this drawing move to <code>Client Comments/Reviewed</code> with an <code>R_</code> prefix —
+            sync them in Drawboard first.
+          </div>
+        )}
+        {isA45 && (
+          <div style={{ marginTop: 8, fontSize: 11, color: "var(--text3)" }}>
+            Rejected moves the issued C01 PDF to <code>Grade Returns</code>; Approved leaves it in <code>Approved</code>.
+          </div>
+        )}
       </div>
     </div>
   );
@@ -976,7 +992,7 @@ const Cockpit = () => {
 
   const COLS = [
     { id: "bounced", title: "Bounced — With DT", accent: "var(--danger)", sub: "Returned to DT · awaiting revised resubmission", items: bounced },
-    { id: "submitted", title: "Submitted — Awaiting Review", accent: "var(--info)", sub: "New DT drawing submissions", items: submitted,
+    { id: "submitted", title: "Submitted — Awaiting Review", accent: "var(--info)", sub: "Review in Drawboard · sync before Approve / Bounce", items: submitted,
       action: { label: scanPendingLabel, onClick: handleScanPending, disabled: scanning } },
     { id: "reviewed", title: "Reviewed — Notify DT", accent: "var(--ok)", sub: "Approved / bounced — awaiting DT email", items: reviewedNotify,
       action: { label: sendDtLabel, disabled: sendEmailBusy, count: reviewedSelectedIds.length || reviewedNotify.length,
@@ -984,7 +1000,7 @@ const Cockpit = () => {
     { id: "approved", title: "Approved — Awaiting Issue", accent: "var(--ok)", sub: "DT notified · awaiting DWG upload, then issue", items: approvedItems,
       action: { label: scanUploadsLabel, onClick: handleScanPending, disabled: scanning } },
     { id: "awaiting-comments", title: "Issued — Awaiting Comments", accent: "var(--info)", sub: "Issued to client, awaiting comments", items: awaitingComments },
-    { id: "comments", title: "Issued — Review Client Comments", accent: "var(--grade)", sub: "Client comments received", items: commentItems,
+    { id: "comments", title: "Issued — Review Client Comments", accent: "var(--grade)", sub: "Review in Drawboard, then grade", items: commentItems,
       action: { label: scanCommentsLabel, onClick: handleScanComments, disabled: scanCommentsBusy, count: commentItems.length } },
     { id: "signoff", title: "Issued — Awaiting Sign-Off", accent: "var(--warn)", sub: "A4.5 — with client for sign-off", items: signoffItems },
     { id: "graded", title: "Graded — Notify DT", accent: "var(--accent)", sub: "Notion · DT Notified unchecked", items: graded,
@@ -1034,18 +1050,11 @@ const Cockpit = () => {
           title={ready ? "Issue the drawing" : "Awaiting DT to upload DWGs"}>Issue</button>
       );
     }
-    else if (colId === "signoff" || colId === "awaiting-comments") primary = (
-      <button className="k-act go" onClick={(e) => { e.stopPropagation(); setLogStatusTarget(s); }}>Grade</button>
-    );
-    // Client comments already received on this submission go through the Comment
-    // Reviewer app's pin-based markup review, not the generic Log Status modal — the two
-    // used to both be reachable on the same card, producing a Grade Returns email for
-    // drawings actually being handled through Client Comments/Reviewed.
-    else if (colId === "comments") primary = (
-      <button className="k-act" disabled
-        title="Client comments received — grade this drawing in the Comment Reviewer app, not here">
-        Review in Comment Reviewer
-      </button>
+    // Client comments are reviewed in Drawboard, then graded here — Log Status moves the
+    // comment PDFs to Client Comments/Reviewed/R_… (the Comment Reviewer app is retired).
+    else if (colId === "signoff" || colId === "awaiting-comments" || colId === "comments") primary = (
+      <button className="k-act go" onClick={(e) => { e.stopPropagation(); setLogStatusTarget(s); }}
+        title={colId === "comments" ? "Review the comment PDF in Drawboard, then grade" : "Log the client grade"}>Grade</button>
     );
     return (<>{primary}{hold}</>);
   };
