@@ -121,7 +121,7 @@ All routes are mounted from `drawing-flow.js` under `/api/df/`.
 | `PATCH` | `/api/df/submissions/:id/issue` | Confirms official issue. Updates status to Issued and fires `move-files` to move the PDF from `03_Ready For Issue/` to `04_Issued/` (name unchanged). |
 | `PATCH` | `/api/df/submissions/:id/bounce` | Bounces a submission back to DT. Increments QA round, returns Dropbox move instructions. |
 | `PATCH` | `/api/df/submissions/:id/log-status` | Logs client grade. Updates MDS grade fields; fires `move-files` for client comments (→ Reviewed/R_) A4.5 Rejected (→ 05_Client Comments, renamed) and A4.5 Approved (→ 06_Signed Off). |
-| `POST` | `/api/df/cr-ingest` | Called by Make Scenario 3 per client comment PDF. Stage from the Issued submission (or legacy stage folder); stores the path in `Comment Paths`. |
+| `POST` | `/api/df/cr-ingest` | Called by Make Scenario 3 per client comment PDF named `{YYMMDD}_{Commenter}_{Item}_{Stage}_{Rev}_{DrawingNo}.pdf` (e.g. `260604_F&P_200_S4_P01_EIT-TMJ-AA-B3-D-I-24217.PDF`). Stage and rev come from the name and pick the Issued submission; Rev may be omitted. Older `{Client}_{YYMMDD}_{DrawingNo}_{Rev}.pdf` names still work (stage from the Issued submission or legacy stage folder). Comments are tracked for S4 / S5 / A4.5. Stores the path in `Comment Paths`; problems show in the ingest feed. |
 
 ### Notifications
 
@@ -224,7 +224,7 @@ The backend writes to these MDS properties on Approve, Bounce, and Log Status:
               ├── 03_Ready For Issue/   ← Approve moves the PDF here (filename unchanged); DT email links here; DTs add DWGs here
               ├── 04_Issued/            ← Issue (cockpit) moves the PDF here, filename unchanged (DWGs stay in 03)
               ├── 05_Client Comments/   ← all client returns (architect or principal contractor), told apart by filename:
-              │     │                     client comment PDFs (DM drops in): {Client}_{YYMMDD}_{DrawingNo}_{Rev}.pdf
+              │     │                     client comment PDFs (DM drops in): {YYMMDD}_{Commenter}_{Item}_{Stage}_{Rev}_{DrawingNo}.pdf
               │     │                     A4.5 (C01) Rejected (Log Status):  {Item}_{Stage}_{Rev}_{DrawingNo}_Rejected_{YYMMDD}.pdf
               │     └── Reviewed/       ← graded comment PDFs moved here as R_{original name}
               └── 06_Signed Off/        ← A4.5 (C01) Approved: Log Status moves the PDF here from 04_Issued, filename unchanged

@@ -1,7 +1,7 @@
 // Unit tests for the pure path/filename helpers in drawing-flow.js.  Run: node tests/parsing.test.js
 const fs = require("fs"), vm = require("vm"), assert = require("assert");
 const src = fs.readFileSync(fs.existsSync(__dirname + "/drawing-flow.js") ? __dirname + "/drawing-flow.js" : __dirname + "/../drawing-flow.js", "utf8") +
-  "\n;module.exports.__t = { parsePath, parseFilename, parseSubmissionName, computeDropboxMove, gradeReturnsFolder, toShortDropboxPath, locateProject, computeReviewedMove, computeGradeReturnMove, computeIssueMove, computeSignedOffMove, isGradeReturnName };";
+  "\n;module.exports.__t = { parsePath, parseFilename, parseSubmissionName, computeDropboxMove, gradeReturnsFolder, toShortDropboxPath, locateProject, computeReviewedMove, computeGradeReturnMove, computeIssueMove, computeSignedOffMove, isGradeReturnName, parseClientCommentName };";
 const mod = { exports: {} };
 vm.runInNewContext(src, { module: mod, exports: mod.exports, require: (n) => n === "@netlify/blobs" ? { getStore(){} } : require(n), process, console, Date });
 const t = mod.exports.__t;
@@ -111,5 +111,20 @@ ok("reviewed move legacy stage-level", () => assert.strictEqual(t.computeReviewe
   full(`${P}/S4/Client Comments/Reviewed/R_MC_260910_A-101_P01.pdf`)));
 ok("reviewed move skips already-reviewed", () => { assert.strictEqual(t.computeReviewedMove(`${P}/Client Comments/Reviewed/R_x.pdf`), null);
   assert.strictEqual(t.computeReviewedMove(`${P}/Client Comments/R_x.pdf`), null); });
+// ---- Client comment names
+ok("client comment: Greig's example", () => assert.deepStrictEqual({...t.parseClientCommentName("260604_F&P_200_S4_P01_EIT-TMJ-AA-B3-D-I-24217")},
+  { ok: true, format: "current", date: "260604", commenter: "F&P", itemNo: "200", stage: "S4", revision: "P01", drawingNo: "EIT-TMJ-AA-B3-D-I-24217" }));
+ok("client comment: rev left out", () => { const r = t.parseClientCommentName("260604_F&P_200_S5_EIT-TMJ-AA-B3-D-I-24217");
+  assert.strictEqual(r.ok, true); assert.strictEqual(r.revision, null); assert.strictEqual(r.stage, "S5"); assert.strictEqual(r.drawingNo, "EIT-TMJ-AA-B3-D-I-24217"); });
+ok("client comment: rev after drawing no / lower-case stage", () => { const r = t.parseClientCommentName("260604_PC_200_a4.5_EIT-TMJ-AA-B3-D-I-24217_C01");
+  assert.strictEqual(r.stage, "A4.5"); assert.strictEqual(r.revision, "C01"); assert.strictEqual(r.drawingNo, "EIT-TMJ-AA-B3-D-I-24217"); });
+ok("client comment: older {Client}_{YYMMDD}_{DrawingNo}_{Rev} still parses", () => { const r = t.parseClientCommentName("MC_260910_A-101_P02");
+  assert.strictEqual(r.format, "older"); assert.strictEqual(r.commenter, "MC"); assert.strictEqual(r.drawingNo, "A-101"); assert.strictEqual(r.revision, "P02"); assert.strictEqual(r.stage, null); });
+ok("client comment: bad names rejected with a reason", () => {
+  assert.match(t.parseClientCommentName("260604_F&P_200_S6_P01_A-101").error, /isn't a stage/);
+  assert.match(t.parseClientCommentName("260604_F&P_X1_S4_P01_A-101").error, /item number/);
+  assert.match(t.parseClientCommentName("260604_F&P_200_S4_P01_A 101_extra").error, /drawing number/);
+  assert.match(t.parseClientCommentName("comments from F&P").error, /should be/); });
+ok("client comment names never look like C01 returns", () => assert.ok(!t.isGradeReturnName("260604_F&P_200_S4_P01_EIT-TMJ-AA-B3-D-I-24217.PDF")));
 ok("short path roundtrip", () => assert.strictEqual(t.toShortDropboxPath(full(`${P}/03_Ready For Issue/x.pdf`)), `${P}/03_Ready For Issue/x.pdf`));
 console.log(`\n${n} tests passed`);

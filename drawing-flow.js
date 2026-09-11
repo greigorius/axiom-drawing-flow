@@ -151,7 +151,7 @@ const DROPBOX_ROOT = "/DESIGN KNOW HOW/TMJ Interiors";
 //     03_Ready For Issue/    ← Approve moves the file here, filename unchanged; DTs add DWGs here
 //     04_Issued/             ← Issue (cockpit) moves the PDF here, filename unchanged
 //     05_Client Comments/    ← all client returns, told apart by filename:
-//                               client comment PDFs  {Client}_{YYMMDD}_{DrawingNo}_{Rev}.pdf  (graded → Reviewed/R_{name})
+//                               client comment PDFs  {YYMMDD}_{Commenter}_{Item}_{Stage}_{Rev}_{DrawingNo}.pdf  (graded → Reviewed/R_{name})
 //                               A4.5 (C01) Rejected  {Item}_{Stage}_{Rev}_{DrawingNo}_Rejected_{YYMMDD}.pdf
 //     06_Signed Off/         ← A4.5 (C01) Approved: the PDF moves here from 04_Issued, filename unchanged
 //
@@ -401,6 +401,43 @@ const ITEM_RE     = /^\d{1,4}$/;                 // 003, 112
 const REV_RE      = /^[A-Z]{1,2}\d{1,3}[A-Z]?$/; // P01, C01, P01A
 const INITIALS_RE = /^[A-Z]{2,4}$/;              // GF, AI
 const DRAWING_NO_RE = /^[A-Z0-9][A-Z0-9.\-]*$/i;  // EIT-TMJ-AA-B2-D-I-45120
+
+// Client comment PDF names (dropped into {ProjectNo}/05_Client Comments by the DM):
+//   current: {YYMMDD}_{Commenter}_{Item}_{Stage}_{Rev}_{DrawingNo}   e.g. 260604_F&P_200_S4_P01_EIT-TMJ-AA-B3-D-I-24217
+//            Rev may be left out, or put after the drawing number — the Issued submission fills it in.
+//   older:   {Commenter}_{YYMMDD}_{DrawingNo}_{Rev}                  e.g. MC_260910_EIT-TMJ-AA-B2-D-I-45120_P02
+// Returns { ok: true, format, date, commenter, itemNo, stage, revision, drawingNo } or { ok: false, error }.
+const CLIENT_COMMENT_NAME_HINT = "{YYMMDD}_{Commenter}_{Item}_{Stage}_{Rev}_{DrawingNo}.pdf";
+function parseClientCommentName(baseName) {
+  const parts = (baseName || "").trim().split("_").filter((x) => x !== "");
+  const isDate = (x) => /^\d{6}$/.test(x || "");
+  const isRev  = (x) => REV_RE.test((x || "").toUpperCase());
+  const bad = (error) => ({ ok: false, error });
+
+  if (isDate(parts[0])) {
+    if (parts.length < 5) return bad(`Too few sections — expected ${CLIENT_COMMENT_NAME_HINT}`);
+    const [date, commenter, itemNo, stageRaw, ...rest] = parts;
+    const stage = (stageRaw || "").toUpperCase();
+    if (!ITEM_RE.test(itemNo)) return bad(`"${itemNo}" isn't an item number — expected ${CLIENT_COMMENT_NAME_HINT}`);
+    if (!VALID_STAGES.includes(stage)) return bad(`"${stageRaw}" isn't a stage (${VALID_STAGES.join(" / ")}) — expected ${CLIENT_COMMENT_NAME_HINT}`);
+    let revision = null, dwgParts = rest;
+    if (rest.length >= 2 && isRev(rest[0]))                    { revision = rest[0].toUpperCase();               dwgParts = rest.slice(1); }
+    else if (rest.length >= 2 && isRev(rest[rest.length - 1])) { revision = rest[rest.length - 1].toUpperCase(); dwgParts = rest.slice(0, -1); }
+    if (dwgParts.length !== 1 || !DRAWING_NO_RE.test(dwgParts[0])) {
+      return bad(`Couldn't read the drawing number from "${dwgParts.join("_")}" — expected ${CLIENT_COMMENT_NAME_HINT}`);
+    }
+    return { ok: true, format: "current", date, commenter, itemNo, stage, revision, drawingNo: dwgParts[0] };
+  }
+
+  if (parts.length >= 4 && isDate(parts[1])) {
+    return { ok: true, format: "older", date: parts[1], commenter: parts[0], itemNo: null, stage: null,
+             revision: parts[parts.length - 1].toUpperCase(), drawingNo: parts.slice(2, -1).join("_") };
+  }
+  return bad(`Client comment filename should be ${CLIENT_COMMENT_NAME_HINT}`);
+}
+
+// Stages whose client comments are tracked on the MDS (`<stage> Comment Files` / `<stage> Client Reviewers`).
+const COMMENT_STAGES = ["S4", "S5", "A4.5"];
 
 // Parses a submission name WITHOUT caring about the extension (so it also works for DWGs).
 //   new:    {Item}_{Stage}_{Rev}_{DrawingNo}_{DTInitials}   e.g. 003_S4_P01_EIT-TMJ-AA-B2-D-I-45120_GF
@@ -1839,7 +1876,7 @@ module.exports = function mountDrawingFlow(app, notion) {
             : bucket.returnKind === "signed-off"
             ? "Signed-off C01 drawings — filename unchanged"
             : bucket.returnKind === "reviewed"
-              ? "Client comments reviewed by the DM — files prefixed <code>R_</code>, named <code>R_{Client}_{YYMMDD}_{DrawingNo}_{Rev}.pdf</code>"
+              ? "Client comments reviewed by the DM — files prefixed <code>R_</code>, named <code>R_{YYMMDD}_{Commenter}_{Item}_{Stage}_{Rev}_{DrawingNo}.pdf</code>"
               : "No marked-up file for these — see the grade and action.";
           const filenameFormatNote =
             `<tr><td colspan="6" style="padding:4px 8px 10px;font-size:11px;color:#888;font-style:italic;">${note}</td></tr>`;
@@ -1996,9 +2033,10 @@ module.exports = function mountDrawingFlow(app, notion) {
   // Called by the Make cr-ingest scenario (Scenario 3) once per client-comment PDF found in a
   // Client Comments/ folder. Body: { filePath | dropboxPath, shareLink, filename }
   //
-  // Filename: {ClientAcronym}_{YYMMDD}_{DrawingNo}_{Rev}.pdf
-  // Folder:   {ProjectNo}/Client Comments/            (new — stage taken from the Issued submission)
-  //           {ProjectNo}/{Stage}/Client Comments/    (legacy — stage taken from the folder)
+  // Filename: {YYMMDD}_{Commenter}_{Item}_{Stage}_{Rev}_{DrawingNo}.pdf  — stage (and rev) from the name
+  //           {Commenter}_{YYMMDD}_{DrawingNo}_{Rev}.pdf                  — older names still work
+  // Folder:   {ProjectNo}/05_Client Comments/         (stage from the filename, else the Issued submission)
+  //           {ProjectNo}/{Stage}/Client Comments/    (legacy — stage from the folder)
   //
   // Effects:
   //   MDS drawing   → appends the file (hyperlinked) to `<stage> Comment Files` and the client to
@@ -2025,44 +2063,55 @@ module.exports = function mountDrawingFlow(app, notion) {
         return res.json({ ok: true, skipped: true, reason: "grade return, not a client comment" });
       }
 
-      // Parse {ClientAcronym}_{YYMMDD}_{DrawingNo}_{Rev}.pdf
-      const baseName = name.replace(/\.pdf$/i, "");
-      const parts = baseName.split("_");
-      if (parts.length < 4) {
-        await addNotification({ type: "error", filename: name, message: "Client comment filename should be {Client}_{YYMMDD}_{DrawingNo}_{Rev}.pdf" });
-        return res.status(400).json({ ok: false, error: `Could not parse filename: ${name}` });
+      const parsed = parseClientCommentName(name.replace(/\.pdf$/i, ""));
+      if (!parsed.ok) {
+        await addNotification({ type: "error", filename: name, message: parsed.error });
+        return res.status(400).json({ ok: false, error: `Could not parse filename: ${name} — ${parsed.error}` });
       }
-      const clientAcronym = parts[0];
-      const revision      = parts[parts.length - 1].toUpperCase();
-      const drawingNo     = parts.slice(2, parts.length - 1).join("_");
+      const { drawingNo, revision, itemNo } = parsed;
+      const clientAcronym = parsed.commenter;
 
       const matches = await queryAll(notion, DRAWINGS_DB, {
         property: "Drawing Number", title: { contains: drawingNo },
       });
-      if (!matches.length) {
-        await addNotification({ type: "error", filename: name, message: `No MDS drawing for ${drawingNo}` });
-        return res.json({ ok: true, matched: false, note: `No MDS drawing for ${drawingNo}` });
+      // "contains" also matches longer numbers (…-2421 inside …-24217) — prefer the exact one.
+      const drawing = matches.find((m) => (getProp(m, "Drawing Number", "title") || "").trim().toUpperCase() === drawingNo.toUpperCase())
+                   ?? (matches.length === 1 ? matches[0] : null);
+      if (!drawing) {
+        const message = matches.length ? `${matches.length} MDS drawings partly match ${drawingNo}, none exactly — check the drawing number` : `No MDS drawing for ${drawingNo}`;
+        await addNotification({ type: "error", filename: name, message });
+        return res.json({ ok: true, matched: false, note: message });
       }
-      const drawing = matches[0];
 
-      // Stage: a legacy stage folder in the path wins; otherwise it comes from the drawing's
+      // Stage: the filename says (current naming); else a legacy stage folder; else the drawing's
       // Issued submission (matching the comment's rev when there's more than one).
       const loc         = locateProject(pathStr);
       const folderStage = loc?.stageSeg ? loc.stageSeg.toUpperCase() : null;
+      const knownStage  = parsed.stage || folderStage;
+      if (knownStage && !COMMENT_STAGES.includes(knownStage)) {
+        const message = `Client comments aren't tracked for ${knownStage} — only ${COMMENT_STAGES.join(" / ")}`;
+        await addNotification({ type: "error", filename: name, message });
+        return res.json({ ok: true, matched: false, note: message });
+      }
       const issued = await queryAll(notion, SUBMISSIONS_DB, {
         and: [
           { property: "Drawing", relation: { contains: drawing.id } },
           { property: "Status",  select:   { equals: "Issued"     } },
-          ...(folderStage ? [{ property: "Stage", select: { equals: folderStage } }] : []),
+          ...(knownStage ? [{ property: "Stage", select: { equals: knownStage } }] : []),
         ],
       });
       const byRound  = (a, b) => (getProp(b, "QA Round", "number") ?? 0) - (getProp(a, "QA Round", "number") ?? 0);
-      const revMatch = issued.filter((p) => (getProp(p, "Revision", "select") || "").toUpperCase() === revision);
+      const revMatch = revision ? issued.filter((p) => (getProp(p, "Revision", "select") || "").toUpperCase() === revision) : [];
       const target   = (revMatch.length ? revMatch : issued).sort(byRound)[0] ?? null;
-      const stage    = folderStage || (target ? getProp(target, "Stage", "select") : null);
+      const stage    = knownStage || (target ? getProp(target, "Stage", "select") : null);
 
       if (!stage) {
         const message = `No Issued submission for ${drawingNo} — can't tell which stage these comments belong to`;
+        await addNotification({ type: "error", filename: name, message });
+        return res.json({ ok: true, matched: false, note: message });
+      }
+      if (!COMMENT_STAGES.includes(stage)) {
+        const message = `Client comments aren't tracked for ${stage} — only ${COMMENT_STAGES.join(" / ")}`;
         await addNotification({ type: "error", filename: name, message });
         return res.json({ ok: true, matched: false, note: message });
       }
@@ -2119,8 +2168,10 @@ module.exports = function mountDrawingFlow(app, notion) {
       }
 
       console.log(`[cr-ingest] ${name} → ${drawingNo} ${stage} (${clientAcronym})`);
-      await addNotification({ type: "success", filename: name, message: `Client comments (${clientAcronym}) logged against ${drawingNo} ${stage}` });
-      res.json({ ok: true, matched: true, drawingId: drawing.id, submissionId, stage, clientAcronym, drawingNo });
+      const noCard = target ? "" : ` — no Issued ${stage} submission${revision ? ` at ${revision}` : ""}, so no card moved; check the stage/rev in the filename`;
+      await addNotification({ type: target ? "success" : "error", filename: name,
+        message: `Client comments (${clientAcronym}) logged against ${drawingNo} ${stage}${noCard}` });
+      res.json({ ok: true, matched: true, drawingId: drawing.id, submissionId, stage, clientAcronym, drawingNo, itemNo, revision });
     } catch (err) {
       console.error("[cr-ingest]", err);
       res.status(500).json({ ok: false, error: err.message });

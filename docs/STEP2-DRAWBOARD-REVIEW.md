@@ -26,7 +26,7 @@
    Either way, the folder link reaches the DT in the next *Send DT Email*.
 
 ### Client comments (S4 / S5)
-1. Save the client's PDF to `{Project}/Client Comments/` as `{Client}_{YYMMDD}_{DrawingNo}_{Rev}.pdf`. The old `{Project}/{Stage}/Client Comments/` folders also still work.
+1. Save the client's PDF to `{Project}/05_Client Comments/` as `{YYMMDD}_{Commenter}_{Item}_{Stage}_{Rev}_{DrawingNo}.pdf` (e.g. `260604_F&P_200_S4_P01_EIT-TMJ-AA-B3-D-I-24217.PDF`; *updated 11 Sept — was `{Client}_{YYMMDD}_{DrawingNo}_{Rev}.pdf`, which still works*). The old `{Project}/{Stage}/Client Comments/` folders also still work.
 2. **Scan Comments.** The card moves to **Review Client Comments**. The stage comes from the drawing's Issued submission, matched on Rev, so the folder doesn't need a stage. The file path is saved to the submission's `Comment Paths`.
 3. Review it in Drawboard. Sync, then close.
 4. **Grade** in the Hub (A / B / C / NA). Every logged comment PDF for that drawing moves to `Client Comments/Reviewed/R_{name}`. *Send DT Email* then points the DT at that Reviewed folder.

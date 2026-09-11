@@ -194,6 +194,35 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(r.json.stage, "S4");
   ok("cr-ingest (legacy stage folder) → stage from folder");
 
+  // Current naming: {YYMMDD}_{Commenter}_{Item}_{Stage}_{Rev}_{DrawingNo} — stage + rev from the name
+  submissions = [issued("subS4", "S4", "P01"), issued("subS5", "S5", "P02")];
+  updates.length = 0;
+  r = await call("POST /api/df/cr-ingest", { body: { filePath: `${R}/24-367/05_Client Comments/260604_F&P_003_S4_P01_${DWG}.PDF`, filename: `260604_F&P_003_S4_P01_${DWG}.PDF` } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  assert.strictEqual(r.json.stage, "S4"); assert.strictEqual(r.json.submissionId, "subS4"); assert.strictEqual(r.json.clientAcronym, "F&P");
+  const s4Dwg = updates.find((u) => u.page_id === "dwg1").properties;
+  assert.ok(s4Dwg["S4 Comment Files"]); assert.strictEqual(JSON.stringify(s4Dwg["S4 Client Reviewers"].multi_select), JSON.stringify([{ name: "F&P" }]));
+  assert.ok(updates.find((u) => u.page_id === "subS4")); assert.ok(!updates.find((u) => u.page_id === "subS5"));
+  ok("cr-ingest: 260604_F&P_003_S4_P01_{DrawingNo}.PDF → S4 submission (stage from filename, not the newer S5)");
+
+  // Stage in the name with no Issued submission at that stage → logged, flagged in the feed, no card moved
+  submissions = [issued("subS5", "S5", "P02")];
+  updates.length = 0; feed.length = 0;
+  r = await call("POST /api/df/cr-ingest", { body: { filePath: `${R}/24-367/05_Client Comments/260604_F&P_003_S4_P01_${DWG}.pdf` } });
+  assert.strictEqual(r.json.submissionId, null); assert.ok(!updates.find((u) => u.page_id === "subS5"));
+  assert.strictEqual(feed[0].type, "error"); assert.match(feed[0].message, /no Issued S4 submission at P01/);
+  ok("cr-ingest: no Issued submission at the filename's stage → flagged in the feed");
+
+  // Bad name → clear feed message
+  feed.length = 0;
+  r = await call("POST /api/df/cr-ingest", { body: { filePath: `${R}/24-367/05_Client Comments/260604_F&P_003_S6_P01_${DWG}.pdf` } });
+  assert.strictEqual(r.status, 400); assert.match(feed[0].message, /isn't a stage/);
+  r = await call("POST /api/df/cr-ingest", { body: { filePath: `${R}/24-367/05_Client Comments/260604_F&P_003_AB_P01_${DWG}.pdf` } });
+  assert.match(r.json.note, /aren't tracked for AB/);
+  ok("cr-ingest: bad stage / untracked stage → feed explains why");
+
+  r = await call("POST /api/df/cr-ingest", { body: { filePath: `${R}/24-367/05_Client Comments/Reviewed/R_260604_F&P_003_S4_P01_${DWG}.pdf` } });
+  assert.strictEqual(r.json.skipped, true);
   r = await call("POST /api/df/cr-ingest", { body: { filePath: `${R}/24-367/05_Client Comments/Reviewed/R_MC_260910_${DWG}_P02.pdf` } });
   assert.strictEqual(r.json.skipped, true);
   ok("cr-ingest ignores Reviewed/R_ files");
