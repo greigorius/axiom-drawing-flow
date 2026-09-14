@@ -197,8 +197,15 @@ function toShortDropboxPath(fullPath) {
     : fullPath;
 }
 
+// DTs type the A4.5 stage various ways ("A45", "A4-5") because dots read oddly in filenames.
+// Everything downstream uses the canonical "A4.5".
+const STAGE_ALIASES = { "A45": "A4.5", "A4-5": "A4.5" };
+function normalizeStage(seg) {
+  const raw = (seg || "").trim().toUpperCase();
+  return STAGE_ALIASES[raw] || raw;
+}
 function isStage(seg) {
-  return VALID_STAGES.includes((seg || "").toUpperCase());
+  return VALID_STAGES.includes(normalizeStage(seg));
 }
 
 // Finds the Drawing Submissions/{ProjectNo} anchor in any Dropbox path.
@@ -417,7 +424,7 @@ function parseClientCommentName(baseName) {
   if (isDate(parts[0])) {
     if (parts.length < 5) return bad(`Too few sections — expected ${CLIENT_COMMENT_NAME_HINT}`);
     const [date, commenter, itemNo, stageRaw, ...rest] = parts;
-    const stage = (stageRaw || "").toUpperCase();
+    const stage = normalizeStage(stageRaw);
     if (!ITEM_RE.test(itemNo)) return bad(`"${itemNo}" isn't an item number — expected ${CLIENT_COMMENT_NAME_HINT}`);
     if (!VALID_STAGES.includes(stage)) return bad(`"${stageRaw}" isn't a stage (${VALID_STAGES.join(" / ")}) — expected ${CLIENT_COMMENT_NAME_HINT}`);
     let revision = null, dwgParts = rest;
@@ -472,7 +479,7 @@ function parseSubmissionName(baseName, { requireInitials = true } = {}) {
       dtInitials = initialsRaw.toUpperCase();
       if (!INITIALS_RE.test(dtInitials)) return fail(`5th section "${initialsRaw}" should be your initials (2–4 letters, e.g. GF)`);
     }
-    return { ok: true, format: "v2", itemNo, stage: stageRaw.toUpperCase(), revision, drawingNo: drawingRaw.toUpperCase(), dtInitials };
+    return { ok: true, format: "v2", itemNo, stage: normalizeStage(stageRaw), revision, drawingNo: drawingRaw.toUpperCase(), dtInitials };
   }
 
   // Legacy convention — only valid in the old per-stage Pending folders (ingest enforces that).
@@ -2086,7 +2093,7 @@ module.exports = function mountDrawingFlow(app, notion) {
       // Stage: the filename says (current naming); else a legacy stage folder; else the drawing's
       // Issued submission (matching the comment's rev when there's more than one).
       const loc         = locateProject(pathStr);
-      const folderStage = loc?.stageSeg ? loc.stageSeg.toUpperCase() : null;
+      const folderStage = loc?.stageSeg ? normalizeStage(loc.stageSeg) : null;
       const knownStage  = parsed.stage || folderStage;
       if (knownStage && !COMMENT_STAGES.includes(knownStage)) {
         const message = `Client comments aren't tracked for ${knownStage} — only ${COMMENT_STAGES.join(" / ")}`;
@@ -2441,7 +2448,7 @@ module.exports = function mountDrawingFlow(app, notion) {
     // into {ProjectNo}/03_Ready For Issue/, so take the stage from the filename if it follows
     // {Item}_{Stage}_{Rev}_{DrawingNo}[_{Initials}]. If neither gives a stage, match every Approved
     // submission with BIC=DT for the project.
-    let stage = isStage(parts[dsIdx + 2]) ? parts[dsIdx + 2].toUpperCase() : null;
+    let stage = isStage(parts[dsIdx + 2]) ? normalizeStage(parts[dsIdx + 2]) : null;
     if (!stage) {
       const fname = parts[parts.length - 1] || "";
       const dot   = fname.lastIndexOf(".");

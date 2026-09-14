@@ -234,6 +234,8 @@ Folder matching ignores the `NN_` prefix, so un-numbered folders (`Pending`, `Re
 If a Pending folder is renamed, files that re-surface at the new path are matched to their existing
 Submitted row by filename and repointed — not ingested twice.
 
+Stage in a filename may be written `A45` or `A4-5` as well as `A4.5` — all three are read as A4.5.
+
 C01 return file name: `{Item}_{Stage}_{Rev}_{DrawingNo}_{Grade}_{YYMMDD}.pdf`. Scan Comments skips any file
 named like this (backend and Make filter), so it's never mistaken for a client comment.
 Legacy stage-level `{Project}/{Stage}/Client Comments/` folders still work (stage taken from the folder).

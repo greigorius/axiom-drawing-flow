@@ -111,6 +111,16 @@ ok("reviewed move legacy stage-level", () => assert.strictEqual(t.computeReviewe
   full(`${P}/S4/Client Comments/Reviewed/R_MC_260910_A-101_P01.pdf`)));
 ok("reviewed move skips already-reviewed", () => { assert.strictEqual(t.computeReviewedMove(`${P}/Client Comments/Reviewed/R_x.pdf`), null);
   assert.strictEqual(t.computeReviewedMove(`${P}/Client Comments/R_x.pdf`), null); });
+// ---- Stage aliases (DTs write A45 as often as A4.5)
+ok("A45 filename ingests as A4.5", () => { const r = t.parseSubmissionName("200_A45_C01_EIT-TMJ-AA-B3-SK-I-45104_JC");
+  assert.strictEqual(r.ok, true); assert.strictEqual(r.stage, "A4.5"); assert.strictEqual(r.revision, "C01"); assert.strictEqual(r.drawingNo, "EIT-TMJ-AA-B3-SK-I-45104"); });
+ok("A4.5 and a4-5 still fine, S6 still rejected", () => {
+  assert.strictEqual(t.parseSubmissionName("200_A4.5_C01_A-101_JC").stage, "A4.5");
+  assert.strictEqual(t.parseSubmissionName("200_a4-5_C01_A-101_JC").stage, "A4.5");
+  assert.strictEqual(t.parseSubmissionName("200_S6_C01_A-101_JC").ok, false); });
+ok("A45 pending path parses", () => assert.strictEqual(t.parsePath(`${P}/01_Pending/200_A45_C01_A-101_JC.pdf`).projectNo, "24-367"));
+ok("client comment with A45 stage", () => assert.strictEqual(t.parseClientCommentName("260604_PC_200_A45_C01_EIT-TMJ-AA-B3-D-I-24217").stage, "A4.5"));
+
 // ---- Client comment names
 ok("client comment: Greig's example", () => assert.deepStrictEqual({...t.parseClientCommentName("260604_F&P_200_S4_P01_EIT-TMJ-AA-B3-D-I-24217")},
   { ok: true, format: "current", date: "260604", commenter: "F&P", itemNo: "200", stage: "S4", revision: "P01", drawingNo: "EIT-TMJ-AA-B3-D-I-24217" }));
