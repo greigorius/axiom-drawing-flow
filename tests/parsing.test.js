@@ -1,7 +1,7 @@
 // Unit tests for the pure path/filename helpers in drawing-flow.js.  Run: node tests/parsing.test.js
 const fs = require("fs"), vm = require("vm"), assert = require("assert");
 const src = fs.readFileSync(fs.existsSync(__dirname + "/drawing-flow.js") ? __dirname + "/drawing-flow.js" : __dirname + "/../drawing-flow.js", "utf8") +
-  "\n;module.exports.__t = { parsePath, parseFilename, parseSubmissionName, computeDropboxMove, gradeReturnsFolder, toShortDropboxPath, locateProject, computeReviewedMove, computeGradeReturnMove, computeIssueMove, computeSignedOffMove, isGradeReturnName, parseClientCommentName };";
+  "\n;module.exports.__t = { parsePath, parseFilename, parseSubmissionName, computeDropboxMove, gradeReturnsFolder, toShortDropboxPath, locateProject, computeReviewedMove, computeGradeReturnMove, computeIssueMove, computeSignedOffMove, isGradeReturnName, parseClientCommentName, parseSubmissionTitle, padItemNo, itemNoFromTaskName };";
 const mod = { exports: {} };
 vm.runInNewContext(src, { module: mod, exports: mod.exports, require: (n) => n === "@netlify/blobs" ? { getStore(){} } : require(n), process, console, Date });
 const t = mod.exports.__t;
@@ -111,6 +111,26 @@ ok("reviewed move legacy stage-level", () => assert.strictEqual(t.computeReviewe
   full(`${P}/S4/Client Comments/Reviewed/R_MC_260910_A-101_P01.pdf`)));
 ok("reviewed move skips already-reviewed", () => { assert.strictEqual(t.computeReviewedMove(`${P}/Client Comments/Reviewed/R_x.pdf`), null);
   assert.strictEqual(t.computeReviewedMove(`${P}/Client Comments/R_x.pdf`), null); });
+// ---- Derivative items (Suffix 200 vs Suffix 200_1)
+ok("derivative item in a filename", () => { const r = t.parseSubmissionName("200_1_S4_P01_EIT-TMJ-AA-B3-D-I-24217_GF");
+  assert.strictEqual(r.ok, true); assert.strictEqual(r.itemNo, "200_1"); assert.strictEqual(r.stage, "S4");
+  assert.strictEqual(r.revision, "P01"); assert.strictEqual(r.drawingNo, "EIT-TMJ-AA-B3-D-I-24217"); assert.strictEqual(r.dtInitials, "GF"); });
+ok("plain item unaffected", () => assert.strictEqual(t.parseSubmissionName("200_S4_P01_A-101_GF").itemNo, "200"));
+ok("item padding keeps the derivative", () => { assert.strictEqual(t.padItemNo("3"), "003");
+  assert.strictEqual(t.padItemNo("3_1"), "003_1"); assert.strictEqual(t.padItemNo("200_1"), "200_1"); });
+ok("item read off the task name, exactly", () => {
+  assert.strictEqual(t.itemNoFromTaskName("Suffix 200 - LIN-804 Soft Cell Wall Panelling"), "200");
+  assert.strictEqual(t.itemNoFromTaskName("Suffix 200_1 - LIN-804 … Lobby"), "200_1");
+  assert.strictEqual(t.itemNoFromTaskName("Suffix 22 - Risers"), "022");
+  assert.strictEqual(t.itemNoFromTaskName("001-24-354 Document Control (MW)"), null); });
+ok("submission title round-trips a derivative item", () => {
+  assert.deepStrictEqual({...t.parseSubmissionTitle("24-367-200_1_EIT-TMJ-AA-B3-D-I-24217_S4_R2", "S4")},
+    { taskCode: "24-367-200_1", drawingNo: "EIT-TMJ-AA-B3-D-I-24217" });
+  assert.deepStrictEqual({...t.parseSubmissionTitle("24-367-003_EIT-TMJ-AA-B2-D-I-45120_A4.5_R1", "A4.5")},
+    { taskCode: "24-367-003", drawingNo: "EIT-TMJ-AA-B2-D-I-45120" }); });
+ok("client comment for a derivative item", () => { const r = t.parseClientCommentName("260604_F&P_200_1_S4_P01_EIT-TMJ-AA-B3-D-I-24217");
+  assert.strictEqual(r.itemNo, "200_1"); assert.strictEqual(r.stage, "S4"); assert.strictEqual(r.drawingNo, "EIT-TMJ-AA-B3-D-I-24217"); });
+
 // ---- Stage aliases (DTs write A45 as often as A4.5)
 ok("A45 filename ingests as A4.5", () => { const r = t.parseSubmissionName("200_A45_C01_EIT-TMJ-AA-B3-SK-I-45104_JC");
   assert.strictEqual(r.ok, true); assert.strictEqual(r.stage, "A4.5"); assert.strictEqual(r.revision, "C01"); assert.strictEqual(r.drawingNo, "EIT-TMJ-AA-B3-SK-I-45104"); });

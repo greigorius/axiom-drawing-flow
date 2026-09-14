@@ -19,6 +19,9 @@ const sel   = (n) => ({ select: n ? { name: n } : null });
 const pages = {
   task1: { id: "task1", properties: { "Item Name": title("Suffix 003 Reception desk"), "Item No.": { formula: { type: "string", string: "003" } }, "Person": rel("dtAI") } },
   task2: { id: "task2", properties: { "Item Name": title("Suffix 004 Bar"), "Item No.": { formula: { type: "string", string: "004" } }, "Person": rel() } },
+  // Real pair from the Tasks DB: a base item and its derivative, whose Item No. formula reads the same.
+  task200:  { id: "task200",  properties: { "Item Name": title("Suffix 200 - LIN-804 Soft Cell Wall Panelling"), "Item No.": { formula: { type: "string", string: "200" } }, "Person": rel("dtAI") } },
+  task200d: { id: "task200d", properties: { "Item Name": title("Suffix 200_1 - LIN-804 Soft Cell Wall Panelling - Lobby"), "Item No.": { formula: { type: "string", string: "200" } }, "Person": rel("dtAI") } },
   dwg1:  { id: "dwg1", properties: { "Drawing Number": title("EIT-TMJ-AA-B2-D-I-45120"), "Dwg No. Assigned": sel(null) } },
   dtGF:  { id: "dtGF", properties: { "Name": title("Greig Fensome"), "Email": { email: "g@x.com" } } },
   dtAI:  { id: "dtAI", properties: { "Name": title("Andrew Isted"), "Email": { email: "a@x.com" } } },
@@ -40,7 +43,13 @@ const match = (page, f) => {
 const notion = {
   databases: { query: async ({ database_id, filter, sorts }) => {
     const f = JSON.stringify(filter);
-    if (database_id === "TASKS") return { results: f.includes("Suffix 003") ? [pages.task1] : f.includes("Suffix 004") ? [pages.task2] : [] };
+    if (database_id === "TASKS") return { results:
+      f.includes("Suffix 003")   ? [pages.task1]
+      : f.includes("Suffix 004") ? [pages.task2]
+      // Notion's "contains" returns the derivative too — order deliberately puts it first.
+      : f.includes("Suffix 200_1") ? [pages.task200d]
+      : f.includes("Suffix 200")   ? [pages.task200d, pages.task200]
+      : [] };
     if (database_id === "DWGS")  return { results: [pages.dwg1] };
     if (database_id === "TEAM")  return { results: [pages.dtGF, pages.dtAI] };
     if (database_id === "SUBS") {
@@ -99,12 +108,27 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.match(feed[0].message, /no DT matched initials "ZZ"/);
   ok("unknown initials → falls back to Item Person + flagged");
 
+  // Derivative items: 200 and 200_1 are different items and must not be confused
+  r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/01_Pending/200_S4_P01_${DWG}_AI.pdf` } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  let pi = created[created.length - 1].properties;
+  assert.strictEqual(pi.Item.relation[0].id, "task200");
+  assert.strictEqual(pi.Submission.title[0].text.content, `24-367-200_${DWG}_S4_R1`);
+  r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/01_Pending/200_1_S4_P01_${DWG}_AI.pdf` } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  pi = created[created.length - 1].properties;
+  assert.strictEqual(pi.Item.relation[0].id, "task200d");
+  assert.strictEqual(pi.Submission.title[0].text.content, `24-367-200_1_${DWG}_S4_R1`);
+  assert.strictEqual(pi.Stage.select.name, "S4"); assert.strictEqual(pi.Revision.select.name, "P01");
+  ok("ingest: 200 → Suffix 200, 200_1 → Suffix 200_1 (derivative items kept apart)");
+
+
   r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/004_S5_P02_${DWG}_ZZ.pdf` } });
-  assert.strictEqual(r.status, 200); assert.ok(!created[3].properties.DT); assert.match(feed[0].message, /set DT manually/);
+  assert.strictEqual(r.status, 200); assert.ok(!created[created.length - 1].properties.DT); assert.match(feed[0].message, /set DT manually/);
   ok("unknown initials + no Item Person → created, DT flagged for manual set");
 
   r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/S5/Pending/003_${DWG}_P03_GF.pdf` } });
-  assert.strictEqual(r.status, 200); assert.strictEqual(created[4].properties.Stage.select.name, "S5");
+  assert.strictEqual(r.status, 200); assert.strictEqual(created[created.length - 1].properties.Stage.select.name, "S5");
   ok("legacy stage-folder ingest still works");
 
   r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/003_${DWG}_P01_GF.pdf` } });
@@ -326,6 +350,30 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.ok(gs.folderBlocks.some((f) => /R_/.test(f.drawingsHtml)) && gs.folderBlocks.some((f) => /\{Item\}_\{Stage\}/.test(f.drawingsHtml)));
   ok("grade email: S5 → 05_Client Comments/Reviewed, A4.5 Rejected → 05_Client Comments, A4.5 Approved → 06_Signed Off");
 
+  // ── DT emails: filename (with _R#) + folder link ───────────────────────
+  submissions = [
+    { id: "d1", properties: { "Status": sel("Approved"), "DT Notified": { checkbox: false }, "Stage": sel("S4"), "DM Action": sel("Approve"),
+      "Submission": title(`24-354-003_${DWG}_S4_R2`), "DT": rel("dtAI"), "QA Round": { number: 2 },
+      "Folder Link": { url: "https://db/readyforissue" },
+      "Dropbox Path": { url: `Drawing Submissions/24-354/03_Ready For Issue/003_S4_P01_${DWG}_AI_R1.PDF` } } },
+    { id: "d2", properties: { "Status": sel("Rejected"), "DT Notified": { checkbox: false }, "Stage": sel("S5"), "DM Action": sel("Bounce"),
+      "Submission": title(`24-354-112_${DWG}_S5_R1`), "DT": rel("dtAI"), "QA Round": { number: 1 },
+      "Folder Link": { url: "https://db/rejected" },
+      "Dropbox Path": { url: `Drawing Submissions/24-354/02_Rejected/112_S5_P02_${DWG}_AI_R1.PDF` } } },
+  ];
+  webhooks.length = 0; updates.length = 0;
+  r = await call("POST /api/df/send-dt-emails", { body: {} });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  const dt = hook("dt-summary");
+  const blocks = dt.folderBlocks.map((b) => b.folderHtml + b.drawingsHtml).join(" | ");
+  assert.ok(blocks.includes(`003_S4_P01_${DWG}_AI_R1.PDF`), blocks);
+  assert.ok(blocks.includes(`112_S5_P02_${DWG}_AI_R1.PDF`), blocks);
+  assert.ok(blocks.includes("https://db/readyforissue") && blocks.includes("https://db/rejected"), blocks);
+  assert.ok(/24-354 \/ 03_Ready For Issue/.test(blocks) && /24-354 \/ 02_Rejected/.test(blocks), blocks);
+  assert.match(blocks, /dropping only a <code>_R1<\/code>/);
+  ok("DT email: full filename incl. _R#, links to 03_Ready For Issue / 02_Rejected");
+
+  // stage-upload still finds the stage when the DWG keeps a _R# suffix
   // ── stage-upload ───────────────────────────────────────────────────────
   const seen = []; const q = notion.databases.query;
   notion.databases.query = async (a) => { if (a.database_id === "SUBS") seen.push(JSON.stringify(a.filter)); return { results: [
@@ -333,12 +381,14 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
     { id: "s2", properties: { "Submission": title("24-3670-001_A-9_S4_R1") } } ], has_more: false }; };
   r = await call("POST /api/df/stage-upload", { body: { filePath: `${R}/24-367/03_Ready For Issue/003_S4_P01_A-101.dwg` } });
   assert.strictEqual(r.json.updated, 1); assert.match(seen[0], /"S4"/);
+  r = await call("POST /api/df/stage-upload", { body: { filePath: `${R}/24-367/03_Ready For Issue/003_S4_P01_A-101_GF_R2.dwg` } });
+  assert.strictEqual(r.json.updated, 1); assert.match(seen[seen.length - 1], /"S4"/);
   r = await call("POST /api/df/stage-upload", { body: { filePath: `${R}/24-367/03_Ready For Issue/A-101.dwg` } });
-  assert.strictEqual(r.json.updated, 1); assert.doesNotMatch(seen[1], /"Stage"/);
+  assert.strictEqual(r.json.updated, 1); assert.doesNotMatch(seen[seen.length - 1], /"Stage"/);
   r = await call("POST /api/df/stage-upload", { body: { filePath: `${R}/24-367/S5/Suffix 003/A-101.dwg` } });
-  assert.match(seen[2], /"S5"/);
+  assert.match(seen[seen.length - 1], /"S5"/);
   notion.databases.query = q;
-  ok("stage-upload: stage from DWG name / project-wide fallback / legacy folder");
+  ok("stage-upload: stage from DWG name (incl. a kept _R# suffix) / project-wide fallback / legacy folder");
 
   console.log(`\n${n} route tests passed`);
 })().catch((e) => { console.error("FAIL", e); process.exit(1); });

@@ -127,7 +127,7 @@ All routes are mounted from `drawing-flow.js` under `/api/df/`.
 
 | Method | Route | Description |
 |--------|-------|-------------|
-| `POST` | `/api/df/send-dt-emails` | Fires batch DT notification webhook to Make.com — one `dt-summary` action per DT covering all their pending items. |
+| `POST` | `/api/df/send-dt-emails` | Fires batch DT notification webhook to Make.com — one `dt-summary` action per DT covering all their pending items. Each row shows the file's **current filename** (bounced files keep their `_R#`) above the drawing number, grouped under a link to the folder it now sits in (`03_Ready For Issue` or `02_Rejected`). Approved blocks tell the DT to upload DWGs there under the same name, minus any `_R#`. |
 | `POST` | `/api/df/send-grade-emails` | Fires grade notification emails to DTs via Make.com webhook. |
 
 ### Drawings & Inputs
@@ -235,6 +235,12 @@ If a Pending folder is renamed, files that re-surface at the new path are matche
 Submitted row by filename and repointed — not ingested twice.
 
 Stage in a filename may be written `A45` or `A4-5` as well as `A4.5` — all three are read as A4.5.
+
+Derivative items (`Suffix 200` and `Suffix 200_1` are separate items in Tasks) are written the same way in
+a filename: `200_1_S4_P01_{DrawingNo}_{Initials}.pdf`, and in a client comment name
+`{YYMMDD}_{Commenter}_200_1_{Stage}_{Rev}_{DrawingNo}.pdf`. The item is read off the Tasks title
+(`Suffix 200` never matches `Suffix 200_1`), so a submission can no longer land on the wrong item; if the
+number in the filename doesn't exist as an item, ingest reports it rather than guessing.
 
 C01 return file name: `{Item}_{Stage}_{Rev}_{DrawingNo}_{Grade}_{YYMMDD}.pdf`. Scan Comments skips any file
 named like this (backend and Make filter), so it's never mistaken for a client comment.

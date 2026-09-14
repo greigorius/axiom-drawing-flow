@@ -174,6 +174,13 @@ const FOLDER = {
 };
 const REVIEWED_PREFIX = "R_";
 
+// Bounce appends _R1/_R2 to the rejected PDF. The DT keeps the rest of the name, so strip only
+// that suffix when matching a name back to its submission (e.g. a DWG uploaded after approval).
+const BOUNCE_SUFFIX_RE = /_R\d+$/i;
+function stripBounceSuffix(baseName) {
+  return (baseName || "").replace(BOUNCE_SUFFIX_RE, "");
+}
+
 // "01_Pending", "Pending", "pending" all match FOLDER.PENDING.
 function folderBase(seg) {
   return (seg || "").trim().replace(/^\d+_/, "").toLowerCase();
@@ -404,7 +411,19 @@ function parsePath(filePath) {
   return { projectNo: above.toUpperCase(), folderStage: null, filename, layout: "project" };
 }
 
-const ITEM_RE     = /^\d{1,4}$/;                 // 003, 112
+// Items can have derivatives in Notion — "Suffix 200" and "Suffix 200_1" are different items.
+// Filenames carry the derivative the same way: 200_1_S4_P01_{DrawingNo}_{Initials}.pdf
+const ITEM_RE     = /^\d{1,4}(?:_\d{1,2})?$/;   // 003, 112, 200_1
+function padItemNo(itemNo) {
+  const [base, sub] = String(itemNo ?? "").trim().split("_");
+  const padded = (base || "").padStart(3, "0");
+  return sub ? `${padded}_${sub}` : padded;
+}
+// "Suffix 200_1 - LIN-804 …" → "200_1"; "Suffix 22 - …" → "022". Anything else → null.
+function itemNoFromTaskName(taskName) {
+  const m = /^\s*suffix\s*(\d{1,4}(?:_\d{1,2})?)(?![\d_])/i.exec(taskName || "");
+  return m ? padItemNo(m[1]) : null;
+}
 const REV_RE      = /^[A-Z]{1,2}\d{1,3}[A-Z]?$/; // P01, C01, P01A
 const INITIALS_RE = /^[A-Z]{2,4}$/;              // GF, AI
 const DRAWING_NO_RE = /^[A-Z0-9][A-Z0-9.\-]*$/i;  // EIT-TMJ-AA-B2-D-I-45120
@@ -423,6 +442,10 @@ function parseClientCommentName(baseName) {
 
   if (isDate(parts[0])) {
     if (parts.length < 5) return bad(`Too few sections — expected ${CLIENT_COMMENT_NAME_HINT}`);
+    // Derivative item ("200_1") — glue it back together, as in submission filenames.
+    if (parts.length >= 6 && !isStage(parts[3]) && /^\d{1,4}$/.test(parts[2]) && /^\d{1,2}$/.test(parts[3]) && isStage(parts[4])) {
+      parts.splice(2, 2, `${parts[2]}_${parts[3]}`);
+    }
     const [date, commenter, itemNo, stageRaw, ...rest] = parts;
     const stage = normalizeStage(stageRaw);
     if (!ITEM_RE.test(itemNo)) return bad(`"${itemNo}" isn't an item number — expected ${CLIENT_COMMENT_NAME_HINT}`);
@@ -463,6 +486,11 @@ function parseSubmissionName(baseName, { requireInitials = true } = {}) {
   if (parts.length < 2 || parts.some((p) => !p)) {
     return fail("Filename should be {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials} — check for missing sections or double/trailing underscores");
   }
+  // Derivative item ("200_1"): the underscore inside it looks like a separator, so glue the
+  // first two sections back together when the stage turns up one section later than expected.
+  if (parts.length >= 5 && !isStage(parts[1]) && /^\d{1,4}$/.test(parts[0]) && /^\d{1,2}$/.test(parts[1]) && isStage(parts[2])) {
+    parts.splice(0, 2, `${parts[0]}_${parts[1]}`);
+  }
 
   // New convention — the stage is the 2nd section.
   if (isStage(parts[1])) {
@@ -470,7 +498,7 @@ function parseSubmissionName(baseName, { requireInitials = true } = {}) {
     if (parts.length === 4 && requireInitials) return fail("DT initials missing — add them at the end: {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}.pdf (e.g. …_GF.pdf)");
     if (parts.length > 5) return fail("Too many underscores — use hyphens inside the drawing number; the 5th section is your initials");
     const [itemNo, stageRaw, revRaw, drawingRaw, initialsRaw] = parts;
-    if (!ITEM_RE.test(itemNo)) return fail(`Item "${itemNo}" should be the item number in digits, e.g. 003`);
+    if (!ITEM_RE.test(itemNo)) return fail(`Item "${itemNo}" should be the item number in digits, e.g. 003 (or 200_1 for a derivative item)`);
     const revision = revRaw.toUpperCase();
     if (!REV_RE.test(revision)) return fail(`Rev "${revRaw}" not recognised — expected e.g. P01 or C01`);
     if (!DRAWING_NO_RE.test(drawingRaw)) return fail(`Drawing number "${drawingRaw}" has spaces or odd characters — letters, digits, hyphens and dots only`);
@@ -504,16 +532,23 @@ function parseFilename(filename) {
   return parseSubmissionName(name.slice(0, dot));
 }
 
+// Titles are {ProjectNo}-{Item}_{DrawingNo}_{Stage}_R{n}. The item can itself contain an
+// underscore ("200_1"), so work back from the stage marker instead of forward from the first
+// underscore; fall back to the old forward read when the stage isn't in the title.
 function parseSubmissionTitle(title, stage) {
   if (!title) return { taskCode: null, drawingNo: null };
   const firstUnder = title.indexOf("_");
   if (firstUnder < 0) return { taskCode: title, drawingNo: null };
+  const stageIdx = stage ? title.lastIndexOf(`_${stage}_`) : -1;
+  if (stageIdx > 0) {
+    const head      = title.slice(0, stageIdx);        // {ProjectNo}-{Item}_{DrawingNo}
+    const lastUnder = head.lastIndexOf("_");
+    if (lastUnder > 0) return { taskCode: head.slice(0, lastUnder), drawingNo: head.slice(lastUnder + 1) };
+  }
   const taskCode = title.slice(0, firstUnder);
-  const rest = title.slice(firstUnder + 1);
-  const stageMarker = `_${stage}_`;
-  const stageIdx = rest.lastIndexOf(stageMarker);
-  const drawingNo = stageIdx >= 0 ? rest.slice(0, stageIdx) : rest.split("_")[0];
-  return { taskCode, drawingNo };
+  const rest     = title.slice(firstUnder + 1);
+  const restIdx  = stage ? rest.lastIndexOf(`_${stage}_`) : -1;
+  return { taskCode, drawingNo: restIdx >= 0 ? rest.slice(0, restIdx) : rest.split("_")[0] };
 }
 
 // --- Notion utilities ---
@@ -633,7 +668,7 @@ function now() {
 async function findTask(notion, projectNo, itemNo) {
   // "Item No." is a formula property — cannot be used as a query filter.
   // Search for "Suffix NNN" to avoid false matches (e.g. "CLG-111" would match a search for "111").
-  const paddedItemNo = itemNo.padStart(3, "0");
+  const paddedItemNo = padItemNo(itemNo);
   const res = await notion.databases.query({
     database_id: TASKS_DB,
     filter: { property: "Item Name", title: { contains: `Suffix ${paddedItemNo}` } },
@@ -641,10 +676,17 @@ async function findTask(notion, projectNo, itemNo) {
   });
   if (!res.results.length) return null;
 
+  // "Suffix 200" must not match "Suffix 200_1" — they're separate items, and the Item No.
+  // formula reads the same for both. Read the number off the title instead, and only fall
+  // back to the formula when the title doesn't follow the convention at all.
+  const byName = res.results.filter(
+    (page) => itemNoFromTaskName(getProp(page, "Item Name", "title")) === paddedItemNo
+  );
   const byFormula = res.results.filter(
     (page) => getProp(page, "Item No.", "formula") === paddedItemNo
   );
-  const candidates = byFormula.length ? byFormula : res.results;
+  const candidates = byName.length ? byName : byFormula.length ? byFormula : [];
+  if (!candidates.length) return null;
   if (candidates.length === 1) return candidates[0];
 
   for (const page of candidates) {
@@ -663,17 +705,20 @@ async function findTask(notion, projectNo, itemNo) {
 // findTask(), this returns null whenever the match isn't unique instead of falling back
 // to a best guess.
 async function findTaskByItemNo(notion, itemNo) {
-  const paddedItemNo = itemNo.padStart(3, "0");
+  const paddedItemNo = padItemNo(itemNo);
   const res = await notion.databases.query({
     database_id: TASKS_DB,
     filter: { property: "Item Name", title: { contains: `Suffix ${paddedItemNo}` } },
     page_size: 50,
   });
   if (!res.results.length) return null;
+  const byName = res.results.filter(
+    (page) => itemNoFromTaskName(getProp(page, "Item Name", "title")) === paddedItemNo
+  );
   const byFormula = res.results.filter(
     (page) => getProp(page, "Item No.", "formula") === paddedItemNo
   );
-  const candidates = byFormula.length ? byFormula : res.results;
+  const candidates = byName.length ? byName : byFormula.length ? byFormula : [];
   return candidates.length === 1 ? candidates[0] : null;
 }
 
@@ -682,7 +727,7 @@ async function findTaskByItemNo(notion, itemNo) {
 // Bare numbers, drawing numbers, or client references aren't attempted; a false-positive
 // match is worse than no match, so this is deliberately conservative.
 function parseItemNoFromSubject(subject) {
-  const m = /suffix\s*0*(\d{1,4})/i.exec(subject || "");
+  const m = /suffix\s*0*(\d{1,4}(?:_\d{1,2})?)/i.exec(subject || "");
   return m ? m[1] : null;
 }
 
@@ -1130,7 +1175,7 @@ module.exports = function mountDrawingFlow(app, notion) {
       }
     } catch (err) { console.warn("[ingest] Resubmission check:", err.message); }
 
-    const submissionTitle = `${projectNo}-${itemNo.padStart(3, "0")}_${drawingNo}_${stage}_R${qaRound}`;
+    const submissionTitle = `${projectNo}-${padItemNo(itemNo)}_${drawingNo}_${stage}_R${qaRound}`;
 
     const submissionProps = {
       "Submission":    { title:    [{ text: { content: submissionTitle } }] },
@@ -1607,6 +1652,9 @@ module.exports = function mountDrawingFlow(app, notion) {
 
         // Derive folder path and name
         const fullPath   = toFullDropboxPath(rawPath);
+        // The DT needs the exact filename to find it in the folder — including the _R1/_R2
+        // suffix bounce adds, since every project's files now sit in one folder per status.
+        const fileName   = fullPath ? fullPath.split("/").pop() : null;
         const folderPath = fullPath ? fullPath.split("/").slice(0, -1).join("/") : null;
         const folderSegs = folderPath ? folderPath.split("/").filter(Boolean) : [];
         const folderName = folderSegs.slice(-2).join(" / ") || null;   // e.g. "24-367 / Approved"
@@ -1626,6 +1674,7 @@ module.exports = function mountDrawingFlow(app, notion) {
           folderPath,
           folderName,
           folderLink,  // real Dropbox shared link written back by Make
+          fileName,
           drawingNo,
           stage,
           status,
@@ -1654,6 +1703,7 @@ module.exports = function mountDrawingFlow(app, notion) {
           };
         }
         byDT[dtKey].folders[folderKey].drawings.push({
+          fileName:     item.fileName,
           drawingNo:    item.drawingNo,
           stage:        item.stage,
           actionLabel:  item.actionLabel,
@@ -1674,9 +1724,14 @@ module.exports = function mountDrawingFlow(app, notion) {
               ? `<strong>${folder.folderName}</strong>`
               : "<em>No folder</em>";
 
+          // Column 1 is the file as it is named in that folder (bounced files keep their _R#),
+          // with the drawing number underneath for scanning.
           const drawingRows = folder.drawings.map((d) =>
             `<tr>
-              <td style="padding:4px 8px;color:#333;">${d.drawingNo || "—"}</td>
+              <td style="padding:4px 8px;color:#333;">
+                <code style="font-size:12px;">${d.fileName || d.drawingNo || "—"}</code>
+                ${d.fileName && d.drawingNo ? `<div style="font-size:11px;color:#888;">${d.drawingNo}</div>` : ""}
+              </td>
               <td style="padding:4px 8px;color:#555;">${d.stage}</td>
               <td style="padding:4px 8px;color:#555;">${d.actionLabel}</td>
             </tr>`
@@ -1685,9 +1740,9 @@ module.exports = function mountDrawingFlow(app, notion) {
           // Instruction row — derive from the first drawing's actionLabel (all drawings in a folder share the same action)
           const firstAction = folder.drawings[0]?.actionLabel ?? "";
           const instruction = firstAction === "QA Approved"
-            ? "Upload DWGs to the 03_Ready For Issue folder link above."
+            ? "Upload the DWGs (and any other approved files) to the 03_Ready For Issue folder link above. Keep the filename exactly as listed, dropping only a <code>_R1</code>/<code>_R2</code> suffix if the drawing was bounced along the way."
             : firstAction.startsWith("Bounced")
-              ? "Your marked-up drawings are in the 02_Rejected folder link above (suffixed _R#). Revise to the DM comments and upload the revised PDF to the project's 01_Pending folder, named {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}.pdf."
+              ? "Your marked-up drawings are in the 02_Rejected folder link above, under the filenames listed. Revise to the DM comments and upload the revised PDF to the project's 01_Pending folder, named {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}.pdf (no _R# suffix)."
               : null;
           const instructionRow = instruction
             ? `<tr><td colspan="3" style="padding:4px 8px 10px;font-size:12px;color:#888;font-style:italic;">${instruction}</td></tr>`
@@ -2452,7 +2507,7 @@ module.exports = function mountDrawingFlow(app, notion) {
     if (!stage) {
       const fname = parts[parts.length - 1] || "";
       const dot   = fname.lastIndexOf(".");
-      const named = parseSubmissionName(dot > 0 ? fname.slice(0, dot) : fname, { requireInitials: false });
+      const named = parseSubmissionName(stripBounceSuffix(dot > 0 ? fname.slice(0, dot) : fname), { requireInitials: false });
       if (named.ok && named.stage) stage = named.stage;
     }
 
