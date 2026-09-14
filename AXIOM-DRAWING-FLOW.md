@@ -127,7 +127,7 @@ All routes are mounted from `drawing-flow.js` under `/api/df/`.
 
 | Method | Route | Description |
 |--------|-------|-------------|
-| `POST` | `/api/df/send-dt-emails` | Fires batch DT notification webhook to Make.com — one `dt-summary` action per DT covering all their pending items. Each row shows the file's **current filename** (bounced files keep their `_R#`) above the drawing number, grouped under a link to the folder it now sits in (`03_Ready For Issue` or `02_Rejected`). Approved blocks tell the DT to upload DWGs there under the same name, minus any `_R#`. |
+| `POST` | `/api/df/send-dt-emails` | Fires batch DT notification webhook to Make.com — one `dt-summary` action per DT covering all their pending items. Each row shows the file's **current filename** (bounced files keep their `_R#`) above the drawing number, grouped under a link to the folder it now sits in (`03_Ready For Issue` or `02_Rejected`). Approved blocks tell the DT to upload DWGs there under the same name, minus any `_R#`. If a submission has no `Folder Link` (its approve/bounce run failed before Make wrote one back), the link is borrowed from another submission in the same folder. |
 | `POST` | `/api/df/send-grade-emails` | Fires grade notification emails to DTs via Make.com webhook. |
 
 ### Drawings & Inputs

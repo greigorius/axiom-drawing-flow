@@ -1713,6 +1713,37 @@ module.exports = function mountDrawingFlow(app, notion) {
         byDT[dtKey].pageIds.push(item.pageId);
       }
 
+      // A folder's link is written back by Make after the approve/bounce move. If that run
+      // failed (a stale path, say), the property is empty and the DT gets plain text instead of
+      // a link — so borrow the link from any other submission sitting in the same folder.
+      const folderLinkCache = new Map();
+      async function folderLinkFor(folderPath) {
+        const shortPath = toShortDropboxPath(folderPath);
+        if (!shortPath) return null;
+        if (folderLinkCache.has(shortPath)) return folderLinkCache.get(shortPath);
+        let link = null;
+        try {
+          const res = await withNotionRetry(() => notion.databases.query({
+            database_id: SUBMISSIONS_DB,
+            filter: { and: [
+              { property: "Dropbox Path", url: { contains: `${shortPath}/` } },
+              { property: "Folder Link",  url: { is_not_empty: true      } },
+            ]},
+            page_size: 1,
+          }));
+          link = res.results.length ? getProp(res.results[0], "Folder Link", "url") : null;
+        } catch (err) {
+          console.warn(`[send-dt-emails] Folder link lookup failed for ${shortPath}:`, err.message);
+        }
+        folderLinkCache.set(shortPath, link);
+        return link;
+      }
+      for (const group of Object.values(byDT)) {
+        for (const [folderPath, folder] of Object.entries(group.folders)) {
+          if (!folder.folderLink && folderPath.startsWith("/")) folder.folderLink = await folderLinkFor(folderPath);
+        }
+      }
+
       // Build the folders array for each DT group, with pre-rendered folderHtml
       // and a drawingsHtml block listing all drawings under that folder.
       // All HTML is built here — the Text Aggregator receives a single folderBlockHtml token.

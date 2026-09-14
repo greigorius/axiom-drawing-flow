@@ -34,7 +34,13 @@ const match = (page, f) => {
   if (!f) return true;
   if (f.and) return f.and.every((x) => match(page, x));
   const p = val(page, f.property);
-  if (f.url)      return f.url.ends_with !== undefined ? (p?.url ?? "").endsWith(f.url.ends_with) : (p?.url ?? null) === f.url.equals;
+  if (f.url) {
+    const v = p?.url ?? null;
+    if (f.url.ends_with   !== undefined) return (v ?? "").endsWith(f.url.ends_with);
+    if (f.url.contains    !== undefined) return (v ?? "").includes(f.url.contains);
+    if (f.url.is_not_empty!== undefined) return f.url.is_not_empty ? !!v : !v;
+    return v === f.url.equals;
+  }
   if (f.select)   return (p?.select?.name ?? null) === f.select.equals;
   if (f.checkbox) return (p?.checkbox ?? false) === f.checkbox.equals;
   if (f.relation) return (p?.relation ?? []).some((r) => r.id === f.relation.contains);
@@ -358,8 +364,13 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
       "Dropbox Path": { url: `Drawing Submissions/24-354/03_Ready For Issue/003_S4_P01_${DWG}_AI_R1.PDF` } } },
     { id: "d2", properties: { "Status": sel("Rejected"), "DT Notified": { checkbox: false }, "Stage": sel("S5"), "DM Action": sel("Bounce"),
       "Submission": title(`24-354-112_${DWG}_S5_R1`), "DT": rel("dtAI"), "QA Round": { number: 1 },
-      "Folder Link": { url: "https://db/rejected" },
+      "Folder Link": { url: null },   // Make's bounce run failed, so no link was written back
       "Dropbox Path": { url: `Drawing Submissions/24-354/02_Rejected/112_S5_P02_${DWG}_AI_R1.PDF` } } },
+    // An older submission already in that folder carries the link the email can borrow.
+    { id: "d0", properties: { "Status": sel("Rejected"), "DT Notified": { checkbox: true }, "Stage": sel("S4"), "DM Action": sel("Bounce"),
+      "Submission": title(`24-354-003_${DWG}_S4_R1`), "DT": rel("dtAI"), "QA Round": { number: 1 },
+      "Folder Link": { url: "https://db/rejected" },
+      "Dropbox Path": { url: `Drawing Submissions/24-354/02_Rejected/003_S4_P01_${DWG}_SF_R1.PDF` } } },
   ];
   webhooks.length = 0; updates.length = 0;
   r = await call("POST /api/df/send-dt-emails", { body: {} });
@@ -371,7 +382,7 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.ok(blocks.includes("https://db/readyforissue") && blocks.includes("https://db/rejected"), blocks);
   assert.ok(/24-354 \/ 03_Ready For Issue/.test(blocks) && /24-354 \/ 02_Rejected/.test(blocks), blocks);
   assert.match(blocks, /dropping only a <code>_R1<\/code>/);
-  ok("DT email: full filename incl. _R#, links to 03_Ready For Issue / 02_Rejected");
+  ok("DT email: full filename incl. _R#, links to 03_Ready For Issue / 02_Rejected (link borrowed when Make didn't write one)");
 
   // stage-upload still finds the stage when the DWG keeps a _R# suffix
   // ── stage-upload ───────────────────────────────────────────────────────
