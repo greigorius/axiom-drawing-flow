@@ -89,6 +89,7 @@ Accessed at the app root (`/`). Designed to sit open permanently on the DM's des
 | **Grade (Log Status)** | Button on any Issued card, incl. Review Client Comments | Records the client grade (A/B/C/NA for S4/S5, Approved/Rejected for A4.5/AB). Moves logged client comment PDFs to `Client Comments/Reviewed/R_…`; A4.5 Rejected moves the C01 PDF to `05_Client Comments/` (renamed `…_Rejected_{YYMMDD}.pdf`); A4.5 Approved moves it to `06_Signed Off/` |
 | **Send DT Emails** | Batch button | Fires one summary email per DT covering all their pending notifications |
 | **Send Grade Emails** | Batch button | Fires grade notification emails to DTs for all graded submissions |
+| **DT filter** | Toolbar dropdown | Filters the whole board to one DT (plus "— No DT —"), so every drawing they're on is visible in the column it currently sits in; the chip beside it shows their total and clears the filter |
 | **Scan Comments** | Button | Triggers Make Scenario 3 to find new client comment PDFs in `Client Comments/` folders → MDS comment files + card moves to Review Client Comments |
 | **Scan Pending** | Button | Triggers Make.com Scenario 1 to re-process any missed Dropbox uploads |
 
@@ -282,6 +283,7 @@ Files that don't match are rejected at ingest with a specific reason in the cock
 |----------|---------|-------------|
 | **Scenario 1 — Ingest** | New PDF in any project `01_Pending/` folder (filter: path contains `pending/`) (recursive watch on `Drawing Submissions`) | Calls `POST /api/df/ingest`; backend parses path and filename, creates Submission row |
 | **Scenario 2 — Actions Hub** | Webhook from backend (`MAKE_ACTIONS_WEBHOOK`) | Handles Dropbox file moves (approve/bounce), sends DT notification emails, triggers client review ingest |
+| **Scenario 4 — Issue Files** | Webhook from backend (`MAKE_ISSUE_FILES_WEBHOOK`), action `issue-files` | Lists the project's `03_Ready For Issue/`, moves **every** file whose name carries the issued drawing number (PDF, DWGs, anything else) into `04_Issued/`. A file that can't move is skipped, so one clash can't strand the rest. Without the env var the backend falls back to moving the PDF alone. |
 
 ### Make.com Webhook Actions
 
@@ -317,7 +319,8 @@ NOTION_DB_INPUTS=                              # Set once Inputs DB is created i
 
 # Make.com
 MAKE_ACTIONS_WEBHOOK=                          # Scenario 2 webhook URL
-MAKE_CR_INGEST_WEBHOOK=https://hook.eu1.make.com/xxxx      # Client-review ingest webhook URL
+MAKE_CR_INGEST_WEBHOOK=https://hook.eu1.make.com/xxxx      # Client-review ingest webhook URL (Scenario 3)
+MAKE_ISSUE_FILES_WEBHOOK=https://hook.eu1.make.com/xxxx    # Issue-files webhook URL (Scenario 4)
 MAKE_SCENARIO_ID=                              # Scenario 1 ID (for Scan Pending button)
 MAKE_API_KEY=                                  # Make.com API key
 MAKE_API_ZONE=eu1                              # Make.com region

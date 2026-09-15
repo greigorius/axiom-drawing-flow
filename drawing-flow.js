@@ -2457,9 +2457,12 @@ module.exports = function mountDrawingFlow(app, notion) {
 
     if (!stageMap) return res.status(400).json({ ok: false, error: `Unknown stage: ${stage}` });
 
-    // The PDF moves 03_Ready For Issue/ → 04_Issued/ (filename unchanged). Any DWGs the DT
-    // added stay in Ready For Issue. The new path is written in the same Notion call.
-    const issueMove = computeIssueMove(getProp(submissionPage, "Dropbox Path", "url"));
+    // Everything for this drawing moves 03_Ready For Issue/ → 04_Issued/, filenames unchanged:
+    // the PDF (which Notion tracks) plus the DWGs and anything else the DT uploaded alongside it.
+    // The PDF's new path is written in the same Notion call; Make matches the rest by drawing number.
+    const issueMove       = computeIssueMove(getProp(submissionPage, "Dropbox Path", "url"));
+    const issueFilesHook  = process.env.MAKE_ISSUE_FILES_WEBHOOK;
+    const issueDrawingNo  = parseSubmissionTitle(getProp(submissionPage, "Submission", "title"), stage).drawingNo;
 
     try {
       await notion.pages.update({ page_id: id, properties: {
@@ -2474,7 +2477,21 @@ module.exports = function mountDrawingFlow(app, notion) {
       return res.status(500).json({ ok: false, error: "Submission update failed", detail: err.message });
     }
 
-    if (issueMove) {
+    if (issueMove && issueFilesHook && issueDrawingNo) {
+      // Scenario 4 lists the Ready For Issue folder and moves every file whose name carries
+      // this drawing number — PDF, DWGs, anything else the DT put beside it.
+      await fireWebhook(issueFilesHook, {
+        action:         "issue-files",
+        submissionId:   id,
+        drawingNo:      issueDrawingNo,
+        fromFolder:     issueMove.from.split("/").slice(0, -1).join("/"),
+        toFolder:       issueMove.toFolder,
+        toFolderParent: issueMove.toFolderParent,
+        toFolderName:   issueMove.toFolderName,
+      });
+    } else if (issueMove) {
+      // No issue-files webhook configured — fall back to moving the PDF on its own.
+      if (!issueFilesHook) console.warn("[issue] MAKE_ISSUE_FILES_WEBHOOK not set — moving the PDF only, DWGs stay in Ready For Issue");
       await fireWebhook(process.env.MAKE_ACTIONS_WEBHOOK, {
         action:       "move-files",
         reason:       "issue",
@@ -2500,7 +2517,6 @@ module.exports = function mountDrawingFlow(app, notion) {
     const submissionTitle = getProp(submissionPage, "Submission", "title");
     const taskIds  = getProp(submissionPage, "Item",     "relation");
     const revision = getProp(submissionPage, "Revision", "select") ?? "";
-    const { drawingNo: issueDrawingNo } = parseSubmissionTitle(submissionTitle, stage);
     await createActivityLogEntry(notion, {
       taskId: taskIds?.[0],
       source: "Drawing Flow",

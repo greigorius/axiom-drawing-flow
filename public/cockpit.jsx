@@ -506,6 +506,8 @@ const Cockpit = () => {
   const [sendGradeEmailsBusy,  setSendGradeEmailsBusy]  = useState(false);
   const [sendGradeResult,      setSendGradeResult]      = useState(null);  // "ok" | "error" | null
   const [search,               setSearch]               = useState("");
+  // Filter the whole board to one DT — shows at a glance where each of their drawings sits.
+  const [dtFilter,             setDtFilter]             = useState("");
   const [density,              setDensity]              = useState("comfortable");
 
   // Ingest notifications — separate from the queue data above. Backed by
@@ -1012,6 +1014,15 @@ const Cockpit = () => {
   const q = search.trim().toLowerCase();
   const matchSearch = (s) => !q || `${s.drawingNo || ""} ${s.title || ""} ${s.taskCode || ""} ${s.dtName || ""}`.toLowerCase().includes(q);
 
+  // Every DT with something on the board, plus a bucket for cards with no DT set.
+  const UNASSIGNED = "— No DT —";
+  const dtNames = Array.from(new Set(
+    COLS.flatMap((c) => c.items).map((s) => s.dtName || UNASSIGNED)
+  )).sort((a, b) => (a === UNASSIGNED ? 1 : b === UNASSIGNED ? -1 : a.localeCompare(b)));
+  const matchDT = (s) => !dtFilter || (s.dtName || UNASSIGNED) === dtFilter;
+  const matches = (s) => matchSearch(s) && matchDT(s);
+  const dtTotal = dtFilter ? COLS.reduce((n, c) => n + c.items.filter(matches).length, 0) : 0;
+
   const statusPill = (colId, s) => {
     switch (colId) {
       case "bounced":           return { cls: "danger", txt: `R${s.qaRound ?? "?"} Bounced` };
@@ -1131,6 +1142,18 @@ const Cockpit = () => {
       <div className="k-toolbar" role="toolbar" aria-label="Cockpit actions">
         <input className="k-search" type="search" placeholder="Search drawing ref, title, DT…"
           value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search submissions" />
+        <select className="k-dt-filter" value={dtFilter} onChange={(e) => setDtFilter(e.target.value)}
+          aria-label="Filter by DT"
+          style={{ padding: "6px 10px", borderRadius: 8, border: "1px solid var(--line, #d5dbe1)",
+                   background: "var(--surface, #fff)", color: "inherit", font: "inherit", maxWidth: 220 }}>
+          <option value="">All DTs</option>
+          {dtNames.map((name) => <option key={name} value={name}>{name}</option>)}
+        </select>
+        {dtFilter && (
+          <button className="k-act" onClick={() => setDtFilter("")} title="Clear the DT filter">
+            {dtFilter} · {dtTotal} in flow ✕
+          </button>
+        )}
         <div className="k-seg" role="group" aria-label="Density">
           <button aria-pressed={density === "comfortable"} onClick={() => setDensity("comfortable")}>Comfortable</button>
           <button aria-pressed={density === "compact"} onClick={() => setDensity("compact")}>Compact</button>
@@ -1145,7 +1168,7 @@ const Cockpit = () => {
 
       <div className="k-board" aria-label="Submissions board">
         {COLS.map((col) => {
-          const items = col.items.filter(matchSearch);
+          const items = col.items.filter(matches);
           return (
             <div key={col.id} className="k-column" style={{ "--k-col-accent": col.accent }}>
               <div className="k-col-head">

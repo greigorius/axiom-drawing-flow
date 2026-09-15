@@ -334,6 +334,24 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(updates[0].properties.Status.select.name, "Issued");
   ok("issue → PDF moves 03_Ready For Issue → 04_Issued, name unchanged, path written with status");
 
+  // With the issue-files webhook configured, Make is asked for every file carrying the drawing number
+  env.MAKE_ISSUE_FILES_WEBHOOK = "https://hook.test/issue-files";
+  submissions = [{ id: "subR2", properties: { "Status": sel("Awaiting Issue"), "Stage": sel("S4"), "Drawing": rel("dwg1"), "Item": rel(),
+    "Submission": title(`24-367-003_${DWG}_S4_R1`), "Revision": sel("P01"),
+    "Dropbox Path": { url: `Drawing Submissions/24-367/03_Ready For Issue/003_S4_P01_${DWG}_GF.pdf` } } }];
+  webhooks.length = 0; updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/issue", { params: { id: "subR2" } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  const isf = hook("issue-files");
+  assert.strictEqual(isf.drawingNo, DWG);
+  assert.strictEqual(isf.fromFolder, `${R}/24-367/03_Ready For Issue`);
+  assert.strictEqual(isf.toFolder, `${R}/24-367/04_Issued`);
+  assert.strictEqual(isf.toFolderName, "04_Issued"); assert.strictEqual(isf.toFolderParent, `${R}/24-367`);
+  assert.strictEqual(hook("move-files"), undefined);   // no separate single-file move
+  assert.strictEqual(updates[0].properties["Dropbox Path"].url, `Drawing Submissions/24-367/04_Issued/003_S4_P01_${DWG}_GF.pdf`);
+  delete env.MAKE_ISSUE_FILES_WEBHOOK;
+  ok("issue → issue-files webhook moves every file for that drawing number");
+
   // ── Grade emails: folder per stage ─────────────────────────────────────
   submissions = [
     { id: "g1", properties: { "Status": sel("Graded"), "DT Notified": { checkbox: false }, "Stage": sel("S5"), "Client Grade": sel("B"), "Revision": sel("P02"),
