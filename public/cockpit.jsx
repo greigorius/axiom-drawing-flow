@@ -15,6 +15,7 @@ function stageBadgeClass(stage) {
   if (stage === "S4") return "badge-s4";
   if (stage === "S5") return "badge-s5";
   if (stage === "S3") return "badge-s3";
+  if (stage === "PRD") return "badge-prd";
   return "badge-a45";
 }
 
@@ -109,9 +110,13 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
 
   const isAB  = submission.stage === "AB";
   const isA45 = submission.stage === "A4.5";
-  const needsReturnDate = !isAB && !isA45;   // S4/S5 have a project-system return date
-  const grades = (isAB || isA45) ? ["Approved", "Rejected"] : ["A", "B", "C", "NA"];
+  const isPRD = submission.stage === "PRD";
+  // A4.5 and PRD share the same Approved/Rejected mechanics and file moves.
+  const isSignOff = isA45 || isPRD;
+  const needsReturnDate = !isAB && !isSignOff;   // S4/S5 have a project-system return date
+  const grades = (isAB || isSignOff) ? ["Approved", "Rejected"] : ["A", "B", "C", "NA"];
   const hint   = isAB  ? "Approved = As Built accepted · Rejected = revision required"
+               : isPRD ? "Approved = Factory sign-off · Rejected = revision required"
                : isA45 ? "Approved = Contractor sign-off · Rejected = revision required"
                : "A = accepted · B = minor revision · C = major revision · NA = not applicable";
 
@@ -129,7 +134,7 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h3>Log Client Grade — {submission.drawingNo || submission.title}</h3>
+        <h3>Log {isPRD ? "Factory" : "Client"} Grade — {submission.drawingNo || submission.title}</h3>
         <div className="modal-sub">
           {submission.stage} · Rev {submission.revision}
         </div>
@@ -165,9 +170,9 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
             sync them in Drawboard first.
           </div>
         )}
-        {isA45 && (
+        {isSignOff && (
           <div style={{ marginTop: 8, fontSize: 11, color: "var(--text3)" }}>
-            Rejected moves the issued C01 PDF to <code>05_Client Comments</code> as <code>…_Rejected_YYMMDD.pdf</code>; Approved moves it to <code>06_Signed Off</code>.
+            Rejected moves the issued {isPRD ? "PRD" : "C01"} PDF to <code>05_Client Comments</code> as <code>…_Rejected_YYMMDD.pdf</code>; Approved moves it to <code>06_Signed Off</code>.
           </div>
         )}
       </div>
@@ -972,9 +977,12 @@ const Cockpit = () => {
   };
 
   // ── Render ───────────────────────────────────────────────────────────────
+  // A4.5 sits with the contractor for sign-off, PRD with the factory — both land in the
+  // Awaiting Sign-Off column rather than Awaiting Comments.
+  const isSignOffStage   = (s) => s.stage === "A4.5" || s.stage === "PRD";
   const commentItems     = issued.filter((s) => s.hasComments);
-  const signoffItems     = issued.filter((s) => s.stage === "A4.5" && !s.hasComments);
-  const awaitingComments = issued.filter((s) => s.stage !== "A4.5" && !s.hasComments);
+  const signoffItems     = issued.filter((s) => isSignOffStage(s) && !s.hasComments);
+  const awaitingComments = issued.filter((s) => !isSignOffStage(s) && !s.hasComments);
   const reviewedNotify   = pendingNotification.filter((s) => s.status === "Approved" || s.status === "Rejected");
   // Checkbox-selected cards, scoped to each of these two columns — an empty result means
   // "nothing selected in this column", which the send handlers treat as "send everything".
@@ -1005,7 +1013,7 @@ const Cockpit = () => {
     { id: "awaiting-comments", title: "Issued — Awaiting Comments", accent: "var(--info)", sub: "Issued to client, awaiting comments", items: awaitingComments },
     { id: "comments", title: "Issued — Review Client Comments", accent: "var(--grade)", sub: "Review in Drawboard, then grade", items: commentItems,
       action: { label: scanCommentsLabel, onClick: handleScanComments, disabled: scanCommentsBusy, count: commentItems.length } },
-    { id: "signoff", title: "Issued — Awaiting Sign-Off", accent: "var(--warn)", sub: "A4.5 — with client for sign-off", items: signoffItems },
+    { id: "signoff", title: "Issued — Awaiting Sign-Off", accent: "var(--warn)", sub: "A4.5 with client · PRD with factory", items: signoffItems },
     { id: "graded", title: "Graded — Notify DT", accent: "var(--accent)", sub: "Notion · DT Notified unchecked", items: graded,
       action: { label: sendGradeLabel, disabled: sendGradeEmailsBusy, count: gradedSelectedIds.length || graded.length,
         onClick: () => handleSendGradeEmails(gradedSelectedIds) } },

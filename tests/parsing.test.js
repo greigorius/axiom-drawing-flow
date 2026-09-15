@@ -141,6 +141,25 @@ ok("A4.5 and a4-5 still fine, S6 still rejected", () => {
 ok("A45 pending path parses", () => assert.strictEqual(t.parsePath(`${P}/01_Pending/200_A45_C01_A-101_JC.pdf`).projectNo, "24-367"));
 ok("client comment with A45 stage", () => assert.strictEqual(t.parseClientCommentName("260604_PC_200_A45_C01_EIT-TMJ-AA-B3-D-I-24217").stage, "A4.5"));
 
+// ---- PRD (production drawings, graded by the factory)
+ok("PRD filename parses", () => assert.deepStrictEqual(pf("003_PRD_C01_EIT-TMJ-AA-B2-D-I-45120_GF.pdf"),
+  { ok: true, format: "v2", itemNo: "003", stage: "PRD", revision: "C01", drawingNo: "EIT-TMJ-AA-B2-D-I-45120", dtInitials: "GF" }));
+ok("PRD lower-case + derivative item", () => { const r = pf("200_1_prd_c01_A-101_GF.pdf");
+  assert.strictEqual(r.stage, "PRD"); assert.strictEqual(r.itemNo, "200_1"); assert.strictEqual(r.revision, "C01"); });
+ok("PRD has no aliases — PROD rejected", () => assert.strictEqual(t.parseSubmissionName("200_PROD_C01_A-101_JC").ok, false));
+ok("PRD pending path parses", () => assert.strictEqual(t.parsePath(`${P}/01_Pending/200_PRD_C01_A-101_JC.pdf`).projectNo, "24-367"));
+ok("PRD grade return → 05_Client Comments, named like A4.5", () => {
+  const m = t.computeGradeReturnMove(`${P}/04_Issued/003_PRD_C01_A-101.pdf`,
+    { itemNo: "003", stage: "PRD", revision: "C01", drawingNo: "A-101", grade: "Rejected", date: "2026-09-10" });
+  assert.strictEqual(m.to, full(`${P}/05_Client Comments/003_PRD_C01_A-101_Rejected_260910.pdf`)); });
+ok("PRD grade return name detected (so cr-ingest skips it)", () =>
+  assert.ok(t.isGradeReturnName("003_PRD_C01_EIT-TMJ-AA-B2-D-I-45120_Rejected_260910.pdf")));
+ok("PRD signed off → 06_Signed Off, name unchanged", () => {
+  const m = t.computeSignedOffMove(`${P}/04_Issued/003_PRD_C01_A-101_GF.pdf`);
+  assert.strictEqual(m.to, full(`${P}/06_Signed Off/003_PRD_C01_A-101_GF.pdf`)); });
+ok("client comment with PRD stage parses (ingest rejects it later by stage)", () =>
+  assert.strictEqual(t.parseClientCommentName("260604_PC_200_PRD_C01_EIT-TMJ-AA-B3-D-I-24217").stage, "PRD"));
+
 // ---- Client comment names
 ok("client comment: Greig's example", () => assert.deepStrictEqual({...t.parseClientCommentName("260604_F&P_200_S4_P01_EIT-TMJ-AA-B3-D-I-24217")},
   { ok: true, format: "current", date: "260604", commenter: "F&P", itemNo: "200", stage: "S4", revision: "P01", drawingNo: "EIT-TMJ-AA-B3-D-I-24217" }));

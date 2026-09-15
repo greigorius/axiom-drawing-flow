@@ -24,8 +24,8 @@
 //                             filename = {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}.pdf
 //   Scenario 2 (Actions Hub): backend fires MAKE_ACTIONS_WEBHOOK with action=dt-summary|grade-summary
 //                             (batch emails), action=approve|bounce (Dropbox move + folder link), or
-//                             action=move-files (client comments → Reviewed/R_, A4.5 Rejected → 05_Client Comments,
-//                             A4.5 Approved → 06_Signed Off, Issue → 04_Issued)
+//                             action=move-files (client comments → Reviewed/R_, A4.5/PRD Rejected → 05_Client Comments,
+//                             A4.5/PRD Approved → 06_Signed Off, Issue → 04_Issued)
 //   Review happens in Drawboard PDF, synced back to the same Dropbox file before the DM acts.
 //                             See docs/MAKE-CONFIG-GUIDE.md for full configuration steps
 
@@ -43,29 +43,35 @@ const ACTIVITY_LOG_DB = process.env.NOTION_DB_ACTIVITY_LOG;
 
 // --- Stage constants ---
 
-const VALID_STAGES = ["S3", "S4", "S5", "A4.5", "AB"];
+const VALID_STAGES = ["S3", "S4", "S5", "A4.5", "PRD", "AB"];
 
 const STAGE_LABEL = {
   "S3":   "S3 - For Coordination",
   "S4":   "S4 - For Review and Authorisation",
   "S5":   "S5 - For Review and Acceptance",
   "A4.5": "A4.5 - Authorised Mfg. & Constr. Design",
+  "PRD":  "PRD - For Production",
   "AB":   "AB - As Built Record Drawings",
 };
 
 const STAGE_APPROVE_MAP = {
-  "S3":   { dateField: "Model Submit Date"        },
-  "S4":   { dateField: "S4 Submit Date (Actual)"  },
-  "S5":   { dateField: "S5 Submit Date (Actual)"  },
-  "A4.5": { dateField: "C01 Submit Date (Actual)" },
-  "AB":   { dateField: "AB Submit Date (Actual)"  },
+  "S3":   { dateField: "Model Submit Date"            },
+  "S4":   { dateField: "S4 Submit Date (Actual)"      },
+  "S5":   { dateField: "S5 Submit Date (Actual)"      },
+  "A4.5": { dateField: "C01 Submit Date (Actual)"     },
+  // PRD reuses the existing production milestone date rather than a new column.
+  "PRD":  { dateField: "Schedule Production (Actual)" },
+  "AB":   { dateField: "AB Submit Date (Actual)"      },
 };
 
+// PRD sits with the factory, not the client — "Client Review" is the generic
+// "issued, awaiting a response" bucket; Ball In Court below says who holds it.
 const STAGE_APPROVE_DRAWING_STATUS = {
   "S3":   "Client Review",
   "S4":   "Client Review",
   "S5":   "Client Review",
   "A4.5": "Client Review",
+  "PRD":  "Client Review",
   "AB":   "Client Review",
 };
 
@@ -76,6 +82,7 @@ const STAGE_APPROVE_BIC = {
   "S4":   "Contractor",   // MC & consultants review
   "S5":   "Architect",    // Client review
   "A4.5": "Contractor",   // MC sign-off
+  "PRD":  "Production",   // factory reviews production drawings
   "AB":   "Project Team",
 };
 
@@ -83,9 +90,21 @@ const STAGE_LOG_STATUS_MAP = {
   "S3":   { supported: false, statusField: null,        dateField: null,             grades: []                       },
   "S4":   { supported: true,  statusField: "S4 Status", dateField: "S4 Status Date", grades: ["A","B","C","NA"]      },
   "S5":   { supported: true,  statusField: "S5 Status", dateField: "S5 Status Date", grades: ["A","B","C","NA"]      },
-  "A4.5": { supported: true,  statusField: null,        dateField: "C01 Sign Off",   grades: ["Approved","Rejected"]  },
-  "AB":   { supported: true,  statusField: "AB Status", dateField: "AB Status Date", grades: ["Approved","Rejected"] },
+  "A4.5": { supported: true,  statusField: null,         dateField: "C01 Sign Off",    grades: ["Approved","Rejected"] },
+  // PRD is graded by the factory. Rejected restarts the flow at the next revision,
+  // so unlike A4.5's sign-off date, PRD Status Date is written for both outcomes.
+  "PRD":  { supported: true,  statusField: "PRD Status", dateField: "PRD Status Date", grades: ["Approved","Rejected"] },
+  "AB":   { supported: true,  statusField: "AB Status",  dateField: "AB Status Date",  grades: ["Approved","Rejected"] },
 };
+
+// Stages where grading moves the submitted PDF itself:
+//   Rejected → {ProjectNo}/05_Client Comments/{...}_Rejected_{YYMMDD}.pdf
+//   Approved → {ProjectNo}/06_Signed Off/{filename}
+// A4.5 is signed off by the contractor, PRD by the factory; the mechanics are identical.
+// These stages also defer their Drawing Status write to POST /api/df/send-grade-emails,
+// where Ball In Court actually flips from DM to DT.
+const GRADE_MOVE_STAGES = ["A4.5", "PRD"];
+const movesPdfOnGrade = (stage) => GRADE_MOVE_STAGES.includes(stage);
 
 const BIC = {
   SUBMITTED:        "DM",
@@ -152,8 +171,8 @@ const DROPBOX_ROOT = "/DESIGN KNOW HOW/TMJ Interiors";
 //     04_Issued/             ← Issue (cockpit) moves the PDF here, filename unchanged
 //     05_Client Comments/    ← all client returns, told apart by filename:
 //                               client comment PDFs  {YYMMDD}_{Commenter}_{Item}_{Stage}_{Rev}_{DrawingNo}.pdf  (graded → Reviewed/R_{name})
-//                               A4.5 (C01) Rejected  {Item}_{Stage}_{Rev}_{DrawingNo}_Rejected_{YYMMDD}.pdf
-//     06_Signed Off/         ← A4.5 (C01) Approved: the PDF moves here from 04_Issued, filename unchanged
+//                               A4.5 (C01) & PRD Rejected  {Item}_{Stage}_{Rev}_{DrawingNo}_Rejected_{YYMMDD}.pdf
+//     06_Signed Off/         ← A4.5 (C01) & PRD Approved: the PDF moves here from 04_Issued, filename unchanged
 //
 // Folder matching ignores the "NN_" prefix, so un-numbered folders (Pending, Rejected …)
 // from before the numbering still work.
@@ -168,7 +187,7 @@ const FOLDER = {
   READY_FOR_ISSUE: "03_Ready For Issue",
   ISSUED:          "04_Issued",
   CLIENT_COMMENTS: "05_Client Comments",
-  SIGNED_OFF:      "06_Signed Off",     // A4.5 (C01) Approved
+  SIGNED_OFF:      "06_Signed Off",     // A4.5 (C01) & PRD Approved
   GRADE_RETURNS:   "Grade Returns",     // LEGACY stage-folder layout only: {ProjectNo}/{Stage}/Grade Returns
   REVIEWED:        "Reviewed",          // …/Client Comments/Reviewed/R_{name} once the DM has graded
 };
@@ -272,7 +291,7 @@ function computeReviewedMove(rawPath) {
            toFolderName: FOLDER.REVIEWED, newFilename };
 }
 
-// A4.5 (C01) Rejected: the issued copy moves out of 04_Issued/ into 05_Client Comments/, renamed in
+// A4.5 (C01) & PRD Rejected: the issued copy moves out of 04_Issued/ into 05_Client Comments/, renamed in
 // the submission order with the grade and date appended:
 //   {Item}_{Stage}_{Rev}_{DrawingNo}_{Grade}_{YYMMDD}.pdf
 function computeGradeReturnMove(rawPath, { itemNo, stage, revision, drawingNo, grade, date }) {
@@ -290,7 +309,7 @@ function computeGradeReturnMove(rawPath, { itemNo, stage, revision, drawingNo, g
            toFolderName: toFolderParts[toFolderParts.length - 1], newFilename };
 }
 
-// A4.5 (C01) Approved: the issued PDF moves to {ProjectNo}/06_Signed Off/, filename unchanged.
+// A4.5 (C01) & PRD Approved: the issued PDF moves to {ProjectNo}/06_Signed Off/, filename unchanged.
 // Only a project-level copy moves (04_Issued, or 03_Ready For Issue / "Approved" if it was never
 // issued through the cockpit). Legacy {Stage}/… copies and anything already signed off stay put.
 function computeSignedOffMove(rawPath) {
@@ -467,6 +486,11 @@ function parseClientCommentName(baseName) {
 }
 
 // Stages whose client comments are tracked on the MDS (`<stage> Comment Files` / `<stage> Client Reviewers`).
+// PRD is deliberately absent: the factory grades Approved/Rejected in the Hub rather than
+// returning marked-up PDFs, so there are no `PRD Comment Files` / `PRD Client Reviewers`
+// properties. A PRD comment PDF dropped into 05_Client Comments is rejected by cr-ingest
+// with a clear message. Add "PRD" here (and both MDS properties) if that changes.
+// PRD grade returns written by log-status are unaffected — isGradeReturnName() skips them.
 const COMMENT_STAGES = ["S4", "S5", "A4.5"];
 
 // Parses a submission name WITHOUT caring about the extension (so it also works for DWGs).
@@ -1881,12 +1905,12 @@ module.exports = function mountDrawingFlow(app, notion) {
         const dt = await resolveDT(notion, dtIds);
 
         // Where the DT finds the returned file:
-        //   A4.5 Rejected → {ProjectNo}/05_Client Comments/ (moved there at Log Status)
-        //   A4.5 Approved → {ProjectNo}/06_Signed Off/ (if the PDF was moved there at Log Status)
-        //   S4/S5 etc.   → the Reviewed/ folder the client comment PDFs were moved into
-        //   otherwise    → no file (e.g. graded without client comments)
+        //   A4.5/PRD Rejected → {ProjectNo}/05_Client Comments/ (moved there at Log Status)
+        //   A4.5/PRD Approved → {ProjectNo}/06_Signed Off/ (if the PDF was moved there at Log Status)
+        //   S4/S5 etc.       → the Reviewed/ folder the client comment PDFs were moved into
+        //   otherwise        → no file (e.g. graded without client comments)
         let returnFolder = null, returnKind = null;
-        if (stage === "A4.5") {
+        if (movesPdfOnGrade(stage)) {
           if (grade === "Rejected") { returnFolder = gradeReturnsFolder(rawPath); returnKind = "grade-returns"; }
           if (grade === "Approved") {
             const segs = (toFullDropboxPath(rawPath) || "").split("/");
@@ -1910,7 +1934,7 @@ module.exports = function mountDrawingFlow(app, notion) {
             ? "Not applicable — no action required"
             : grade === "Rejected"
               ? "Revise to the returned comments and resubmit"
-              : grade === "Approved" && stage === "A4.5"
+              : grade === "Approved" && movesPdfOnGrade(stage)
                 ? "Approved — proceed with production"
                 : isProductionRev
                   ? "Update drawings for production"
@@ -2038,18 +2062,24 @@ module.exports = function mountDrawingFlow(app, notion) {
         }}).catch((e) => console.warn(`[send-grade-emails] Notion update failed ${pid}:`, e.message))
       ));
 
-      // A4.5's Drawing Status is finalized here, at the same moment Ball In Court above
-      // actually flips to DT — Approved → Production Updates (goes to DT for production),
-      // Rejected → DT Review (drawing starts its submission journey again). Every other
-      // stage already got its Drawing Status written immediately at log-status time.
-      const a45DrawingStatus = (grade) => grade === "Approved" ? "Production Updates" : "DT Review";
+      // A4.5's and PRD's Drawing Status is finalized here, at the same moment Ball In Court
+      // above actually flips to DT. Rejected → DT Review for both (the drawing starts its
+      // submission journey again at the next revision). Approved differs by stage:
+      //   A4.5 → Production Updates — contractor has signed off, DT now draws the PRD set
+      //   PRD  → Schedule — factory has signed off, the item is scheduled for production
+      //                     (procurement / production supporting docs), then As Built Updates
+      // Every other stage already got its Drawing Status written immediately at log-status.
+      const gradeDrawingStatus = (stage, grade) =>
+        grade !== "Approved" ? "DT Review"
+        : stage === "PRD"    ? "Schedule"
+        : "Production Updates";
       await Promise.all(
         enriched
-          .filter((item) => item.stage === "A4.5")
+          .filter((item) => movesPdfOnGrade(item.stage))
           .flatMap((item) => (item.drawingIds || []).map((drawingId) =>
             notion.pages.update({ page_id: drawingId, properties: {
-              "Drawing Status": { select: { name: a45DrawingStatus(item.grade) } },
-            }}).catch((e) => console.warn(`[send-grade-emails] A4.5 MDS update failed ${drawingId}:`, e.message))
+              "Drawing Status": { select: { name: gradeDrawingStatus(item.stage, item.grade) } },
+            }}).catch((e) => console.warn(`[send-grade-emails] ${item.stage} MDS update failed ${drawingId}:`, e.message))
           ))
       );
 
@@ -2703,15 +2733,15 @@ module.exports = function mountDrawingFlow(app, notion) {
     const statusDate       = returnDate || gradedAt;   // prefer project-system date over today
 
     const isTerminalAB     = stage === "AB"   && grade === "Approved";
-    const isA45Approved    = stage === "A4.5" && grade === "Approved";
+    const isA45Approved    = movesPdfOnGrade(stage) && grade === "Approved";
     const isProductionRev  = revision.toUpperCase().startsWith("C");
 
-    // A4.5's Drawing Status is finalized later, in POST /api/df/send-grade-emails, at the
-    // same moment Ball In Court actually flips to DT (Approved → Production Updates,
+    // A4.5's and PRD's Drawing Status is finalized later, in POST /api/df/send-grade-emails,
+    // at the same moment Ball In Court actually flips to DT (Approved → Production Updates,
     // Rejected → DT Review) — not here, since BIC sits with DM until the notify email
-    // fires. Skip writing Drawing Status at this step for that stage; every other stage
+    // fires. Skip writing Drawing Status at this step for those stages; every other stage
     // keeps the immediate write.
-    const deferDrawingStatus = stage === "A4.5";
+    const deferDrawingStatus = movesPdfOnGrade(stage);
 
     // Drawing Status: terminal stages override; otherwise use revision prefix
     const drawingStatus = isTerminalAB  ? "Complete"
@@ -2735,15 +2765,16 @@ module.exports = function mountDrawingFlow(app, notion) {
     const moves         = commentMoves.map((c) => c.move).filter(Boolean);
     const newCommentPaths = commentMoves.map((c) => c.move ? toShortDropboxPath(c.move.to) : c.p);
 
-    // A4.5: the C01 PDF itself moves — Rejected → 05_Client Comments (renamed), Approved → 06_Signed Off.
+    // A4.5 / PRD: the submitted PDF itself moves — Rejected → 05_Client Comments (renamed),
+    // Approved → 06_Signed Off.
     let pdfMove = null;
-    if (stage === "A4.5") {
+    if (movesPdfOnGrade(stage)) {
       const pdfPath = getProp(submissionPage, "Dropbox Path", "url");
       pdfMove = grade === "Rejected"
         ? computeGradeReturnMove(pdfPath, { itemNo, stage, revision, drawingNo: logStatusDrawingNo, grade, date: gradedAt })
         : computeSignedOffMove(pdfPath);
       if (pdfMove) moves.push(pdfMove);
-      else console.warn(`[log-status] No C01 PDF move for submission ${id} (${grade}) — path: ${pdfPath || "none"}`);
+      else console.warn(`[log-status] No ${stage} PDF move for submission ${id} (${grade}) — path: ${pdfPath || "none"}`);
     }
 
     try {
@@ -2768,8 +2799,9 @@ module.exports = function mountDrawingFlow(app, notion) {
         const mdsProps = {};
         if (!deferDrawingStatus) mdsProps["Drawing Status"] = { select: { name: drawingStatus } };
         if (stageMap.statusField) mdsProps[stageMap.statusField] = { select: { name: grade } };
-        // Status Date uses the project-system return date (or today if not provided)
-        // A4.5: only set C01 Sign Off date when Approved
+        // Status Date uses the project-system return date (or today if not provided).
+        // A4.5 is the exception: C01 Sign Off is a sign-off date, so it is only set when
+        // Approved. PRD Status Date is a plain status date and writes on both outcomes.
         if (stageMap.dateField && !(stage === "A4.5" && grade !== "Approved")) {
           mdsProps[stageMap.dateField] = { date: { start: statusDate } };
         }
@@ -2795,7 +2827,7 @@ module.exports = function mountDrawingFlow(app, notion) {
       source: "Drawing Flow",
       tag:    "#response",
       author: "System",
-      entry:  `Client grade ${grade} recorded for ${logStatusDrawingNo} Rev ${revision}.`,
+      entry:  `${stage === "PRD" ? "Factory" : "Client"} grade ${grade} recorded for ${logStatusDrawingNo} Rev ${revision}.`,
     });
 
     console.log(`[log-status] ${id} => ${grade} (Rev ${revision}) => ${drawingStatus}; ${moves.length} file move(s)`);

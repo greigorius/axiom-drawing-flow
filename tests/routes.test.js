@@ -318,6 +318,67 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(updates[0].properties["Dropbox Path"].url, `Drawing Submissions/24-367/06_Signed Off/003_A4.5_C01_${DWG}_GF.pdf`);
   ok("A4.5 Approved → 06_Signed Off/{filename}, path written with the grade");
 
+  // ── PRD: approve → issue → factory grade (mirrors A4.5) ────────────────
+  submissions = [{ id: "subP", properties: { "Status": sel("Submitted"), "Stage": sel("PRD"), "Submission": title(`24-367-003_${DWG}_PRD_R1`),
+    "DT": rel("dtAI"), "Item": rel(), "Revision": sel("C01"), "Drawing": rel("dwg1"),
+    "Dropbox Path": { url: `Drawing Submissions/24-367/01_Pending/003_PRD_C01_${DWG}_GF.pdf` } } }];
+  webhooks.length = 0; updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/approve", { params: { id: "subP" } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  const pa = hook("approve");
+  assert.strictEqual(pa.dropboxMove.toFolderName, "03_Ready For Issue");
+  assert.strictEqual(pa.dropboxMove.newFilename, `003_PRD_C01_${DWG}_GF.pdf`);
+  ok("PRD approve → 03_Ready For Issue, filename unchanged");
+
+  // Issue is where the stage's approve map lands: Schedule Production (Actual) + BIC Production
+  submissions = [{ id: "subPI", properties: { "Status": sel("Awaiting Issue"), "Stage": sel("PRD"), "Drawing": rel("dwg1"), "Item": rel(),
+    "Submission": title(`24-367-003_${DWG}_PRD_R1`), "Revision": sel("C01"),
+    "Dropbox Path": { url: `Drawing Submissions/24-367/03_Ready For Issue/003_PRD_C01_${DWG}_GF.pdf` } } }];
+  webhooks.length = 0; updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/issue", { params: { id: "subPI" } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  assert.strictEqual(updates[0].properties["Ball In Court"].select.name, "Production");
+  const pdwg = updates.find((u) => u.page_id === "dwg1").properties;
+  assert.ok(pdwg["Schedule Production (Actual)"], "PRD issue writes Schedule Production (Actual)");
+  assert.ok(!pdwg["C01 Submit Date (Actual)"], "PRD issue must not touch the A4.5 date");
+  ok("PRD issue → 04_Issued, BIC Production, Schedule Production (Actual) written");
+
+  // PRD Rejected → 05_Client Comments, PRD Status + PRD Status Date both written
+  submissions = [issued("subP2", "PRD", "C01", { "Submission": title(`24-367-003_${DWG}_PRD_R1`),
+    "Dropbox Path": { url: `Drawing Submissions/24-367/04_Issued/003_PRD_C01_${DWG}_GF.pdf` } })];
+  webhooks.length = 0; updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/log-status", { params: { id: "subP2" }, body: { grade: "Rejected" } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  mv = hook("move-files");
+  assert.strictEqual(mv.moves.length, 1);
+  assert.strictEqual(mv.moves[0].toFolderParent, `${R}/24-367`); assert.strictEqual(mv.moves[0].toFolderName, "05_Client Comments");
+  assert.match(mv.moves[0].newFilename, new RegExp(`^003_PRD_C01_${DWG}_Rejected_\\d{6}\\.pdf$`));
+  let prdDwg = updates.find((u) => u.page_id === "dwg1").properties;
+  assert.strictEqual(prdDwg["PRD Status"].select.name, "Rejected");
+  assert.ok(prdDwg["PRD Status Date"], "PRD Status Date is written on Rejected too (unlike C01 Sign Off)");
+  assert.ok(!prdDwg["Drawing Status"], "PRD defers Drawing Status to send-grade-emails");
+  ok("PRD Rejected → 05_Client Comments/…_Rejected_{YYMMDD}.pdf; PRD Status + Date written, Drawing Status deferred");
+
+  // PRD Approved → 06_Signed Off
+  submissions = [issued("subP3", "PRD", "C01", { "Submission": title(`24-367-003_${DWG}_PRD_R1`),
+    "Dropbox Path": { url: `Drawing Submissions/24-367/04_Issued/003_PRD_C01_${DWG}_GF.pdf` } })];
+  webhooks.length = 0; updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/log-status", { params: { id: "subP3" }, body: { grade: "Approved" } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  assert.strictEqual(r.json.isA45Approved, true);
+  mv = hook("move-files");
+  assert.strictEqual(mv.moves[0].toFolderName, "06_Signed Off");
+  assert.strictEqual(mv.moves[0].newFilename, `003_PRD_C01_${DWG}_GF.pdf`);
+  assert.strictEqual(updates[0].properties["Dropbox Path"].url, `Drawing Submissions/24-367/06_Signed Off/003_PRD_C01_${DWG}_GF.pdf`);
+  prdDwg = updates.find((u) => u.page_id === "dwg1").properties;
+  assert.strictEqual(prdDwg["PRD Status"].select.name, "Approved");
+  ok("PRD Approved → 06_Signed Off/{filename}, PRD Status Approved");
+
+  // A PRD grade return dropped back into 05_Client Comments is ignored by cr-ingest
+  r = await call("POST /api/df/cr-ingest", { body: { filePath: `${R}/24-367/05_Client Comments/003_PRD_C01_${DWG}_Rejected_260910.pdf` } });
+  assert.strictEqual(r.json.skipped, true); assert.match(r.json.reason, /grade return/);
+  ok("cr-ingest ignores PRD grade returns");
+
   // ── Issue: 03_Ready For Issue → 04_Issued ─────────────────────────────
   submissions = [{ id: "subR", properties: { "Status": sel("Awaiting Issue"), "Stage": sel("S4"), "Drawing": rel("dwg1"), "Item": rel(),
     "Submission": title(`24-367-003_${DWG}_S4_R1`), "Revision": sel("P01"),
@@ -373,6 +434,30 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.ok(heads.includes("<strong>24-367/06_Signed Off</strong>"), heads.join(" | "));
   assert.ok(gs.folderBlocks.some((f) => /R_/.test(f.drawingsHtml)) && gs.folderBlocks.some((f) => /\{Item\}_\{Stage\}/.test(f.drawingsHtml)));
   ok("grade email: S5 → 05_Client Comments/Reviewed, A4.5 Rejected → 05_Client Comments, A4.5 Approved → 06_Signed Off");
+
+  // Drawing Status is finalised here, and Approved differs by stage:
+  //   A4.5 → Production Updates (DT now draws the PRD set)
+  //   PRD  → Schedule (factory signed off; item goes for production scheduling)
+  // Rejected → DT Review for both.
+  submissions = [
+    { id: "g4", properties: { "Status": sel("Graded"), "DT Notified": { checkbox: false }, "Stage": sel("A4.5"), "Client Grade": sel("Approved"), "Revision": sel("C01"),
+      "Submission": title(`24-367-003_${DWG}_A4.5_R1`), "DT": rel("dtAI"), "Drawing": rel("dwgA45"),
+      "Dropbox Path": { url: `Drawing Submissions/24-367/06_Signed Off/003_A4.5_C01_${DWG}_GF.pdf` } } },
+    { id: "g5", properties: { "Status": sel("Graded"), "DT Notified": { checkbox: false }, "Stage": sel("PRD"), "Client Grade": sel("Approved"), "Revision": sel("C01"),
+      "Submission": title(`24-367-004_${DWG}_PRD_R1`), "DT": rel("dtAI"), "Drawing": rel("dwgPRD"),
+      "Dropbox Path": { url: `Drawing Submissions/24-367/06_Signed Off/004_PRD_C01_${DWG}_GF.pdf` } } },
+    { id: "g6", properties: { "Status": sel("Graded"), "DT Notified": { checkbox: false }, "Stage": sel("PRD"), "Client Grade": sel("Rejected"), "Revision": sel("C01"),
+      "Submission": title(`24-367-005_${DWG}_PRD_R1`), "DT": rel("dtAI"), "Drawing": rel("dwgPRDrej"),
+      "Dropbox Path": { url: `Drawing Submissions/24-367/05_Client Comments/005_PRD_C01_${DWG}_Rejected_260910.pdf` } } },
+  ];
+  webhooks.length = 0; updates.length = 0;
+  r = await call("POST /api/df/send-grade-emails", { body: {} });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  const dsOf = (id) => updates.find((u) => u.page_id === id)?.properties?.["Drawing Status"]?.select?.name;
+  assert.strictEqual(dsOf("dwgA45"),    "Production Updates");
+  assert.strictEqual(dsOf("dwgPRD"),    "Schedule");
+  assert.strictEqual(dsOf("dwgPRDrej"), "DT Review");
+  ok("grade email finalises Drawing Status: A4.5 Approved → Production Updates, PRD Approved → Schedule, Rejected → DT Review");
 
   // ── DT emails: filename (with _R#) + folder link ───────────────────────
   submissions = [

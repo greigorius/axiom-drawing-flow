@@ -86,7 +86,7 @@ Accessed at the app root (`/`). Designed to sit open permanently on the DM's des
 | **Approve** | Button on For Review card | Status → Approved; Make moves the (Drawboard-reviewed) PDF to `{Project}/03_Ready For Issue/`, name unchanged |
 | **Bounce** | Button on For Review card | Confirm modal → status Rejected, BIC → DT; Make moves the marked-up PDF to `{Project}/02_Rejected/{name}_R{n}.pdf` |
 | **Issue** | Button on Awaiting Issue card | Sets status to Issued, updates MDS, fires Make.com issue webhook |
-| **Grade (Log Status)** | Button on any Issued card, incl. Review Client Comments | Records the client grade (A/B/C/NA for S4/S5, Approved/Rejected for A4.5/AB). Moves logged client comment PDFs to `Client Comments/Reviewed/R_…`; A4.5 Rejected moves the C01 PDF to `05_Client Comments/` (renamed `…_Rejected_{YYMMDD}.pdf`); A4.5 Approved moves it to `06_Signed Off/` |
+| **Grade (Log Status)** | Button on any Issued card, incl. Review Client Comments | Records the grade (A/B/C/NA for S4/S5, Approved/Rejected for A4.5/PRD/AB — PRD is graded by the factory). Moves logged client comment PDFs to `Client Comments/Reviewed/R_…`; A4.5/PRD Rejected moves the PDF to `05_Client Comments/` (renamed `…_Rejected_{YYMMDD}.pdf`); A4.5/PRD Approved moves it to `06_Signed Off/` |
 | **Send DT Emails** | Batch button | Fires one summary email per DT covering all their pending notifications |
 | **Send Grade Emails** | Batch button | Fires grade notification emails to DTs for all graded submissions |
 | **DT filter** | Toolbar dropdown | Filters the whole board to one DT (plus "— No DT —"), so every drawing they're on is visible in the column it currently sits in; the chip beside it shows their total and clears the filter |
@@ -121,8 +121,8 @@ All routes are mounted from `drawing-flow.js` under `/api/df/`.
 | `PATCH` | `/api/df/submissions/:id/approve` | Approves a submission. Updates Notion status + MDS, returns Dropbox move instructions. |
 | `PATCH` | `/api/df/submissions/:id/issue` | Confirms official issue. Updates status to Issued and fires `move-files` to move the PDF from `03_Ready For Issue/` to `04_Issued/` (name unchanged). |
 | `PATCH` | `/api/df/submissions/:id/bounce` | Bounces a submission back to DT. Increments QA round, returns Dropbox move instructions. |
-| `PATCH` | `/api/df/submissions/:id/log-status` | Logs client grade. Updates MDS grade fields; fires `move-files` for client comments (→ Reviewed/R_) A4.5 Rejected (→ 05_Client Comments, renamed) and A4.5 Approved (→ 06_Signed Off). |
-| `POST` | `/api/df/cr-ingest` | Called by Make Scenario 3 per client comment PDF named `{YYMMDD}_{Commenter}_{Item}_{Stage}_{Rev}_{DrawingNo}.pdf` (e.g. `260604_F&P_200_S4_P01_EIT-TMJ-AA-B3-D-I-24217.PDF`). Stage and rev come from the name and pick the Issued submission; Rev may be omitted. Older `{Client}_{YYMMDD}_{DrawingNo}_{Rev}.pdf` names still work (stage from the Issued submission or legacy stage folder). Comments are tracked for S4 / S5 / A4.5. Stores the path in `Comment Paths`; problems show in the ingest feed. |
+| `PATCH` | `/api/df/submissions/:id/log-status` | Logs the client (or, for PRD, factory) grade. Updates MDS grade fields; fires `move-files` for client comments (→ Reviewed/R_), A4.5/PRD Rejected (→ 05_Client Comments, renamed) and A4.5/PRD Approved (→ 06_Signed Off). |
+| `POST` | `/api/df/cr-ingest` | Called by Make Scenario 3 per client comment PDF named `{YYMMDD}_{Commenter}_{Item}_{Stage}_{Rev}_{DrawingNo}.pdf` (e.g. `260604_F&P_200_S4_P01_EIT-TMJ-AA-B3-D-I-24217.PDF`). Stage and rev come from the name and pick the Issued submission; Rev may be omitted. Older `{Client}_{YYMMDD}_{DrawingNo}_{Rev}.pdf` names still work (stage from the Issued submission or legacy stage folder). Comments are tracked for S4 / S5 / A4.5 only — PRD is graded in the Hub, not by returned markup. Stores the path in `Comment Paths`; problems show in the ingest feed. |
 
 ### Notifications
 
@@ -167,7 +167,7 @@ All routes are mounted from `drawing-flow.js` under `/api/df/`.
 |----------|------|-------|
 | `Submission` | title | Format: `{TaskCode}_{DrawingNo}_{Stage}_{Rev}_{R1}` e.g. `CLG-001_A-101_S4_P01_R1` |
 | `Status` | select | `Submitted` → `Approved` / `Rejected` → `Awaiting Issue` → `Issued` → `Graded` |
-| `Stage` | select | `S3`, `S4`, `S5`, `A4.5`, `AB` |
+| `Stage` | select | `S3`, `S4`, `S5`, `A4.5`, `PRD`, `AB` |
 | `QA Round` | number | Increments on each bounce; resets when entering a new stage |
 | `DT` | relation | Links to Team DB |
 | `DT Notified` | checkbox | Set true after batch email sent; used to filter Pending Notification section |
@@ -189,11 +189,12 @@ The backend writes to these MDS properties on Approve, Bounce, and Log Status:
 | `S4 Submit Date (Actual)` | Approve (S4) |
 | `S5 Submit Date (Actual)` | Approve (S5) |
 | `C01 Submit Date (Actual)` | Approve (A4.5) |
+| `Schedule Production (Actual)` | Approve (PRD) |
 | `Model Submit Date` | Approve (S3) |
 | `AB Submit Date (Actual)` | Approve (AB) |
-| `S4 Status` / `S5 Status` / `AB Status` | Log Status |
-| `S4 Status Date` / `S5 Status Date` / `AB Status Date` | Log Status |
-| `C01 Sign Off` | Log Status (A4.5) |
+| `S4 Status` / `S5 Status` / `PRD Status` / `AB Status` | Log Status |
+| `S4 Status Date` / `S5 Status Date` / `PRD Status Date` / `AB Status Date` | Log Status |
+| `C01 Sign Off` | Log Status (A4.5, Approved only) |
 | Drawing Status | All actions |
 
 **Critical:** Never write to `(Plan)`, `(Adj)`, or formula properties — these will throw Notion API errors.
@@ -208,6 +209,9 @@ The backend writes to these MDS properties on Approve, Bounce, and Log Status:
 | `S4` | S4 - For Review and Authorisation | Contractor | Client Review |
 | `S5` | S5 - For Review and Acceptance | Architect | Client Review |
 | `A4.5` | A4.5 - Authorised Mfg. & Constr. Design | Contractor | Production Updates |
+| `PRD` | PRD - For Production | Production | Client Review |
+
+After grading, `POST /api/df/send-grade-emails` finalises Drawing Status for the two sign-off stages: **A4.5 Approved → Production Updates** (DT draws the PRD set), **PRD Approved → Schedule** (factory signed off — the item goes for production scheduling), **either Rejected → DT Review**.
 | `AB` | AB - As Built Record Drawings | Project Team | Client Review |
 
 ---
@@ -226,16 +230,16 @@ The backend writes to these MDS properties on Approve, Bounce, and Log Status:
               ├── 04_Issued/            ← Issue (cockpit) moves the PDF here, filename unchanged (DWGs stay in 03)
               ├── 05_Client Comments/   ← all client returns (architect or principal contractor), told apart by filename:
               │     │                     client comment PDFs (DM drops in): {YYMMDD}_{Commenter}_{Item}_{Stage}_{Rev}_{DrawingNo}.pdf
-              │     │                     A4.5 (C01) Rejected (Log Status):  {Item}_{Stage}_{Rev}_{DrawingNo}_Rejected_{YYMMDD}.pdf
+              │     │                     A4.5 (C01) & PRD Rejected (Log Status):  {Item}_{Stage}_{Rev}_{DrawingNo}_Rejected_{YYMMDD}.pdf
               │     └── Reviewed/       ← graded comment PDFs moved here as R_{original name}
-              └── 06_Signed Off/        ← A4.5 (C01) Approved: Log Status moves the PDF here from 04_Issued, filename unchanged
+              └── 06_Signed Off/        ← A4.5 (C01) & PRD Approved: Log Status moves the PDF here from 04_Issued, filename unchanged
 ```
 
 Folder matching ignores the `NN_` prefix, so un-numbered folders (`Pending`, `Rejected`, …) still work.
 If a Pending folder is renamed, files that re-surface at the new path are matched to their existing
 Submitted row by filename and repointed — not ingested twice.
 
-Stage in a filename may be written `A45` or `A4-5` as well as `A4.5` — all three are read as A4.5.
+Stage in a filename may be written `A45` or `A4-5` as well as `A4.5` — all three are read as A4.5. `PRD` has no aliases.
 
 Derivative items (`Suffix 200` and `Suffix 200_1` are separate items in Tasks) are written the same way in
 a filename: `200_1_S4_P01_{DrawingNo}_{Initials}.pdf`, and in a client comment name
@@ -265,7 +269,7 @@ flight keep working. In-flight legacy files are moved to the new project-level `
 ```
 
 - `Item` — item number in digits, matching "Suffix NNN" in the Tasks DB (e.g. `003`)
-- `Stage` — `S3`, `S4`, `S5`, `A4.5` or `AB` (case-insensitive)
+- `Stage` — `S3`, `S4`, `S5`, `A4.5`, `PRD` or `AB` (case-insensitive)
 - `Rev` — e.g. `P01`–`P03` (preliminary) or `C01`–`C03` (construction)
 - `DrawingNo` — full drawing number; hyphens only, **no underscores**
 - `Initials` — **required**; the DT's initials, matched against the Team DB name (e.g. Greig
@@ -293,7 +297,7 @@ The backend fires `MAKE_ACTIONS_WEBHOOK` with an `action` field. Make.com routes
 |--------|-------------|---------|
 | `approve` | Approve endpoint | `dropboxMove` (`from`, `toFolderParent`, `toFolderName`, `toFolder`, `newFilename`) |
 | `bounce` | Bounce endpoint | `dropboxMove` (same shape — Make **moves**, never deletes) |
-| `move-files` | Log Status, Issue | `moves[]` of the same shape — client comments → Reviewed/R_, A4.5 Rejected → 05_Client Comments, A4.5 Approved → 06_Signed Off, Issue → 04_Issued |
+| `move-files` | Log Status, Issue | `moves[]` of the same shape — client comments → Reviewed/R_, A4.5/PRD Rejected → 05_Client Comments, A4.5/PRD Approved → 06_Signed Off, Issue → 04_Issued |
 | `dt-summary` | Send DT Emails button | Per-DT summary of actioned submissions for email |
 | `issue` | Issue endpoint | Submission details for issue notification |
 | `grade-summary` | Send Grade Emails button | Per-DT summary; folder block per return folder (Reviewed, 05_Client Comments for C01 rejections, or 06_Signed Off) |
