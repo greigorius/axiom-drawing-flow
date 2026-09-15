@@ -49,6 +49,14 @@
 .kanban .k-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:4px 24px 10px}
 .kanban .k-search{flex:0 0 280px;max-width:100%;background:var(--col);border:1px solid var(--border);color:var(--fg);border-radius:8px;padding:7px 12px;font-size:12.5px}
 .kanban .k-search::placeholder{color:var(--faint)}
+/* DT filter — matches the search field; color-scheme keeps the native dropdown dark */
+.kanban .k-dt-filter{flex:0 0 190px;max-width:100%;background:var(--col);border:1px solid var(--border);color:var(--fg);border-radius:8px;padding:7px 10px;font-size:12.5px;font-weight:600;cursor:pointer;color-scheme:dark}
+.kanban .k-dt-filter:hover{border-color:var(--border-hi)}
+.kanban .k-dt-filter:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.kanban .k-dt-filter option{background:var(--col);color:var(--fg)}
+.kanban .k-dt-clear{display:inline-flex;align-items:center;gap:7px;border:1px solid transparent;background:var(--accent);color:var(--accent-fg);padding:7px 12px;border-radius:8px;font-size:12.5px;font-weight:600;cursor:pointer;white-space:nowrap}
+.kanban .k-dt-clear:hover{filter:brightness(1.06)}
+.kanban .k-dt-clear:focus-visible{outline:2px solid var(--fg);outline-offset:2px}
 .kanban .k-seg{display:flex;background:var(--col);border:1px solid var(--border);border-radius:8px;padding:2px;gap:2px}
 .kanban .k-seg button{background:transparent;border:0;color:var(--muted);padding:5px 11px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer}
 .kanban .k-seg button[aria-pressed="true"]{background:var(--card-hi);color:var(--fg);box-shadow:var(--shadow)}

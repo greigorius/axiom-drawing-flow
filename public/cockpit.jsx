@@ -1143,14 +1143,13 @@ const Cockpit = () => {
         <input className="k-search" type="search" placeholder="Search drawing ref, title, DT…"
           value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search submissions" />
         <select className="k-dt-filter" value={dtFilter} onChange={(e) => setDtFilter(e.target.value)}
-          aria-label="Filter by DT"
-          style={{ padding: "6px 10px", borderRadius: 8, border: "1px solid var(--line, #d5dbe1)",
-                   background: "var(--surface, #fff)", color: "inherit", font: "inherit", maxWidth: 220 }}>
+          aria-label="Filter the board by DT">
           <option value="">All DTs</option>
           {dtNames.map((name) => <option key={name} value={name}>{name}</option>)}
         </select>
         {dtFilter && (
-          <button className="k-act" onClick={() => setDtFilter("")} title="Clear the DT filter">
+          <button className="k-dt-clear" onClick={() => setDtFilter("")}
+            title={`Clear the DT filter — showing ${dtTotal} drawing(s) for ${dtFilter}`}>
             {dtFilter} · {dtTotal} in flow ✕
           </button>
         )}
