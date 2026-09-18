@@ -29,8 +29,10 @@ const dt    = (d) => ({ date: d ? { start: d } : null });
 const num   = (v) => ({ number: v });
 
 const pages = {
-  task1:  { id: "task1",  url: "u/task1",  properties: { "Item Name": title("Suffix 112 B2 Glazed Screen"), "Project": rel("proj1") } },
-  task2:  { id: "task2",  url: "u/task2",  properties: { "Item Name": title("Suffix 200 Soft Cell Panelling"), "Project": rel("proj1") } },
+  // "Projects" (plural) is the real relation name on the Tasks DB — the fixture used to say
+  // "Project", which quietly agreed with the bug in the resolver instead of catching it.
+  task1:  { id: "task1",  url: "u/task1",  properties: { "Item Name": title("Suffix 112 B2 Glazed Screen"), "Projects": rel("proj1") } },
+  task2:  { id: "task2",  url: "u/task2",  properties: { "Item Name": title("Suffix 200 Soft Cell Panelling"), "Projects": rel("proj1") } },
   proj1:  { id: "proj1",  url: "u/proj1",  properties: { "Project Name": title("24-354 EIT") } },
 };
 
@@ -75,8 +77,15 @@ const notion = {
     if (database_id === "RFIS") { if (rfiShouldFail) throw new Error("boom"); return { results: rfiRows, has_more: false }; }
     // Only proj1 has items — an unknown project must come back empty, so the route's
     // "no items in scope" short-circuit is actually exercised.
+    //
+    // The property name is matched strictly. The Tasks DB's relation to Projects is called
+    // "Projects" (plural); there is no "Project" property on it, and asking Notion for one
+    // 400s — which is exactly how every project-scoped call came back as a 500 in
+    // production on 18 Sep 2026. A mock that ignored the property name would have let that
+    // regression through, so this one refuses anything but the real name.
     if (database_id === "TASKS") return {
-      results: filter?.relation?.contains === "proj1" ? [pages.task1, pages.task2] : [], has_more: false };
+      results: (filter?.property === "Projects" && filter?.relation?.contains === "proj1")
+        ? [pages.task1, pages.task2] : [], has_more: false };
     return { results: [], has_more: false };
   }},
   pages: { retrieve: async ({ page_id }) => pages[page_id] || (() => { throw new Error("404"); })() },
@@ -130,6 +139,17 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.ok(seen.ACT[0].or, "project scope OR's the project's task ids");
   assert.strictEqual(seen.ACT[0].or.length, 2);
   ok("feed: projectId resolves to the project's items");
+
+  // Regression: the Tasks relation is "Projects", not "Project". Getting this wrong 500s
+  // every project-scoped call, and it shipped that way once.
+  reset();
+  await call("GET /api/df/activity-log", { projectId: "proj1" });
+  assert.strictEqual(seen.TASKS[0].property, "Projects",
+    'Tasks are related to Projects by "Projects" — "Project" does not exist and Notion 400s on it');
+  reset();
+  await call("GET /api/df/activity-position", { projectId: "proj1" });
+  assert.strictEqual(seen.TASKS[0].property, "Projects");
+  ok("feed + position: project scope uses the relation that actually exists");
 
   // ── feed: composing filters ─────────────────────────────────────────────
   reset();

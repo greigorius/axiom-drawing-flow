@@ -142,7 +142,10 @@ async function getRevisionDays(notion, drawingPageIds) {
     const taskIds    = getProp(drawing, "Item",    "relation");
     if (!taskIds?.length) return 7;
     const task       = await notion.pages.retrieve({ page_id: taskIds[0] });
-    const projectIds = getProp(task,    "Project", "relation");
+    // Same misnamed relation as above. This one failed silently rather than loudly: the
+    // lookup returned null, so every programme date was computed from the hardcoded
+    // 7-day fallback instead of the project's own Revision Days.
+    const projectIds = getProp(task,    "Projects", "relation");
     if (!projectIds?.length) return 7;
     const project    = await notion.pages.retrieve({ page_id: projectIds[0] });
     return getProp(project, "Revision Days", "number") ?? 7;
@@ -929,11 +932,12 @@ async function fireWebhook(url, payload) {
 // to Tasks, not Projects directly, so "all activity for this project" is built by first
 // finding its tasks, then OR-ing the Task relation filter across all of their IDs.
 async function findTaskIdsForProject(notion, projectId) {
-  // Tasks DB's relation to Projects DB is named "Project" (singular) — confirmed by
-  // getRevisionDays above, which walks this same relation. There's a separate rollup
-  // property named "Projects" (plural, used elsewhere to search project names as text),
-  // which isn't relation-filterable and would 400 if used here.
-  const results = await queryAll(notion, TASKS_DB, { property: "Project", relation: { contains: projectId } });
+  // The Tasks → Projects relation is named "Projects" (plural). There is no "Project"
+  // property on the Tasks DB at all: filtering on one made Notion 400, which surfaced as a
+  // 500 on every project-scoped feed and position call. /api/tasks in app.js has always
+  // used the correct name — this was the odd one out. Verified against the live schema
+  // 18 Sep 2026; the Projects side of the same relation is called "Tasks".
+  const results = await queryAll(notion, TASKS_DB, { property: "Projects", relation: { contains: projectId } });
   return results.map((p) => p.id);
 }
 
@@ -961,7 +965,7 @@ function makeTaskNameResolver(notion) {
       taskCache.set(taskId, withNotionRetry(() => notion.pages.retrieve({ page_id: taskId }))
         .then(async (page) => {
           const taskName    = getProp(page, "Item Name", "title");
-          const projectId   = getProp(page, "Project", "relation")?.[0] ?? null;
+          const projectId   = getProp(page, "Projects", "relation")?.[0] ?? null;
           const projectName = await resolveProjectName(projectId);
           return { taskName, projectName };
         })
