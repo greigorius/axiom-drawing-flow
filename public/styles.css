@@ -751,7 +751,7 @@ main {
 }
 
 /* Tag pills — one solid color per tag, consistent between the feed rows and the
-   quick-log picker buttons below. All verified >=4.5:1 contrast with white text. */
+   filter chips below. All verified >=4.5:1 contrast with white text. */
 .tag-pill {
   display: inline-block;
   font-size: 10px;
@@ -821,13 +821,6 @@ main {
 .activity-file-doc:hover { border-color: var(--accent); }
 
 /* ─── Quick-log form ─────────────────────────────────────────────────── */
-.activity-note-input {
-  width: 100%;
-  resize: vertical;
-  min-height: 60px;
-  margin-bottom: 12px;
-}
-
 .tag-picker {
   display: flex;
   flex-wrap: wrap;
@@ -1006,4 +999,224 @@ main {
 @keyframes notif-toast-in {
   from { opacity: 0; transform: translateY(6px); }
   to   { opacity: 1; transform: translateY(0); }
+}
+
+
+/* ─── Activity feed: filters ──────────────────────────────────────────
+   The chips reuse .tag-picker-btn from the old quick-log picker, so a tag reads
+   identically whether it is being filtered on or displayed on a row. */
+.filter-block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 18px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.filter-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.filter-legend {
+  flex: 0 0 52px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text3);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding-top: 6px;
+}
+
+/* Neutral by design: a source is a fact about where an entry came from, not a status,
+   so it gets no colour of its own to compete with the tag pills. */
+.source-filter-btn {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background: var(--bg4);
+  color: var(--text2);
+  cursor: pointer;
+  font-family: var(--font);
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.source-filter-btn:hover { color: var(--text); }
+.source-filter-btn.selected {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+/* Once a filter is on, the chips it excludes step back. Without this, eight solid tag
+   colours all read as equally active and the selection ring is easy to miss at a glance. */
+.filter-row[data-filtering="true"] .tag-picker-btn:not(.selected),
+.filter-row[data-filtering="true"] .source-filter-btn:not(.selected) {
+  opacity: 0.4;
+}
+
+.filter-row[data-filtering="true"] .tag-picker-btn:not(.selected):hover,
+.filter-row[data-filtering="true"] .source-filter-btn:not(.selected):hover {
+  opacity: 0.75;
+}
+
+.filter-dates {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.filter-date {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  padding: 5px 10px;
+  font-size: 12px;
+  font-family: var(--font);
+  outline: none;
+  color-scheme: dark;
+}
+
+.filter-date:focus { border-color: var(--accent); }
+.filter-date-sep { font-size: 12px; color: var(--text3); }
+.filter-clear { margin-left: 4px; }
+
+/* ─── Activity feed: current position ─────────────────────────────────
+   A stat row, not a chart. "With DM" is the hero figure — the one number that says
+   whether anything is sitting in Greig's court — and the two supporting tiles are
+   deliberately smaller. Colour never carries meaning alone here: every value has its
+   label beside it, so the green-at-zero state is a reward, not the message. */
+.position-header {
+  display: flex;
+  align-items: stretch;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.position-hero {
+  flex: 0 0 auto;
+  min-width: 150px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius2);
+  padding: 14px 20px;
+}
+
+.position-hero-value {
+  font-size: 48px;
+  font-weight: 600;
+  line-height: 1.05;
+  color: var(--text);
+  /* Proportional figures, not tabular — at 48px, tabular digits make a number like
+     121 read loose and gappy. Tabular is for columns that must align. */
+  font-variant-numeric: proportional-nums;
+}
+
+.position-hero-label {
+  font-size: 12px;
+  color: var(--text2);
+  margin-top: 2px;
+}
+
+.position-hero-clear {
+  border-color: var(--success2);
+  background: rgba(34, 197, 94, 0.08);
+}
+
+.position-hero-clear .position-hero-value,
+.position-hero-clear .position-hero-label { color: var(--success); }
+
+.position-tiles {
+  display: flex;
+  gap: 16px;
+  align-items: stretch;
+}
+
+.stat-tile {
+  min-width: 96px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius2);
+  padding: 14px 18px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.stat-value {
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.1;
+  color: var(--text);
+  font-variant-numeric: proportional-nums;
+}
+
+.stat-value-alert { color: var(--warning); }
+
+.stat-label {
+  font-size: 12px;
+  color: var(--text2);
+  margin-top: 2px;
+}
+
+.position-note {
+  font-size: 12px;
+  color: var(--warning);
+  margin-bottom: 12px;
+}
+
+/* ─── Activity feed: blocker strip ────────────────────────────────────
+   Rendered only when something is actually blocked — absence is silent, with no
+   "no blockers" placeholder to read past. */
+.blocker-strip {
+  background: rgba(239, 68, 68, 0.06);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: var(--radius2);
+  padding: 12px 16px;
+  margin-bottom: 16px;
+}
+
+.blocker-strip-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--danger);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 10px;
+}
+
+.blocker-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 5px 0;
+  font-size: 13px;
+  border-top: 1px solid rgba(239, 68, 68, 0.12);
+}
+
+.blocker-row:first-of-type { border-top: none; }
+
+.blocker-item   { color: var(--text); font-weight: 500; }
+.blocker-reason { color: var(--text2); }
+.blocker-bic    { color: var(--text3); font-size: 12px; margin-left: auto; white-space: nowrap; }
+
+.source-badge-ai  { background: #14532d; } /* green-900  — matches the A&I source badge */
+.source-badge-rfi { background: #7c2d12; } /* orange-900 — matches the RFI source badge */
+
+.unassigned-note {
+  font-size: 12px;
+  color: var(--warning);
+  background: rgba(245, 158, 11, 0.07);
+  border: 1px solid rgba(245, 158, 11, 0.25);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  margin-bottom: 16px;
 }

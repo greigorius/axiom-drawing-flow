@@ -13,8 +13,9 @@
 //   GET    /api/df/inputs/:projectId
 //   GET    /api/df/inputs/:projectId/:taskId
 //   POST   /api/df/inputs
-//   GET    /api/df/activity-log        ?taskId&limit  — Item Activity Log feed for a task
-//   POST   /api/df/activity-log        manual/backfill entry (also auto-fired on approve/issue/bounce/log-status/ingest)
+//   GET    /api/df/activity-log        ?taskId&projectId&days&limit&tag&source&from&to — Item Activity Feed
+//   GET    /api/df/activity-position   ?projectId&taskId — live state from A&I + RFIs (not the log)
+//   GET    /api/df/activity-export     ?<same filters as activity-log> — XLSX of exactly what's on screen
 //   GET    /api/df/notifications        cockpit ingest-run feed (created/skipped/error), newest first
 //   POST   /api/df/notifications/clear  clears the feed once reviewed
 //
@@ -40,6 +41,14 @@ const TEAM_DB        = process.env.NOTION_DB_TEAM;
 const TASKS_DB       = process.env.NOTION_DB_TASKS;
 const INPUTS_DB      = () => process.env.NOTION_DB_INPUTS;
 const ACTIVITY_LOG_DB = process.env.NOTION_DB_ACTIVITY_LOG;
+const ACTIONS_INFO_DB = process.env.NOTION_DB_ACTIONS_INFO;
+const RFIS_DB         = process.env.NOTION_DB_RFIS;
+
+// Whether an RFI sitting at Raise/Open counts as a blocker on its item. Provisional: on by
+// default so the blocker strip has real content from day one, but whether *every* open RFI
+// genuinely blocks is a call to make from live data, not in advance (handoff doc §13).
+// Flip this one line to drop RFIs out of the blocked count and the blocker strip.
+const OPEN_RFIS_BLOCK = true;
 
 // --- Stage constants ---
 
@@ -3014,180 +3023,352 @@ module.exports = function mountDrawingFlow(app, notion) {
     }
   });
 
-  // GET /api/df/activity-log?taskId=&projectId=&days=&limit=
-  // Three modes, in priority order:
-  //   taskId given    -> full history for that one item, unbounded by date.
-  //   projectId given -> all activity across every item in that project, unbounded by date
-  //                      (resolves the project's task IDs first, then OR's the Task filter).
-  //   neither given   -> global feed across every project/item, capped to the last `days`
-  //                      (default 7) — this is the default page-load view.
-  // Sorts by "Event Date" when set (backfilled/historical entries), else Created.
+  // Scope a query to one or many Task ids. Notion caps filter nesting at two levels, so
+  // this returns a bare property filter for the single-id case rather than a pointless
+  // one-element `or` that would burn a level when nested inside an `and`.
+  const taskScopeFilter = (prop, ids) => ids.length === 1
+    ? { property: prop, relation: { contains: ids[0] } }
+    : { or: ids.map((id) => ({ property: prop, relation: { contains: id } })) };
 
+  // Comma-separated multi-value select filter ("#issue,#query"), same nesting care.
+  const selectAnyOf = (prop, raw) => {
+    const vals = String(raw || "").split(",").map((s) => s.trim()).filter(Boolean);
+    if (!vals.length) return null;
+    return vals.length === 1
+      ? { property: prop, select: { equals: vals[0] } }
+      : { or: vals.map((v) => ({ property: prop, select: { equals: v } })) };
+  };
+
+  // A date arrives as YYYY-MM-DD from the UI's range picker. Anchor both ends to the whole
+  // day, or "to = today" silently drops everything logged today.
+  const dayStart = (d) => new Date(`${String(d).slice(0, 10)}T00:00:00.000Z`).getTime();
+  const dayEnd   = (d) => new Date(`${String(d).slice(0, 10)}T23:59:59.999Z`).getTime();
+
+  // An entry's effective date is Event Date when set (backfilled history), else Created.
+  const effectiveDate = (e) => e.eventDate || e.created;
+
+  const daysOpen = (since) => since
+    ? Math.max(0, Math.floor((Date.now() - new Date(since).getTime()) / 86400000))
+    : null;
+
+  // --- Shared fetchers -------------------------------------------------------
+  //
+  // The feed, the position header and the export must never be three different queries —
+  // "the export is exactly what is on screen" is a hard requirement (handoff doc §7.5), and
+  // the only way to keep it true as the filters grow is for all three routes to go through
+  // the same two functions. Add a filter here, not in a route.
+
+  // Date range is deliberately split between Notion and here. Event Date is always <=
+  // Created — you can backfill the past, not the future — so `Created >= from` is a safe
+  // superset of `effective >= from` and can go to Notion. The upper bound cannot: an entry
+  // created today can carry an Event Date from last month and must still fall inside a
+  // range that ended last month. Both bounds are therefore re-applied exactly, below.
+  async function fetchActivityEntries(q = {}) {
+    const { taskId, projectId, days, limit, tag, source, from, to } = q;
+    const pageSize = Math.min(Number(limit) || (taskId || projectId ? 50 : 100), 200);
+    const clauses = [];
+
+    if (taskId) {
+      clauses.push({ property: "Task", relation: { contains: taskId } });
+    } else if (projectId) {
+      const projectTaskIds = await findTaskIdsForProject(notion, projectId);
+      if (!projectTaskIds.length) return [];
+      clauses.push(taskScopeFilter("Task", projectTaskIds));
+    } else if (!from && !to) {
+      const windowDays = Number(days) || 7;
+      clauses.push({ property: "Created", created_time: {
+        on_or_after: new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000).toISOString() } });
+    }
+
+    const tagFilter    = selectAnyOf("Tag", tag);
+    const sourceFilter = selectAnyOf("Source", source);
+    if (tagFilter)    clauses.push(tagFilter);
+    if (sourceFilter) clauses.push(sourceFilter);
+    if (from) clauses.push({ property: "Created", created_time: { on_or_after: new Date(dayStart(from)).toISOString() } });
+
+    const filter = clauses.length === 0 ? undefined
+                 : clauses.length === 1 ? clauses[0]
+                 : { and: clauses };
+
+    const result = await notion.databases.query({
+      database_id: ACTIVITY_LOG_DB,
+      ...(filter ? { filter } : {}),
+      sorts:     [{ property: "Created", direction: "descending" }],
+      page_size: pageSize,
+    });
+
+    // Enrich with which item each entry belongs to — needed once a feed can span more than
+    // one Task. Cached per unique Task id, so a feed full of entries from the same handful
+    // of items costs one lookup each, not one per entry.
+    const resolveTaskName = makeTaskNameResolver(notion);
+    let entries = await Promise.all(result.results.map(async (page) => {
+      const entryTaskId = getProp(page, "Task", "relation")?.[0] ?? null;
+      const { taskName, projectName } = entryTaskId
+        ? await resolveTaskName(entryTaskId)
+        : { taskName: null, projectName: null };
+      return {
+        id:        page.id,
+        created:   page.created_time,
+        eventDate: getProp(page, "Event Date", "date"),
+        entry:     getProp(page, "Entry",  "title"),
+        source:    getProp(page, "Source", "select"),
+        tag:       getProp(page, "Tag",    "select"),
+        author:    getProp(page, "Author", "rich_text"),
+        detail:    getProp(page, "Detail", "rich_text") ?? "",
+        link:      getProp(page, "Link",   "url") ?? "",
+        files:     getProp(page, "Files & media", "files") ?? [],
+        taskId:    entryTaskId,
+        taskName,
+        projectName,
+      };
+    }));
+
+    if (from || to) {
+      const lo = from ? dayStart(from) : -Infinity;
+      const hi = to   ? dayEnd(to)     :  Infinity;
+      entries = entries.filter((e) => {
+        const t = new Date(effectiveDate(e)).getTime();
+        return t >= lo && t <= hi;
+      });
+    }
+
+    // Notion's own sort covers Created order; re-sort here so any row with an Event Date
+    // slots into true chronological position instead of clustering at the top by the time
+    // it happened to be typed up.
+    entries.sort((a, b) => new Date(effectiveDate(b)) - new Date(effectiveDate(a)));
+    return entries;
+  }
+
+  // Current state, not history. Reads the trackers live and never touches the Activity Log:
+  // the feed answers "how did we get here", this answers "where are we now", and deriving
+  // either from the other makes both wrong (handoff doc §7.2).
+  //
+  // Reads TWO sources, not three. Every submission carries its own A&I action row (§6.1),
+  // so querying the Submissions DB as well would count every submission twice.
+  async function fetchPosition(q = {}) {
+    const { projectId, taskId } = q;
+    const errors = [];
+    const empty = { open: 0, blocked: 0, withDM: 0, unassigned: 0, blockers: [], items: { ai: [], rfis: [] } };
+
+    // null scope = global (no relation filter at all).
+    let scopeIds = null;
+    if (taskId) {
+      scopeIds = [taskId];
+    } else if (projectId) {
+      scopeIds = await findTaskIdsForProject(notion, projectId);
+      if (!scopeIds.length) return empty;
+    }
+
+    const aiClauses = [
+      { property: "Tags",     multi_select: { contains: "Track" } },
+      { property: "Archived", checkbox:     { equals: false } },
+    ];
+    if (scopeIds) aiClauses.push(taskScopeFilter("Items", scopeIds));
+    const aiRows = await queryAll(notion, ACTIONS_INFO_DB, { and: aiClauses });
+
+    // A failing RFI query degrades to A&I-only rather than blanking the whole header — a
+    // partial blocker strip beats an error page.
+    let rfiRows = [];
+    if (RFIS_DB) {
+      const rfiClauses = [{ or: [
+        { property: "RFI Status", select: { equals: "Raise" } },
+        { property: "RFI Status", select: { equals: "Open"  } },
+      ]}];
+      if (scopeIds) rfiClauses.push(taskScopeFilter("Related Item(s)", scopeIds));
+      try {
+        rfiRows = await queryAll(notion, RFIS_DB, { and: rfiClauses });
+      } catch (err) {
+        console.warn("[activity-position] RFI query failed:", err.message);
+        errors.push(`RFIs unavailable: ${err.message}`);
+      }
+    }
+
+    const resolveTaskName = makeTaskNameResolver(notion);
+
+    const ai = await Promise.all(aiRows.map(async (page) => {
+      const itemId = getProp(page, "Items", "relation")?.[0] ?? null;
+      const { taskName, projectName } = itemId
+        ? await resolveTaskName(itemId)
+        : { taskName: null, projectName: null };
+      // "—" is the explicit "looked at it, nothing is holding it up" option, a different
+      // statement from a blank Blocker ("not assessed"). Neither is a blocker.
+      const blocker = getProp(page, "Blocker", "select");
+      return {
+        id:       page.id,
+        title:    getProp(page, "Note", "title"),
+        status:   getProp(page, "Track Status",  "select"),
+        bic:      getProp(page, "Ball in Court", "select"),
+        category: getProp(page, "Category",      "select"),
+        blocker:  blocker && blocker !== "—" ? blocker : null,
+        created:  page.created_time,
+        // When the Email Tracker set a Received date, that — not the row's creation time —
+        // is when the clock started on this action.
+        received: getProp(page, "Received", "date"),
+        url:      page.url,
+        taskId:   itemId,
+        taskName,
+        projectName,
+      };
+    }));
+
+    const rfis = await Promise.all(rfiRows.map(async (page) => {
+      const itemId = getProp(page, "Related Item(s)", "relation")?.[0] ?? null;
+      const { taskName, projectName } = itemId
+        ? await resolveTaskName(itemId)
+        : { taskName: null, projectName: null };
+      const n = getProp(page, "RFI Number", "number");
+      return {
+        id:      page.id,
+        ref:     (n === null || n === undefined) ? "RFI-?" : `RFI-${String(n).padStart(3, "0")}`,
+        title:   getProp(page, "RFI Description", "title"),
+        status:  getProp(page, "RFI Status", "select"),
+        bic:     getProp(page, "TBC by",     "select"),
+        raised:  getProp(page, "Date Raised", "date"),
+        created: page.created_time,
+        url:     page.url,
+        taskId:  itemId,
+        taskName,
+        projectName,
+      };
+    }));
+
+    const blockers = [
+      ...ai.filter((r) => r.blocker).map((r) => ({
+        source: "A&I", ref: null, id: r.id, title: r.title,
+        item: r.taskName, reason: r.blocker, bic: r.bic || "—", url: r.url,
+      })),
+      ...(OPEN_RFIS_BLOCK ? rfis.map((r) => ({
+        source: "RFI", ref: r.ref, id: r.id, title: r.title,
+        item: r.taskName, reason: "Awaiting RFI response", bic: r.bic || "—", url: r.url,
+      })) : []),
+    ];
+
+    // An untethered tracked row can never reach an item feed. Surfaced, not swallowed — it
+    // is a data-quality problem and hiding it is worse than showing it (§6.4).
+    const unassigned = [...ai, ...rfis].filter((r) => !r.taskId).length;
+
+    return {
+      open:    ai.length + rfis.length,
+      blocked: blockers.length,
+      withDM:  ai.filter((r) => r.bic === "Me").length,
+      unassigned,
+      blockers,
+      items: { ai, rfis },
+      ...(errors.length ? { errors } : {}),
+    };
+  }
+
+  // GET /api/df/activity-log?taskId=&projectId=&days=&limit=&tag=&source=&from=&to=
+  // Scope, in priority order:
+  //   taskId given    -> full history for that one item, unbounded by date.
+  //   projectId given -> all activity across every item in that project, unbounded by date.
+  //   neither given   -> global feed, capped to the last `days` (default 7) — the default
+  //                      page-load view. Skipped when an explicit from/to supersedes it.
+  // tag and source accept comma-separated lists and compose with the scope and each other.
   app.get("/api/df/activity-log", async (req, res) => {
     if (!ACTIVITY_LOG_DB) return res.status(503).json({ ok: false, error: "NOTION_DB_ACTIVITY_LOG not configured" });
-    const { taskId, projectId, days, limit } = req.query;
-    const pageSize = Math.min(Number(limit) || (taskId || projectId ? 50 : 100), 200);
-
     try {
-      let filter;
-      if (taskId) {
-        filter = { property: "Task", relation: { contains: taskId } };
-      } else if (projectId) {
-        const projectTaskIds = await findTaskIdsForProject(notion, projectId);
-        if (!projectTaskIds.length) return res.json({ entries: [] });
-        filter = { or: projectTaskIds.map((id) => ({ property: "Task", relation: { contains: id } })) };
-      } else {
-        const windowDays = Number(days) || 7;
-        const since = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000).toISOString();
-        filter = { property: "Created", created_time: { on_or_after: since } };
-      }
-
-      const result = await notion.databases.query({
-        database_id: ACTIVITY_LOG_DB,
-        filter,
-        sorts:       [{ property: "Created", direction: "descending" }],
-        page_size:   pageSize,
-      });
-
-      // Enrich with which item each entry belongs to — needed once a feed can span more
-      // than one Task (the global and project-scoped views). Cached per unique Task id so a
-      // feed full of entries from the same handful of items only costs one lookup each.
-      const resolveTaskName = makeTaskNameResolver(notion);
-      const entries = await Promise.all(result.results.map(async (page) => {
-        const entryTaskId = getProp(page, "Task", "relation")?.[0] ?? null;
-        const { taskName, projectName } = entryTaskId
-          ? await resolveTaskName(entryTaskId)
-          : { taskName: null, projectName: null };
-        return {
-          id:          page.id,
-          created:     page.created_time,
-          eventDate:   getProp(page, "Event Date", "date"),
-          entry:       getProp(page, "Entry",   "title"),
-          source:      getProp(page, "Source",  "select"),
-          tag:         getProp(page, "Tag",     "select"),
-          author:      getProp(page, "Author",  "rich_text"),
-          detail:      getProp(page, "Detail",  "rich_text") ?? "",
-          link:        getProp(page, "Link",    "url") ?? "",
-          files:       getProp(page, "Files & media", "files") ?? [],
-          taskId:      entryTaskId,
-          taskName,
-          projectName,
-        };
-      }));
-
-      // Notion's own sort covers Created order; re-sort here so any row with an Event Date
-      // (backfilled history) slots into true chronological position instead of clustering
-      // at the top by its real Created (import) time.
-      entries.sort((a, b) => new Date(b.eventDate || b.created) - new Date(a.eventDate || a.created));
-
-      res.json({ entries });
+      res.json({ entries: await fetchActivityEntries(req.query) });
     } catch (err) {
       console.error("GET /api/df/activity-log", err);
       res.status(500).json({ ok: false, error: err.message });
     }
   });
 
-  // POST /api/df/activity-log
-  // Manual quick-log entry from the cockpit Feed panel, and the general-purpose write path
-  // for backfilling historical entries (old emails, past events). Author has no picker in
-  // the UI yet, so the cockpit always sends author: 'DM' — see handoff doc.
-  // Pass eventDate (YYYY-MM-DD) only when backfilling; omit it for real-time manual notes.
-
-  app.post("/api/df/activity-log", async (req, res) => {
-    if (!ACTIVITY_LOG_DB) return res.status(503).json({ ok: false, error: "NOTION_DB_ACTIVITY_LOG not configured" });
-    const { taskId, tag, entry, author, source, detail, link, eventDate } = req.body || {};
-    if (!entry) return res.status(400).json({ ok: false, error: "entry required" });
-    if (!tag)   return res.status(400).json({ ok: false, error: "tag required" });
-
+  // GET /api/df/activity-position?projectId=&taskId=
+  app.get("/api/df/activity-position", async (req, res) => {
+    if (!ACTIONS_INFO_DB) return res.status(503).json({ ok: false, error: "NOTION_DB_ACTIONS_INFO not configured" });
     try {
-      const resolvedSource = source || "Manual";
-      const properties = {
-        "Entry":  { title:     [{ text: { content: truncateForNotion(entry) } }] },
-        "Source": { select:    { name: resolvedSource } },
-        "Tag":    { select:    { name: tag } },
-        "Author": { rich_text: [{ text: { content: truncateForNotion(author || "DM") } }] },
-      };
-      if (taskId)    properties["Task"]       = { relation: [{ id: taskId }] };
-      if (detail)    properties["Detail"]     = { rich_text: [{ text: { content: truncateForNotion(detail) } }] };
-      if (link)      properties["Link"]       = { url: link };
-      if (eventDate) properties["Event Date"] = { date: { start: eventDate } };
-
-      const newPage = await notion.pages.create({ parent: { database_id: ACTIVITY_LOG_DB }, properties });
-      res.json({
-        ok: true,
-        entry: {
-          id:        newPage.id,
-          created:   newPage.created_time,
-          eventDate: eventDate ?? null,
-          entry, tag, detail: detail || "", link: link || "",
-          source: resolvedSource,
-          author: author || "DM",
-        },
-      });
+      res.json(await fetchPosition(req.query));
     } catch (err) {
-      console.error("POST /api/df/activity-log", err);
+      console.error("GET /api/df/activity-position", err);
       res.status(500).json({ ok: false, error: err.message });
     }
   });
 
-  // POST /api/df/email-ingest
-  // Make.com watches a dedicated capture address/label (Greig forwards or BCCs relevant
-  // emails there) and POSTs each new message here. Accepts a few field-name aliases since
-  // different Make email modules (Gmail vs. Email/IMAP) name things slightly differently.
+  // GET /api/df/activity-export?<same filters as activity-log>
+  // Streams an .xlsx built server-side. Goes through the same two fetchers as the feed and
+  // the header, so what downloads is exactly what was on screen — if the UI shows 12
+  // entries, Sheet 1 has 12 rows.
   //
-  // Item matching is deliberately conservative: only looks for the "Suffix NNN" convention
-  // already used everywhere else in this codebase, and only links the entry to a Task when
-  // that produces exactly one match (see findTaskByItemNo above). No project context comes
-  // through from an email subject, so anything unmatched or ambiguous logs with no Task —
-  // it'll still show up in the global feed, just needs a manual Task relation added in
-  // Notion afterward. Tag defaults to #info (the same "when in doubt" default used
-  // elsewhere) since reliably inferring intent from arbitrary email text is a later,
-  // AI-assisted step, not this one.
-  //
-  // Attachments are out of scope for this first version — subject + body text only.
-
-  app.post("/api/df/email-ingest", async (req, res) => {
+  // exceljs, not SheetJS. The brief named SheetJS, but the free `xlsx` build writes neither
+  // cell styles nor frozen panes (verified against the generated XML — styles are a Pro
+  // feature), and a bold header row and frozen top row are both explicit requirements.
+  app.get("/api/df/activity-export", async (req, res) => {
     if (!ACTIVITY_LOG_DB) return res.status(503).json({ ok: false, error: "NOTION_DB_ACTIVITY_LOG not configured" });
-
-    const body = req.body || {};
-    const rawSubject = body.subject || "";
-    const bodyText    = body.text || body.body || body.bodyPlain || "";
-    const fromEmail   = body.from || body.fromEmail || body.sender || "";
-    const fromName    = body.fromName || body.senderName || "";
-    const messageUrl  = body.messageUrl || body.link || body.permalink || "";
-
-    if (!rawSubject && !bodyText) {
-      return res.status(400).json({ ok: false, error: "subject or body text required" });
-    }
-
     try {
-      // Strip reply/forward prefixes (Re:, Fwd:, Fw: — possibly stacked) for a cleaner
-      // Entry title; the Source badge already says "Email" so no need to prefix that too.
-      const cleanSubject = rawSubject
-        .replace(/^\s*(re|fwd?)\s*:\s*/i, "")
-        .replace(/^\s*(re|fwd?)\s*:\s*/i, "")
-        .trim() || "(no subject)";
+      const ExcelJS = require("exceljs");
+      const [entries, position] = await Promise.all([
+        fetchActivityEntries(req.query),
+        ACTIONS_INFO_DB ? fetchPosition(req.query) : Promise.resolve(null),
+      ]);
 
-      const itemNo = parseItemNoFromSubject(rawSubject);
-      const task   = itemNo ? await findTaskByItemNo(notion, itemNo) : null;
+      const wb = new ExcelJS.Workbook();
+      wb.creator = "Axiom Drawing Flow";
+      wb.created = new Date();
 
-      const author = fromName || fromEmail || "Unknown";
+      // Real Date cells with a UK number format, not pre-formatted strings — a string
+      // column sorts alphabetically in Excel, which puts 01/12 before 02/03.
+      const UK_DATETIME = "dd/mm/yyyy hh:mm";
+      const UK_DATE     = "dd/mm/yyyy";
 
-      await createActivityLogEntry(notion, {
-        taskId: task?.id ?? null,
-        source: "Email",
-        tag:    "#info",
-        author,
-        entry:  cleanSubject,
-        detail: bodyText,
-        link:   messageUrl,
-      });
+      const finish = (ws, widths) => {
+        // Per cell, not ws.getRow(1).font — a row-level font is not what Excel stores and
+        // does not survive a write/read round-trip.
+        ws.getRow(1).eachCell((c) => { c.font = { bold: true }; });
+        ws.views = [{ state: "frozen", ySplit: 1 }];
+        ws.columns.forEach((c, i) => { c.width = widths[i]; });
+        ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: widths.length } };
+      };
 
-      console.log(`[email-ingest] "${cleanSubject}" from ${author}${task ? ` → matched Suffix ${itemNo}` : itemNo ? ` → Suffix ${itemNo} not uniquely matched, unlinked` : " → no item number in subject, unlinked"}`);
+      // ── Sheet 1: Activity Log ──────────────────────────────────────────
+      const s1 = wb.addWorksheet("Activity Log");
+      s1.addRow(["Date", "Project", "Item", "Tag", "Source", "Author", "Entry", "Detail", "Link"]);
+      for (const e of entries) {
+        const row = s1.addRow([
+          new Date(effectiveDate(e)),
+          e.projectName || "", e.taskName || "(unassigned)",
+          e.tag || "", e.source || "", e.author || "",
+          e.entry || "", e.detail || "", null,
+        ]);
+        row.getCell(1).numFmt = UK_DATETIME;
+        if (e.link) row.getCell(9).value = { text: "Open", hyperlink: e.link };
+      }
+      finish(s1, [18, 20, 32, 14, 14, 14, 70, 60, 10]);
 
-      res.json({ ok: true, matched: !!task, taskId: task?.id ?? null, itemNo: itemNo ?? null });
+      // ── Sheet 2: Current Position ──────────────────────────────────────
+      const s2 = wb.addWorksheet("Current Position");
+      s2.addRow(["Source", "Ref", "Project", "Item", "Title", "Status", "Ball in Court", "Blocker", "Opened", "Days Open"]);
+      if (position) {
+        const rows = [
+          ...position.items.ai.map((r) => ({
+            source: "A&I", ref: "", project: r.projectName, item: r.taskName, title: r.title,
+            status: r.status, bic: r.bic, blocker: r.blocker, since: r.received || r.created,
+          })),
+          ...position.items.rfis.map((r) => ({
+            source: "RFI", ref: r.ref, project: r.projectName, item: r.taskName, title: r.title,
+            status: r.status, bic: r.bic, blocker: OPEN_RFIS_BLOCK ? "Awaiting RFI response" : null,
+            since: r.raised || r.created,
+          })),
+        ].sort((a, b) => new Date(a.since) - new Date(b.since)); // oldest first — what to chase
+        for (const r of rows) {
+          const row = s2.addRow([
+            r.source, r.ref || "", r.project || "", r.item || "(unassigned)", r.title || "",
+            r.status || "", r.bic || "", r.blocker || "",
+            r.since ? new Date(r.since) : null, daysOpen(r.since),
+          ]);
+          row.getCell(9).numFmt = UK_DATE;
+        }
+      }
+      finish(s2, [10, 10, 20, 32, 50, 14, 16, 24, 12, 11]);
+
+      const buf = await wb.xlsx.writeBuffer();
+      const stamp = new Date().toISOString().slice(0, 10);
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader("Content-Disposition", `attachment; filename="activity-export_${stamp}.xlsx"`);
+      res.send(Buffer.from(buf));
     } catch (err) {
-      console.error("POST /api/df/email-ingest", err);
+      console.error("GET /api/df/activity-export", err);
       res.status(500).json({ ok: false, error: err.message });
     }
   });

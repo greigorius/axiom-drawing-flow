@@ -12,10 +12,11 @@ const notion = new Client({ auth: process.env.NOTION_TOKEN });
 // ─── Middleware ────────────────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
-// The email-ingest Make scenario posts its body as application/x-www-form-urlencoded
-// (safer than a hand-built JSON string template for arbitrary email text — Make escapes
-// url-encoded fields itself, where a raw JSON string body would break on stray quotes or
-// newlines in a subject/body). Every other endpoint still sends/expects JSON as before.
+// Retained for Make.com scenarios that post application/x-www-form-urlencoded rather
+// than JSON (Make escapes url-encoded fields itself, where a raw JSON string body breaks
+// on stray quotes or newlines in free text). Every other endpoint sends/expects JSON.
+// Originally added for /api/df/email-ingest, removed Sep 2026 — email now reaches the
+// feed via the Email Task Tracker → Actions & Info, not a second direct path.
 app.use(express.urlencoded({ extended: true }));
 
 // ─── Drawing Flow routes (MUST be before static middleware) ───────────────────
