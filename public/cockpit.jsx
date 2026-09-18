@@ -16,6 +16,7 @@ function stageBadgeClass(stage) {
   if (stage === "S5") return "badge-s5";
   if (stage === "S3") return "badge-s3";
   if (stage === "PRD") return "badge-prd";
+  if (stage === "AB") return "badge-ab";
   return "badge-a45";
 }
 

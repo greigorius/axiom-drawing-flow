@@ -124,6 +124,7 @@ main {
 .badge-s3  { background: rgba(245,158,11,0.14); color: var(--warning); }
 .badge-a45 { background: rgba(168,85,247,0.14); color: #c084fc; }
 .badge-prd { background: rgba(236,72,153,0.14); color: #f472b6; }
+.badge-ab  { background: rgba(20,184,166,0.14); color: #2dd4bf; }
 
 /* ─── Buttons ────────────────────────────────────────────────────────── */
 .btn {

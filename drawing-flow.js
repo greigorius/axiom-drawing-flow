@@ -439,8 +439,19 @@ function padItemNo(itemNo) {
   return sub ? `${padded}_${sub}` : padded;
 }
 // "Suffix 200_1 - LIN-804 …" → "200_1"; "Suffix 22 - …" → "022". Anything else → null.
+// getProp(…, "title") concatenates Notion's rich-text runs and re-encodes bold/italic as
+// markdown, so a task titled with "Suffix 112 - " in bold reads back as
+// "**Suffix 112 - **B2 Glazed Screen Bulkhead". The item-number regex below is anchored at
+// the start of the string, so those markers made it miss and findTask() returned "Task not
+// found" for a task that plainly exists. Strip emphasis markers first.
+// Asterisks never appear in an item number. Underscores do — but only between digits
+// ("200_1"), so only underscores that aren't digit-flanked are emphasis and get dropped.
+function stripMarkdownEmphasis(text) {
+  return String(text ?? "").replace(/\*/g, "").replace(/(?<!\d)_|_(?!\d)/g, "");
+}
+
 function itemNoFromTaskName(taskName) {
-  const m = /^\s*suffix\s*(\d{1,4}(?:_\d{1,2})?)(?![\d_])/i.exec(taskName || "");
+  const m = /^\s*suffix\s*(\d{1,4}(?:_\d{1,2})?)(?![\d_])/i.exec(stripMarkdownEmphasis(taskName));
   return m ? padItemNo(m[1]) : null;
 }
 const REV_RE      = /^[A-Z]{1,2}\d{1,3}[A-Z]?$/; // P01, C01, P01A
@@ -706,8 +717,10 @@ async function findTask(notion, projectNo, itemNo) {
   const byName = res.results.filter(
     (page) => itemNoFromTaskName(getProp(page, "Item Name", "title")) === paddedItemNo
   );
+  // "Item No." is a formula: it can come back as a number (112) rather than a string,
+  // so normalise both sides before comparing — a strict === against "112" never matched.
   const byFormula = res.results.filter(
-    (page) => getProp(page, "Item No.", "formula") === paddedItemNo
+    (page) => padItemNo(getProp(page, "Item No.", "formula")) === paddedItemNo
   );
   const candidates = byName.length ? byName : byFormula.length ? byFormula : [];
   if (!candidates.length) return null;
@@ -739,8 +752,10 @@ async function findTaskByItemNo(notion, itemNo) {
   const byName = res.results.filter(
     (page) => itemNoFromTaskName(getProp(page, "Item Name", "title")) === paddedItemNo
   );
+  // "Item No." is a formula: it can come back as a number (112) rather than a string,
+  // so normalise both sides before comparing — a strict === against "112" never matched.
   const byFormula = res.results.filter(
-    (page) => getProp(page, "Item No.", "formula") === paddedItemNo
+    (page) => padItemNo(getProp(page, "Item No.", "formula")) === paddedItemNo
   );
   const candidates = byName.length ? byName : byFormula.length ? byFormula : [];
   return candidates.length === 1 ? candidates[0] : null;

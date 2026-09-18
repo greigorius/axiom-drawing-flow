@@ -123,6 +123,23 @@ ok("item read off the task name, exactly", () => {
   assert.strictEqual(t.itemNoFromTaskName("Suffix 200_1 - LIN-804 … Lobby"), "200_1");
   assert.strictEqual(t.itemNoFromTaskName("Suffix 22 - Risers"), "022");
   assert.strictEqual(t.itemNoFromTaskName("001-24-354 Document Control (MW)"), null); });
+
+// Notion titles read back through getProp() carry markdown emphasis: a task titled with
+// "Suffix 112 - " in bold arrives as "**Suffix 112 - **B2 …". The ^-anchored regex missed
+// those markers, so findTask returned "Task not found" for a task that plainly existed —
+// which took the whole ingest scenario down (Make disabled it after 3 consecutive 422s).
+ok("item no. from a bold task title (markdown emphasis stripped)", () => {
+  assert.strictEqual(t.itemNoFromTaskName("**Suffix 112 - **B2 Glazed Screen Bulkhead"), "112");
+  assert.strictEqual(t.itemNoFromTaskName("*Suffix 003* - Reception Desk"), "003");
+  assert.strictEqual(t.itemNoFromTaskName("__Suffix 022__ - Risers"), "022"); });
+ok("emphasis stripping keeps derivative underscores intact", () => {
+  assert.strictEqual(t.itemNoFromTaskName("**Suffix 200_1 - **Lobby"), "200_1");
+  assert.strictEqual(t.itemNoFromTaskName("__Suffix 491_2__ - Another"), "491_2");
+  // a bare underscore that isn't digit-flanked is emphasis, not part of the number
+  assert.strictEqual(t.itemNoFromTaskName("_Suffix 200_ - Panelling"), "200"); });
+ok("padItemNo normalises a numeric Item No. formula", () => {
+  assert.strictEqual(t.padItemNo(112), "112");
+  assert.strictEqual(t.padItemNo(7), "007"); });
 ok("submission title round-trips a derivative item", () => {
   assert.deepStrictEqual({...t.parseSubmissionTitle("24-367-200_1_EIT-TMJ-AA-B3-D-I-24217_S4_R2", "S4")},
     { taskCode: "24-367-200_1", drawingNo: "EIT-TMJ-AA-B3-D-I-24217" });
