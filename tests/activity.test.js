@@ -9,7 +9,8 @@ const env = {
 };
 const mod = { exports: {} };
 const srcPath = fs.existsSync(__dirname + "/drawing-flow.js") ? __dirname + "/drawing-flow.js" : __dirname + "/../drawing-flow.js";
-vm.runInNewContext(fs.readFileSync(srcPath, "utf8"), {
+vm.runInNewContext(fs.readFileSync(srcPath, "utf8") +
+  "\n;module.exports.__t = { createActionRow, resolveActionRow };", {
   module: mod, exports: mod.exports,
   require: (n) => n === "@netlify/blobs" ? { getStore: () => ({ get: async () => [], setJSON: async () => {} }) } : require(n),
   process: { env }, console: { ...console, log() {}, warn() {} },
@@ -324,6 +325,87 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   const refs = []; s2.eachRow((r, i) => { if (i > 1) refs.push(r.getCell(2).value); });
   assert.ok(refs.includes("RFI-014"), "RFI rows carry their zero-padded ref");
   ok("export: Current Position lists both trackers with a numeric Days Open");
+
+  // ── A&I action rows (§6.1) ──────────────────────────────────────────────
+  //
+  // A&I is the queue and the Activity Log is the ledger. A submission opens a queue row for
+  // the DM decision it needs and closes it once that decision is made — the row dropping out
+  // of A&I is the queue working, not history being lost.
+  const { createActionRow, resolveActionRow } = mod.exports.__t;
+
+  const writes = { created: [], updated: [] };
+  const aiNotion = {
+    pages: {
+      create: async ({ parent, properties }) => { writes.created.push({ parent, properties }); return { id: "ai-new", url: "u/ai-new" }; },
+      update: async (u) => { writes.updated.push(u); return {}; },
+    },
+  };
+
+  const rowId = await createActionRow(aiNotion, {
+    taskId: "task1", note: "Review A-101 Rev C02 — Suffix 112",
+    category: "Drawing Update", context: "Stage S4 · QA Round 1", link: "https://notion.test/sub",
+  });
+  assert.strictEqual(rowId, "ai-new", "the new row id is returned so it can be stored on the submission");
+  const props = writes.created[0].properties;
+  assert.strictEqual(writes.created[0].parent.database_id, "AI");
+  // joined rather than deepStrictEqual: the array is built in the vm realm, so a
+  // structural compare against a host-realm literal fails on prototype identity.
+  assert.strictEqual(props["Tags"].multi_select.map((t) => t.name).join(","), "Track", "born tracked — no manual step for submissions");
+  assert.strictEqual(props["Track Status"].select.name, "Open");
+  assert.strictEqual(props["Ball in Court"].select.name, "Me", "a submission lands in the DM's court");
+  assert.strictEqual(props["Archived"].checkbox, false);
+  assert.strictEqual(props["Items"].relation[0].id, "task1");
+  assert.strictEqual(props["Category"].select.name, "Drawing Update");
+  ok("A&I row: opens tracked, Open, with DM, tied to the item");
+
+  // Source is what keeps every submission out of the feed twice over — the Make scenario
+  // filters on it. If this ever stops being "Submission", the feed double-logs.
+  assert.strictEqual(props["Source"].select.name, "Submission",
+    "Source=Submission is what lets the Make A&I scenario skip these rows");
+  ok("A&I row: stamped Source=Submission so Make can skip it and the feed never doubles up");
+
+  assert.ok(props["Context"].rich_text[0].text.content.includes("https://notion.test/sub"));
+  assert.strictEqual(props["Email Link"], undefined,
+    "Email Link belongs to the Email Task Tracker — additive means not repurposing it either");
+  ok("A&I row: link goes in Context, not in the Email Tracker's own property");
+
+  writes.updated.length = 0;
+  await resolveActionRow(aiNotion, "ai-new");
+  const up = writes.updated[0].properties;
+  assert.strictEqual(writes.updated[0].page_id, "ai-new");
+  assert.strictEqual(up["Track Status"].select.name, "Resolved");
+  assert.strictEqual(up["Archived"].checkbox, true);
+  assert.strictEqual(up["Ball in Court"].select, null, "nobody holds a closed item");
+  assert.strictEqual(up["Blocker"].select, null);
+  ok("A&I row: closing resolves, archives and clears who holds it");
+
+  writes.updated.length = 0;
+  await resolveActionRow(aiNotion, null);
+  await resolveActionRow(aiNotion, undefined);
+  assert.strictEqual(writes.updated.length, 0);
+  ok("A&I row: a submission with no row (pre-dating this, or a failed create) closes quietly");
+
+  // P4: a queue failure must never take down the submission endpoint it hangs off.
+  const brokenNotion = { pages: { create: async () => { throw new Error("notion down"); },
+                                  update: async () => { throw new Error("notion down"); } } };
+  assert.strictEqual(await createActionRow(brokenNotion, { note: "x" }), null,
+    "a failed create returns null rather than throwing");
+  await resolveActionRow(brokenNotion, "ai-new");
+  ok("A&I row: Notion being down degrades to null and a warning, never an exception (P4)");
+
+  // Wiring guard. The helpers above are unit-tested; this checks every DM action endpoint
+  // actually calls the closer, so a fifth action added later cannot silently leave rows open
+  // in the queue forever.
+  const source = fs.readFileSync(srcPath, "utf8");
+  for (const action of ["approve", "issue", "bounce", "log-status"]) {
+    const start = source.indexOf(`app.patch("/api/df/submissions/:id/${action}"`);
+    assert.ok(start > -1, `${action} endpoint not found`);
+    const nextRoute = source.slice(start + 1).search(/app\.(get|post|patch)\("\/api\/df\//);
+    const body = source.slice(start, nextRoute > -1 ? start + 1 + nextRoute : source.length);
+    assert.ok(body.includes("resolveActionRow("), `${action} does not close its A&I row`);
+  }
+  assert.ok(source.includes("createActionRow(notion, {"), "ingest must open the row");
+  ok("A&I row: every DM action endpoint closes the row ingest opened");
 
   console.log(`\n${n} activity tests passed`);
 })().catch((e) => { console.error("FAIL", e); process.exit(1); });

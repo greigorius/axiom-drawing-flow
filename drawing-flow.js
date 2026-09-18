@@ -1010,6 +1010,67 @@ async function createActivityLogEntry(notion, { taskId, source, tag, author, ent
   }
 }
 
+// --- Actions & Info queue helpers ---
+//
+// Every submission needs a DM decision — approve, bounce, grade, issue — so every submission
+// opens a row in the Actions & Info queue and closes it again once that decision is made.
+// A&I is the queue: it is supposed to empty as work is done. The Activity Log is the ledger:
+// it never forgets. A row vanishing from A&I is the queue working, not history being lost.
+// See ITEM-ACTIVITY-FEED-HANDOFF.md §6.1.
+//
+// These rows carry Source: "Submission" precisely so the Make.com A&I watch scenario can skip
+// them. Without that filter every submission would land in the feed twice — once from
+// createActivityLogEntry above, once from Make reacting to the row's Track Status changing.
+//
+// Same non-blocking contract as createActivityLogEntry: never throws, always awaited. A
+// submission whose queue row fails to open still submits; it just will not show in the open
+// queue, and its Activity Log entry is written regardless.
+async function createActionRow(notion, { taskId, note, category, context, link }) {
+  if (!ACTIONS_INFO_DB) {
+    console.warn("[a&i] NOTION_DB_ACTIONS_INFO not configured — skipping action row:", note);
+    return null;
+  }
+  try {
+    const properties = {
+      "Note":          { title:        [{ text: { content: truncateForNotion(note) } }] },
+      "Tags":          { multi_select: [{ name: "Track" }] },
+      "Source":        { select:       { name: "Submission" } },
+      "Track Status":  { select:       { name: "Open" } },
+      "Ball in Court": { select:       { name: "Me"   } },
+      "Archived":      { checkbox:     false },
+    };
+    if (category) properties["Category"] = { select: { name: category } };
+    if (taskId)   properties["Items"]    = { relation: [{ id: taskId }] };
+    // Context is A&I's own general-purpose text field. The submission URL goes here rather
+    // than in "Email Link", which belongs to the Email Task Tracker — additive only, and
+    // that includes not quietly repurposing someone else's property.
+    const ctx = [context, link].filter(Boolean).join("\n");
+    if (ctx) properties["Context"] = { rich_text: [{ text: { content: truncateForNotion(ctx) } }] };
+
+    const page = await notion.pages.create({ parent: { database_id: ACTIONS_INFO_DB }, properties });
+    return page.id;
+  } catch (err) {
+    console.warn("[a&i] action row create failed:", err.message);
+    return null;
+  }
+}
+
+// Close the queue row a submission opened. Safe to call with nothing, and safe to call twice:
+// submissions that predate this, or whose row never got created, simply have nothing to close.
+async function resolveActionRow(notion, actionRowId) {
+  if (!actionRowId) return;
+  try {
+    await notion.pages.update({ page_id: actionRowId, properties: {
+      "Track Status":  { select:   { name: "Resolved" } },
+      "Archived":      { checkbox: true },
+      "Ball in Court": { select:   null },
+      "Blocker":       { select:   null },
+    }});
+  } catch (err) {
+    console.warn("[a&i] action row resolve failed:", err.message);
+  }
+}
+
 // --- Cockpit notifications ---
 //
 // A separate, disposable feed from the Activity Log above — this is not project history,
@@ -1271,6 +1332,25 @@ module.exports = function mountDrawingFlow(app, notion) {
       author: dtName || "System",
       entry:  `Drawing ${drawingNo} Rev ${revision} submitted by ${dtName}. (QA Round ${qaRound})`,
     });
+
+    // Open the queue row for the DM decision this submission needs. The row id is written
+    // back onto the Submission so close-out can find it directly instead of searching A&I.
+    const actionRowId = await createActionRow(notion, {
+      taskId:   taskPage.id,
+      note:     `Review ${drawingNo} Rev ${revision} — Suffix ${padItemNo(itemNo)}`,
+      category: "Drawing Update",
+      context:  `Stage ${stage} · QA Round ${qaRound}${dtName ? ` · submitted by ${dtName}` : ""}`,
+      link:     newSubmission.url,
+    });
+    if (actionRowId) {
+      try {
+        await notion.pages.update({ page_id: newSubmission.id, properties: {
+          "A&I Row": { rich_text: [{ text: { content: actionRowId } }] },
+        }});
+      } catch (err) {
+        console.warn("[ingest] could not record A&I row id on the submission:", err.message);
+      }
+    }
 
     console.log(`[ingest] created ${submissionTitle} (${newSubmission.id})`);
     const dtNote = dtPage
@@ -2478,6 +2558,9 @@ module.exports = function mountDrawingFlow(app, notion) {
       entry:  `Drawing ${approveDrawingNo} Rev ${revision} approved by DM. Queued for issue.`,
     });
 
+    // The DM decision this submission was queued for has been made — close the A&I row.
+    await resolveActionRow(notion, getProp(submissionPage, "A&I Row", "rich_text"));
+
     console.log(`[approve] ${id} => Awaiting Issue (suffix ${suffixRef})`);
     res.json({ ok: true, reviewedAt, suffixRef, ...(dropboxMove ? { dropboxMove } : {}) });
   });
@@ -2578,6 +2661,9 @@ module.exports = function mountDrawingFlow(app, notion) {
       author: "DM",
       entry:  `Drawing ${issueDrawingNo} Rev ${revision} issued to client.`,
     });
+
+    // The DM decision this submission was queued for has been made — close the A&I row.
+    await resolveActionRow(notion, getProp(submissionPage, "A&I Row", "rich_text"));
 
     // DT email is batched via POST /api/df/send-dt-emails
     console.log(`[issue] ${id} => ${drawingStatus}${issueMove ? ` · moved to ${issueMove.to}` : ""}`);
@@ -2719,6 +2805,9 @@ module.exports = function mountDrawingFlow(app, notion) {
       entry:  `Drawing ${bounceDrawingNo} Rev ${bounceRevision} bounced — QA Round ${qaRound}. BIC returned to ${dt.name || "DT"}.`,
     });
 
+    // The DM decision this submission was queued for has been made — close the A&I row.
+    await resolveActionRow(notion, getProp(submissionPage, "A&I Row", "rich_text"));
+
     console.log(`[bounce] ${id} → ${dropboxMove?.to ?? "no move"}`);
     res.json({ ok: true, bouncedAt, ...(dropboxMove ? { dropboxMove } : {}) });
   });
@@ -2853,6 +2942,9 @@ module.exports = function mountDrawingFlow(app, notion) {
       author: "System",
       entry:  `${stage === "PRD" ? "Factory" : "Client"} grade ${grade} recorded for ${logStatusDrawingNo} Rev ${revision}.`,
     });
+
+    // The DM decision this submission was queued for has been made — close the A&I row.
+    await resolveActionRow(notion, getProp(submissionPage, "A&I Row", "rich_text"));
 
     console.log(`[log-status] ${id} => ${grade} (Rev ${revision}) => ${drawingStatus}; ${moves.length} file move(s)`);
     res.json({ ok: true, grade, gradedAt, statusDate, drawingStatus, submissionStatus, isTerminal: isTerminalAB, isA45Approved,

@@ -10,9 +10,13 @@
 <body>
   <div id="root"></div>
 
-  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
-  <script src="https://unpkg.com/@babel/standalone@7.27.1/babel.min.js"></script>
+  <!-- Served from this site, not a CDN. unpkg went down on 18 Sep 2026 and took the whole
+       cockpit with it (React failed to load, every component threw "React is not defined").
+       There is no build step here, so these three files are the entire runtime — see
+       public/vendor/README.md for versions and how to update them. -->
+  <script src="/vendor/react.production.min.js"></script>
+  <script src="/vendor/react-dom.production.min.js"></script>
+  <script src="/vendor/babel.min.js"></script>
 
   <!-- Components loaded before app shell -->
   <script type="text/babel" src="/cockpit.jsx"></script>
