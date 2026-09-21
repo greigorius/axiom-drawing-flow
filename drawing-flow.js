@@ -1029,7 +1029,7 @@ async function createActivityLogEntry(notion, { taskId, source, tag, author, ent
 // Same non-blocking contract as createActivityLogEntry: never throws, always awaited. A
 // submission whose queue row fails to open still submits; it just will not show in the open
 // queue, and its Activity Log entry is written regardless.
-async function createActionRow(notion, { taskId, note, category, context, link }) {
+async function createActionRow(notion, { taskId, projectId, personId, received, note, category, context, link }) {
   if (!ACTIONS_INFO_DB) {
     console.warn("[a&i] NOTION_DB_ACTIONS_INFO not configured — skipping action row:", note);
     return null;
@@ -1043,8 +1043,18 @@ async function createActionRow(notion, { taskId, note, category, context, link }
       "Ball in Court": { select:       { name: "Me"   } },
       "Archived":      { checkbox:     false },
     };
-    if (category) properties["Category"] = { select: { name: category } };
-    if (taskId)   properties["Items"]    = { relation: [{ id: taskId }] };
+    if (category)  properties["Category"] = { select:   { name: category } };
+    if (taskId)    properties["Items"]    = { relation: [{ id: taskId }] };
+    // Project and Person are set explicitly rather than left to be inferred later: A&I is
+    // filtered by project, and "whose submission is waiting on me" is the question the
+    // Person column answers for a review row. Both relations point at the same Projects and
+    // Team databases the Tasks and Submissions DBs use, so the ids carry straight across.
+    if (projectId) properties["Projects"] = { relation: [{ id: projectId }] };
+    if (personId)  properties["Person"]   = { relation: [{ id: personId }] };
+    // Received is the date A&I is sorted and filtered by. For a submission, the information
+    // arrived when the drawing landed — which is now. Email rows set it from the original
+    // message header; manual rows fall back to their creation date.
+    properties["Received"] = { date: { start: received || new Date().toISOString() } };
     // Context is A&I's own general-purpose text field. The submission URL goes here rather
     // than in "Email Link", which belongs to the Email Task Tracker — additive only, and
     // that includes not quietly repurposing someone else's property.
@@ -1067,6 +1077,10 @@ async function resolveActionRow(notion, actionRowId) {
     await notion.pages.update({ page_id: actionRowId, properties: {
       "Track Status":  { select:   { name: "Resolved" } },
       "Archived":      { checkbox: true },
+      // A&I carries two completion signals: Checked (the human tick, used by the Response
+      // Reconciler and the Monday Chase List) and Archived (the automated one, used by the
+      // feed). A resolved row sets both, so every view and scenario agrees it is done.
+      "Checked":       { checkbox: true },
       "Ball in Court": { select:   null },
       "Blocker":       { select:   null },
     }});
@@ -1340,7 +1354,10 @@ module.exports = function mountDrawingFlow(app, notion) {
     // Open the queue row for the DM decision this submission needs. The row id is written
     // back onto the Submission so close-out can find it directly instead of searching A&I.
     const actionRowId = await createActionRow(notion, {
-      taskId:   taskPage.id,
+      taskId:    taskPage.id,
+      projectId: getProp(taskPage, "Projects", "relation")?.[0] ?? null,
+      personId:  dtPage?.id ?? null,
+      received:  new Date().toISOString(),
       note:     `Review ${drawingNo} Rev ${revision} — Suffix ${padItemNo(itemNo)}`,
       category: "Drawing Update",
       context:  `Stage ${stage} · QA Round ${qaRound}${dtName ? ` · submitted by ${dtName}` : ""}`,
@@ -3255,9 +3272,13 @@ module.exports = function mountDrawingFlow(app, notion) {
       if (!scopeIds.length) return empty;
     }
 
+    // Either completion signal takes a row out of the open count: Archived (set by automation
+    // on resolve) or Checked (Greig's own tick in Notion). Filtering on only one would leave
+    // a row he has manually closed still counting against "with DM".
     const aiClauses = [
       { property: "Tags",     multi_select: { contains: "Track" } },
       { property: "Archived", checkbox:     { equals: false } },
+      { property: "Checked",  checkbox:     { equals: false } },
     ];
     if (scopeIds) aiClauses.push(taskScopeFilter("Items", scopeIds));
     const aiRows = await queryAll(notion, ACTIONS_INFO_DB, { and: aiClauses });

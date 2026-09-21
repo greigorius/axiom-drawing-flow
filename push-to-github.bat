@@ -43,8 +43,14 @@ for %%T in (activity routes parsing) do (
 echo.
 
 :: ---- Commit message --------------------------------------------------------
-for /f "tokens=2 delims==" %%i in ('wmic os get localdatetime /value') do set DT=%%i
-set DEFAULT_MSG=Update %DT:~0,4%-%DT:~4,2%-%DT:~6,2% %DT:~8,2%:%DT:~10,2%
+::   wmic is gone from current Windows 11 builds, so the old date lookup returned nothing and
+::   every default message came out as "Update ~0,4DT:~4,2DT:..." - see the git log from
+::   18-21 Sep 2026. PowerShell ships with every supported Windows, and %date% covers the
+::   case where even that is unavailable.
+set "STAMP="
+for /f "delims=" %%i in ('powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-dd HH:mm'"') do set "STAMP=%%i"
+if not defined STAMP set "STAMP=%date% %time:~0,5%"
+set "DEFAULT_MSG=Update %STAMP%"
 echo  Press Enter to use default: "%DEFAULT_MSG%"
 set /p COMMIT_MSG=Enter commit message (or press Enter):
 if "%COMMIT_MSG%"=="" set COMMIT_MSG=%DEFAULT_MSG%

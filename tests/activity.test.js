@@ -234,6 +234,12 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   ok("position: never queries the Submissions DB");
 
   reset();
+  await call("GET /api/df/activity-position");
+  assert.ok(seen.AI[0].and.some((c) => c.property === "Checked" && c.checkbox.equals === false),
+    "a row Greig has ticked Checked in Notion is done — it must not count against 'with DM'");
+  ok("position: a manually ticked (Checked) row drops out of the open count");
+
+  reset();
   r = await call("GET /api/df/activity-position", { taskId: "task1" });
   assert.ok(seen.AI[0].and.some((c) => c.property === "Items" && c.relation.contains === "task1"));
   assert.ok(seen.RFIS[0].and.some((c) => c.property === "Related Item(s)" && c.relation.contains === "task1"));
@@ -362,7 +368,8 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   };
 
   const rowId = await createActionRow(aiNotion, {
-    taskId: "task1", note: "Review A-101 Rev C02 — Suffix 112",
+    taskId: "task1", projectId: "proj1", personId: "dtGary", received: "2026-09-21T09:15:00.000Z",
+    note: "Review A-101 Rev C02 — Suffix 112",
     category: "Drawing Update", context: "Stage S4 · QA Round 1", link: "https://notion.test/sub",
   });
   assert.strictEqual(rowId, "ai-new", "the new row id is returned so it can be stored on the submission");
@@ -377,6 +384,20 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(props["Items"].relation[0].id, "task1");
   assert.strictEqual(props["Category"].select.name, "Drawing Update");
   ok("A&I row: opens tracked, Open, with DM, tied to the item");
+
+  assert.strictEqual(props["Projects"].relation[0].id, "proj1", "filterable by project in A&I");
+  assert.strictEqual(props["Person"].relation[0].id, "dtGary", "the DT whose submission is waiting");
+  assert.strictEqual(props["Received"].date.start, "2026-09-21T09:15:00.000Z",
+    "A&I is sorted by Received — a submission row must carry it like an email row does");
+  ok("A&I row: carries Project, Person and Received, so it sorts and filters like the rest");
+
+  writes.created.length = 0;
+  await createActionRow(aiNotion, { taskId: "task1", note: "no extras" });
+  const bare = writes.created[0].properties;
+  assert.strictEqual(bare["Projects"], undefined, "no project known — relation left off, not sent empty");
+  assert.strictEqual(bare["Person"], undefined);
+  assert.ok(bare["Received"].date.start, "Received still defaults to now when not passed");
+  ok("A&I row: missing project/person are omitted; Received always has a value");
 
   // Source is what keeps every submission out of the feed twice over — the Make scenario
   // filters on it. If this ever stops being "Submission", the feed double-logs.
@@ -395,9 +416,11 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(writes.updated[0].page_id, "ai-new");
   assert.strictEqual(up["Track Status"].select.name, "Resolved");
   assert.strictEqual(up["Archived"].checkbox, true);
+  assert.strictEqual(up["Checked"].checkbox, true,
+    "Checked is the done-flag the Response Reconciler and Chase List read — resolve must set it too");
   assert.strictEqual(up["Ball in Court"].select, null, "nobody holds a closed item");
   assert.strictEqual(up["Blocker"].select, null);
-  ok("A&I row: closing resolves, archives and clears who holds it");
+  ok("A&I row: closing resolves, archives, ticks Checked and clears who holds it");
 
   writes.updated.length = 0;
   await resolveActionRow(aiNotion, null);
