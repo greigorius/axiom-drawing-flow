@@ -51,11 +51,11 @@ const actRows = [
 
 const aiRows = [
   { id: "ai1", url: "u/ai1", created_time: "2026-09-01T09:00:00.000Z", properties: { Note: title("Confirm grid B4"), Tags: msel("Track"), Archived: chk(false),
-    "Track Status": sel("Waiting"), "Ball in Court": sel("Client"), Blocker: sel("Awaiting decision"), Category: sel("Design Coordination"), Items: rel("task1") } },
+    "Status": sel("Waiting"), "Ball in Court": sel("Client"), Blocker: sel("Awaiting decision"), Category: sel("Design Coordination"), Items: rel("task1") } },
   { id: "ai2", url: "u/ai2", created_time: "2026-09-16T09:00:00.000Z", properties: { Note: title("Review A-101 Rev C02"), Tags: msel("Track"), Archived: chk(false),
-    "Track Status": sel("Open"), "Ball in Court": sel("Me"), Blocker: sel("—"), Category: sel("Drawing Update"), Items: rel("task2") } },
+    "Status": sel("Open"), "Ball in Court": sel("Me"), Blocker: sel("—"), Category: sel("Drawing Update"), Items: rel("task2") } },
   { id: "ai3", url: "u/ai3", created_time: "2026-08-20T09:00:00.000Z", properties: { Note: title("Chase panel finish sample"), Tags: msel("Track"), Archived: chk(false),
-    "Track Status": sel("Open"), "Ball in Court": sel("Me"), Blocker: sel(null), Category: sel("Supplier Coordination"), Items: rel() } },
+    "Status": sel("Open"), "Ball in Court": sel("Me"), Blocker: sel(null), Category: sel("Supplier Coordination"), Items: rel() } },
 ];
 
 const rfiRows = [
@@ -377,10 +377,10 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(writes.created[0].parent.database_id, "AI");
   // joined rather than deepStrictEqual: the array is built in the vm realm, so a
   // structural compare against a host-realm literal fails on prototype identity.
-  assert.strictEqual(props["Tags"].multi_select.map((t) => t.name).join(","), "Track", "born tracked — no manual step for submissions");
-  assert.strictEqual(props["Track Status"].select.name, "Open");
+  assert.strictEqual(props["Status"].select.name, "Open", "born tracked — no manual step for submissions");
+  assert.ok(!("Tags" in props),     "Tags is gone — Status is the tracking flag");
+  assert.ok(!("Archived" in props), "Archived is gone — Checked is the only done flag");
   assert.strictEqual(props["Ball in Court"].select.name, "Me", "a submission lands in the DM's court");
-  assert.strictEqual(props["Archived"].checkbox, false);
   assert.strictEqual(props["Items"].relation[0].id, "task1");
   assert.strictEqual(props["Category"].select.name, "Drawing Update");
   ok("A&I row: opens tracked, Open, with DM, tied to the item");
@@ -414,13 +414,13 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   await resolveActionRow(aiNotion, "ai-new");
   const up = writes.updated[0].properties;
   assert.strictEqual(writes.updated[0].page_id, "ai-new");
-  assert.strictEqual(up["Track Status"].select.name, "Resolved");
-  assert.strictEqual(up["Archived"].checkbox, true);
+  assert.strictEqual(up["Status"].select, null, "clearing Status takes it out of the open queue");
+  assert.ok(!("Archived" in up), "Archived is gone — Checked is the only done flag");
   assert.strictEqual(up["Checked"].checkbox, true,
     "Checked is the done-flag the Response Reconciler and Chase List read — resolve must set it too");
   assert.strictEqual(up["Ball in Court"].select, null, "nobody holds a closed item");
   assert.strictEqual(up["Blocker"].select, null);
-  ok("A&I row: closing resolves, archives, ticks Checked and clears who holds it");
+  ok("A&I row: closing ticks Checked, clears Status and clears who holds it");
 
   writes.updated.length = 0;
   await resolveActionRow(aiNotion, null);

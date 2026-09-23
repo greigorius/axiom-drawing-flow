@@ -1060,12 +1060,13 @@ async function createActionRow(notion, { taskId, projectId, personId, received, 
   }
   try {
     const properties = {
-      "Note":          { title:        [{ text: { content: truncateForNotion(note) } }] },
-      "Tags":          { multi_select: [{ name: "Track" }] },
-      "Source":        { select:       { name: "Submission" } },
-      "Track Status":  { select:       { name: "Open" } },
-      "Ball in Court": { select:       { name: "Me"   } },
-      "Archived":      { checkbox:     false },
+      "Note":          { title:  [{ text: { content: truncateForNotion(note) } }] },
+      "Source":        { select: { name: "Submission" } },
+      // Status is what marks a row as live work. It replaced the old Tags="Track" flag on
+      // 23 Sep 2026: "Tags" read as a sibling of the Activity Log's "Tag" and was not one,
+      // and a row that has a Status is exactly a row being tracked.
+      "Status":        { select: { name: "Open" } },
+      "Ball in Court": { select: { name: "Me"   } },
     };
     if (category)  properties["Category"] = { select:   { name: category } };
     if (taskId)    properties["Items"]    = { relation: [{ id: taskId }] };
@@ -1098,13 +1099,13 @@ async function createActionRow(notion, { taskId, projectId, personId, received, 
 async function resolveActionRow(notion, actionRowId) {
   if (!actionRowId) return;
   try {
+    // Done is now a single flag. A&I used to carry three — Checked (the human tick),
+    // Archived (the automated one) and Track Status="Resolved" — which let views disagree
+    // about whether a row was finished. Checked survived because Make's scenarios already
+    // map to it; clearing Status takes the row out of the open queue.
     await notion.pages.update({ page_id: actionRowId, properties: {
-      "Track Status":  { select:   { name: "Resolved" } },
-      "Archived":      { checkbox: true },
-      // A&I carries two completion signals: Checked (the human tick, used by the Response
-      // Reconciler and the Monday Chase List) and Archived (the automated one, used by the
-      // feed). A resolved row sets both, so every view and scenario agrees it is done.
       "Checked":       { checkbox: true },
+      "Status":        { select:   null },
       "Ball in Court": { select:   null },
       "Blocker":       { select:   null },
     }});
@@ -3297,13 +3298,13 @@ module.exports = function mountDrawingFlow(app, notion) {
       if (!scopeIds.length) return empty;
     }
 
-    // Either completion signal takes a row out of the open count: Archived (set by automation
-    // on resolve) or Checked (Greig's own tick in Notion). Filtering on only one would leave
-    // a row he has manually closed still counting against "with DM".
+    // A row is live work when it has a Status and has not been ticked off. Both halves
+    // matter: Status alone would keep resolved rows in the count, and Checked alone would
+    // sweep in every unclassified note in A&I — half the database has no Item and was never
+    // meant to show in a position header.
     const aiClauses = [
-      { property: "Tags",     multi_select: { contains: "Track" } },
-      { property: "Archived", checkbox:     { equals: false } },
-      { property: "Checked",  checkbox:     { equals: false } },
+      { property: "Status",  select:   { is_not_empty: true } },
+      { property: "Checked", checkbox: { equals: false } },
     ];
     if (scopeIds) aiClauses.push(taskScopeFilter("Items", scopeIds));
     const aiRows = await queryAll(notion, ACTIONS_INFO_DB, { and: aiClauses });
@@ -3338,7 +3339,7 @@ module.exports = function mountDrawingFlow(app, notion) {
       return {
         id:       page.id,
         title:    getProp(page, "Note", "title"),
-        status:   getProp(page, "Track Status",  "select"),
+        status:   getProp(page, "Status",        "select"),
         bic:      getProp(page, "Ball in Court", "select"),
         category: getProp(page, "Category",      "select"),
         blocker:  blocker && blocker !== "—" ? blocker : null,
