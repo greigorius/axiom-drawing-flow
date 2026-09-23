@@ -992,7 +992,29 @@ function truncateForNotion(str, max = 1900) {
 // IMPORTANT: still call this with `await`, same as fireWebhook above. Netlify freezes the
 // Lambda the instant res.json() is sent, so an un-awaited "fire and forget" call here would
 // frequently get cut off mid-write before it reaches Notion, silently dropping the entry.
-async function createActivityLogEntry(notion, { taskId, source, tag, author, entry, detail, link }) {
+// The Log's Projects relation is always DERIVED from the Item — never entered by hand —
+// so that a feed filtered by project cannot disagree with one filtered by item. Cached per
+// process because approve / issue / bounce / grade resolve the same few items repeatedly.
+// A warm Lambda could serve a stale id if an item were moved between projects; items do not
+// move between projects, and the next cold start clears it either way.
+const projectIdCache = new Map();
+async function projectIdForTask(notion, taskId) {
+  if (!taskId) return null;
+  if (projectIdCache.has(taskId)) return projectIdCache.get(taskId);
+  let id = null;
+  try {
+    const page = await notion.pages.retrieve({ page_id: taskId });
+    id = getProp(page, "Projects", "relation")?.[0] ?? null;
+  } catch (err) {
+    console.warn("[activity-log] project lookup failed:", err.message);
+  }
+  projectIdCache.set(taskId, id);
+  return id;
+}
+
+// `projectId` is optional: omit it and it is derived from taskId. Pass it explicitly (even
+// as null) when the caller already holds it, to save the lookup.
+async function createActivityLogEntry(notion, { taskId, projectId, source, tag, author, entry, detail, link }) {
   if (!ACTIVITY_LOG_DB) {
     console.warn("[activity-log] NOTION_DB_ACTIVITY_LOG not configured — skipping entry:", entry);
     return;
@@ -1005,6 +1027,8 @@ async function createActivityLogEntry(notion, { taskId, source, tag, author, ent
       "Author": { rich_text: [{ text: { content: truncateForNotion(author || "System") } }] },
     };
     if (taskId) properties["Task"]   = { relation: [{ id: taskId }] };
+    const projId = projectId !== undefined ? projectId : await projectIdForTask(notion, taskId);
+    if (projId) properties["Projects"] = { relation: [{ id: projId }] };
     if (detail) properties["Detail"] = { rich_text: [{ text: { content: truncateForNotion(detail) } }] };
     if (link)   properties["Link"]   = { url: link };
 
@@ -1344,9 +1368,10 @@ module.exports = function mountDrawingFlow(app, notion) {
 
     const dtName = dtPage ? (getProp(dtPage, "Name", "title") ?? dtInitials) : (dtInitials || "Unknown DT");
     await createActivityLogEntry(notion, {
-      taskId: taskPage.id,
+      taskId:    taskPage.id,
+      projectId: getProp(taskPage, "Projects", "relation")?.[0] ?? null,
       source: "Drawing Flow",
-      tag:    "#info",
+      tag:    "#submitted",
       author: dtName || "System",
       entry:  `Drawing ${drawingNo} Rev ${revision} submitted by ${dtName}. (QA Round ${qaRound})`,
     });
@@ -2574,7 +2599,7 @@ module.exports = function mountDrawingFlow(app, notion) {
     await createActivityLogEntry(notion, {
       taskId: taskIds?.[0],
       source: "Drawing Flow",
-      tag:    "#approval",
+      tag:    "#approved",
       author: "DM",
       entry:  `Drawing ${approveDrawingNo} Rev ${revision} approved by DM. Queued for issue.`,
     });
@@ -2678,7 +2703,7 @@ module.exports = function mountDrawingFlow(app, notion) {
     await createActivityLogEntry(notion, {
       taskId: taskIds?.[0],
       source: "Drawing Flow",
-      tag:    "#approval",
+      tag:    "#issued",
       author: "DM",
       entry:  `Drawing ${issueDrawingNo} Rev ${revision} issued to client.`,
     });
@@ -2821,7 +2846,7 @@ module.exports = function mountDrawingFlow(app, notion) {
     await createActivityLogEntry(notion, {
       taskId: taskIds?.[0],
       source: "Drawing Flow",
-      tag:    "#issue",
+      tag:    "#returned",
       author: "DM",
       entry:  `Drawing ${bounceDrawingNo} Rev ${bounceRevision} bounced — QA Round ${qaRound}. BIC returned to ${dt.name || "DT"}.`,
     });
@@ -2959,7 +2984,7 @@ module.exports = function mountDrawingFlow(app, notion) {
     await createActivityLogEntry(notion, {
       taskId: taskIds?.[0],
       source: "Drawing Flow",
-      tag:    "#response",
+      tag:    "#graded",
       author: "System",
       entry:  `${stage === "PRD" ? "Factory" : "Client"} grade ${grade} recorded for ${logStatusDrawingNo} Rev ${revision}.`,
     });

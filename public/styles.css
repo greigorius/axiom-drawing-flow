@@ -763,14 +763,22 @@ main {
   color: #ffffff;
 }
 
-.tag-decision    { background: #1e3a8a; } /* blue-900   ~8.9:1 */
-.tag-instruction { background: #78350f; } /* amber-900  ~11.4:1 */
-.tag-query       { background: #7c2d12; } /* orange-900 ~9.9:1 */
+/* Drawing milestones, in the order a drawing moves. #returned and #issued are
+   deliberately far apart in hue: they were one pair of easily-confused tags
+   (#issue / #approval) before the rename, and the whole point is telling
+   "sent back to the DT" from "sent out to the client" at a glance. */
+.tag-submitted   { background: #374151; } /* slate-700  ~10:1   */
+.tag-returned    { background: #7f1d1d; } /* red-900    ~10.2:1 */
+.tag-approved    { background: #14532d; } /* green-900  ~11.6:1 */
+.tag-issued      { background: #0c4a6e; } /* sky-900    ~10.4:1 */
+.tag-graded      { background: #831843; } /* pink-900   ~10.5:1 */
+/* RFI and A&I */
+.tag-query       { background: #7c2d12; } /* orange-900 ~9.9:1  */
 .tag-response    { background: #134e4a; } /* teal-900   ~11.9:1 */
-.tag-issue       { background: #7f1d1d; } /* red-900    ~10.2:1 */
-.tag-approval    { background: #14532d; } /* green-900  ~11.6:1 */
-.tag-info        { background: #374151; } /* slate-700  ~10:1 */
+.tag-decision    { background: #1e3a8a; } /* blue-900   ~8.9:1  */
+.tag-blocked     { background: #78350f; } /* amber-900  ~11.4:1 */
 .tag-action      { background: #581c87; } /* purple-900 ~10.9:1 */
+.tag-note        { background: #3f3f46; } /* zinc-700   ~9.6:1  */
 
 /* ─── Media attachments ──────────────────────────────────────────────── */
 .activity-row-files {

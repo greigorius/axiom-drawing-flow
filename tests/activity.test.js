@@ -40,13 +40,13 @@ const pages = {
 // from March — a backfilled historical entry.
 const actRows = [
   { id: "a1", url: "u/a1", created_time: "2026-09-18T09:22:00.000Z",
-    properties: { Entry: title("Suffix 112 blocked — awaiting decision."), Source: sel("A&I"), Tag: sel("#issue"), Author: rt("DM"), Detail: rt(""), Link: { url: null }, "Event Date": dt(null), Task: rel("task1") } },
+    properties: { Entry: title("Suffix 112 blocked — awaiting decision."), Source: sel("A&I"), Tag: sel("#action"), Author: rt("DM"), Detail: rt(""), Link: { url: null }, "Event Date": dt(null), Task: rel("task1") } },
   { id: "a2", url: "u/a2", created_time: "2026-09-17T16:40:00.000Z",
     properties: { Entry: title("RFI-014 raised — grid B4 setting out."), Source: sel("RFI"), Tag: sel("#query"), Author: rt("DM"), Detail: rt(""), Link: { url: null }, "Event Date": dt(null), Task: rel("task1") } },
   { id: "a3", url: "u/a3", created_time: "2026-09-18T08:00:00.000Z",
     properties: { Entry: title("Backfilled: March kickoff decision."), Source: sel("Manual"), Tag: sel("#decision"), Author: rt("DM"), Detail: rt(""), Link: { url: null }, "Event Date": dt("2026-03-02"), Task: rel("task2") } },
   { id: "a4", url: "u/a4", created_time: "2026-09-16T11:00:00.000Z",
-    properties: { Entry: title("Drawing A-101 Rev C02 approved by DM."), Source: sel("Drawing Flow"), Tag: sel("#approval"), Author: rt("DM"), Detail: rt(""), Link: { url: null }, "Event Date": dt(null), Task: rel("task2") } },
+    properties: { Entry: title("Drawing A-101 Rev C02 approved by DM."), Source: sel("Drawing Flow"), Tag: sel("#approved"), Author: rt("DM"), Detail: rt(""), Link: { url: null }, "Event Date": dt(null), Task: rel("task2") } },
 ];
 
 const aiRows = [
@@ -153,7 +153,7 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
 
   // ── feed: composing filters ─────────────────────────────────────────────
   reset();
-  await call("GET /api/df/activity-log", { projectId: "proj1", tag: "#issue,#approval", source: "RFI", from: "2026-09-01" });
+  await call("GET /api/df/activity-log", { projectId: "proj1", tag: "#returned,#approved", source: "RFI", from: "2026-09-01" });
   const f = seen.ACT[0];
   assert.ok(f.and, "composed filter is an AND");
   assert.ok(depth(f) <= 2, `filter nested ${depth(f)} deep — Notion caps at 2`);

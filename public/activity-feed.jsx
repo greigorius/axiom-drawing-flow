@@ -18,7 +18,11 @@
 
 const { useState, useEffect, useCallback, useMemo, useRef } = React;
 
-const TAGS = ["#decision", "#instruction", "#query", "#response", "#issue", "#approval", "#info", "#action"];
+// Event verbs, in the order a drawing actually moves, then the RFI/A&I tags. #issue was
+// renamed #returned because it sat next to "issued to client" and read as its opposite;
+// #approval was split because "approved by DM" and "issued to client" are two milestones.
+const TAGS = ["#submitted", "#returned", "#approved", "#issued", "#graded",
+              "#query", "#response", "#decision", "#blocked", "#action", "#note"];
 
 // Mirrors the Source select on the Item Activity Log DB. Variation and Meeting have no
 // writer behind them yet — they are listed because the schema carries them and a feed that
