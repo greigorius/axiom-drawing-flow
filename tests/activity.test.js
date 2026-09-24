@@ -10,7 +10,7 @@ const env = {
 const mod = { exports: {} };
 const srcPath = fs.existsSync(__dirname + "/drawing-flow.js") ? __dirname + "/drawing-flow.js" : __dirname + "/../drawing-flow.js";
 vm.runInNewContext(fs.readFileSync(srcPath, "utf8") +
-  "\n;module.exports.__t = { createActionRow, resolveActionRow };", {
+  "\n;module.exports.__t = { createActionRow, resolveActionRow, createActivityLogEntry };", {
   module: mod, exports: mod.exports,
   require: (n) => n === "@netlify/blobs" ? { getStore: () => ({ get: async () => [], setJSON: async () => {} }) } : require(n),
   process: { env }, console: { ...console, log() {}, warn() {} },
@@ -357,7 +357,7 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   // A&I is the queue and the Activity Log is the ledger. A submission opens a queue row for
   // the DM decision it needs and closes it once that decision is made — the row dropping out
   // of A&I is the queue working, not history being lost.
-  const { createActionRow, resolveActionRow } = mod.exports.__t;
+  const { createActionRow, resolveActionRow, createActivityLogEntry } = mod.exports.__t;
 
   const writes = { created: [], updated: [] };
   const aiNotion = {
@@ -368,7 +368,7 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   };
 
   const rowId = await createActionRow(aiNotion, {
-    taskId: "task1", projectId: "proj1", personId: "dtGary", received: "2026-09-21T09:15:00.000Z",
+    taskId: "task1", personId: "dtGary", received: "2026-09-21T09:15:00.000Z",
     note: "Review A-101 Rev C02 — Suffix 112",
     category: "Drawing Update", context: "Stage S4 · QA Round 1", link: "https://notion.test/sub",
   });
@@ -385,19 +385,21 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(props["Category"].select.name, "Drawing Update");
   ok("A&I row: opens tracked, Open, with DM, tied to the item");
 
-  assert.strictEqual(props["Projects"].relation[0].id, "proj1", "filterable by project in A&I");
+  // Projects is a rollup through Items as of 24 Sep 2026. Writing it would 400, and the
+  // catch inside createActionRow would swallow that — every submission would silently stop
+  // getting a queue row. This assertion is the guard against that regression.
+  assert.ok(!("Projects" in props), "Projects is a rollup — writing it would fail silently");
   assert.strictEqual(props["Person"].relation[0].id, "dtGary", "the DT whose submission is waiting");
   assert.strictEqual(props["Received"].date.start, "2026-09-21T09:15:00.000Z",
     "A&I is sorted by Received — a submission row must carry it like an email row does");
-  ok("A&I row: carries Project, Person and Received, so it sorts and filters like the rest");
+  ok("A&I row: Person and Received are written, Projects is left to the rollup");
 
   writes.created.length = 0;
   await createActionRow(aiNotion, { taskId: "task1", note: "no extras" });
   const bare = writes.created[0].properties;
-  assert.strictEqual(bare["Projects"], undefined, "no project known — relation left off, not sent empty");
-  assert.strictEqual(bare["Person"], undefined);
+  assert.strictEqual(bare["Person"], undefined, "no person known — relation left off, not sent empty");
   assert.ok(bare["Received"].date.start, "Received still defaults to now when not passed");
-  ok("A&I row: missing project/person are omitted; Received always has a value");
+  ok("A&I row: a missing person is omitted; Received always has a value");
 
   // Source is what keeps every submission out of the feed twice over — the Make scenario
   // filters on it. If this ever stops being "Submission", the feed double-logs.
@@ -409,6 +411,24 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(props["Email Link"], undefined,
     "Email Link belongs to the Email Task Tracker — additive means not repurposing it either");
   ok("A&I row: link goes in Context, not in the Email Tracker's own property");
+
+  // ── the Log writer must not write Projects either ───────────────────────────
+  // Same silent-failure shape as the A&I row above: the Log's Projects is a rollup through
+  // Task, and createActivityLogEntry swallows its own errors so a submission is never broken
+  // by a logging failure. Write Projects and every entry would vanish without a trace.
+  const logWrites = [];
+  const logNotion = { pages: { create: async ({ parent, properties }) => {
+    logWrites.push({ parent, properties }); return { id: "log-new" };
+  } } };
+  await createActivityLogEntry(logNotion, {
+    taskId: "task1", source: "Drawing Flow", tag: "#submitted", author: "Gary",
+    entry: "Drawing A-101 Rev C02 submitted by Gary.",
+  });
+  const lp = logWrites[0].properties;
+  assert.strictEqual(logWrites[0].parent.database_id, "ACT");
+  assert.strictEqual(lp["Task"].relation[0].id, "task1", "the entry lands on its item");
+  assert.ok(!("Projects" in lp), "Projects is a rollup — writing it would fail silently");
+  ok("Activity Log: entry carries Task only; Projects is left to the rollup");
 
   writes.updated.length = 0;
   await resolveActionRow(aiNotion, "ai-new");

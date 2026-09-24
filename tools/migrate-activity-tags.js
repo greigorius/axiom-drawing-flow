@@ -1,7 +1,11 @@
-// One-off migration, two phases:
+// One-off migration: rewrite the Item Activity Log's Tag values onto the event-verb set.
 //
-//   1. Rewrite the Item Activity Log's Tag values onto the event-verb set.
-//   2. Backfill the Log's new Projects relation, derived from each row's Item.
+// It once had a second phase that backfilled the Log's Projects relation from each row's
+// Item. That ran successfully on 24 Sep 2026 (329/329 rows), after which Projects was
+// converted to a ROLLUP through Task — so it can no longer be written, and the phase was
+// removed. Do not reinstate it: a write to a rollup 400s.
+// The tag rewrite below is still safe to re-run; rows already on the new vocabulary match
+// nothing and are skipped.
 //
 //   #info      + "submitted by"     -> #submitted
 //   #approval  + "approved by DM"   -> #approved
@@ -122,37 +126,8 @@ function newTagFor(tag, entry, source) {
     console.log(`  ${k}\n      ${p.entry.slice(0, 90)}`);
   }
 
-  // ── Phase 2: derive Projects from each row's Item ────────────────────────────
-  // The Log's Projects relation is never entered by hand — it is always the Item's project,
-  // so a feed filtered by project cannot disagree with one filtered by item. Rows with no
-  // Item cannot be resolved and are reported rather than guessed at.
-  const projCache = new Map();
-  async function projectForTask(taskId) {
-    if (projCache.has(taskId)) return projCache.get(taskId);
-    let id = null;
-    const res = await fetch(`https://api.notion.com/v1/pages/${taskId}`, { headers });
-    if (res.ok) {
-      const page = await res.json();
-      id = page.properties?.["Projects"]?.relation?.[0]?.id || null;
-    }
-    projCache.set(taskId, id);
-    await new Promise((r) => setTimeout(r, 350));
-    return id;
-  }
-
-  const needProject = rows.filter(
-    (pg) => (pg.properties?.Task?.relation?.length || 0) > 0 &&
-            (pg.properties?.Projects?.relation?.length || 0) === 0
-  );
-  const noItem = rows.filter((pg) => (pg.properties?.Task?.relation?.length || 0) === 0);
-
-  console.log(`\nProjects backfill: ${needProject.length} rows need one, ` +
-              `${rows.length - needProject.length - noItem.length} already have one, ` +
-              `${noItem.length} have no Item so cannot be resolved.`);
-
   if (!APPLY) {
-    console.log(`\nDry run — nothing written.`);
-    console.log(`Re-run with --apply to retag ${planned.length} rows and set Projects on ${needProject.length}.`);
+    console.log(`\nDry run — nothing written. Re-run with --apply to retag ${planned.length} rows.`);
     return;
   }
 
@@ -175,34 +150,8 @@ function newTagFor(tag, entry, source) {
     // Notion allows ~3 requests/second. Stay under it.
     await new Promise((r) => setTimeout(r, 350));
   }
-  console.log(`\nTags done. ${done} updated, ${failed} failed.`);
-
-  console.log(`\nSetting Projects on ${needProject.length} rows...`);
-  let pdone = 0, pskip = 0, pfail = 0;
-  for (const pg of needProject) {
-    const taskId = pg.properties.Task.relation[0].id;
-    let projectId;
-    try { projectId = await projectForTask(taskId); }
-    catch (e) { pfail++; console.warn(`  lookup failed ${pg.id}: ${e.message}`); continue; }
-    if (!projectId) { pskip++; continue; }
-    const res = await fetch(`https://api.notion.com/v1/pages/${pg.id}`, {
-      method: "PATCH",
-      headers,
-      body: JSON.stringify({ properties: { Projects: { relation: [{ id: projectId }] } } }),
-    });
-    if (res.ok) {
-      pdone++;
-      if (pdone % 25 === 0) console.log(`  ${pdone}/${needProject.length}`);
-    } else {
-      pfail++;
-      const d = await res.json().catch(() => ({}));
-      console.warn(`  FAILED ${pg.id}: ${d.message || res.status}`);
-    }
-    await new Promise((r) => setTimeout(r, 350));
-  }
-  console.log(`\nProjects done. ${pdone} set, ${pskip} had an Item with no project, ${pfail} failed.`);
-
-  if (!failed && !pfail) {
-    console.log("\nNow delete the unused #info / #approval / #issue / #instruction options in the Notion UI.");
+  console.log(`\nDone. ${done} updated, ${failed} failed.`);
+  if (!failed) {
+    console.log("Now delete the unused #info / #approval / #issue / #instruction options in the Notion UI.");
   }
 })().catch((err) => { console.error("Migration failed:", err.message); process.exit(1); });

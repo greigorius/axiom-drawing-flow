@@ -992,29 +992,11 @@ function truncateForNotion(str, max = 1900) {
 // IMPORTANT: still call this with `await`, same as fireWebhook above. Netlify freezes the
 // Lambda the instant res.json() is sent, so an un-awaited "fire and forget" call here would
 // frequently get cut off mid-write before it reaches Notion, silently dropping the entry.
-// The Log's Projects relation is always DERIVED from the Item — never entered by hand —
-// so that a feed filtered by project cannot disagree with one filtered by item. Cached per
-// process because approve / issue / bounce / grade resolve the same few items repeatedly.
-// A warm Lambda could serve a stale id if an item were moved between projects; items do not
-// move between projects, and the next cold start clears it either way.
-const projectIdCache = new Map();
-async function projectIdForTask(notion, taskId) {
-  if (!taskId) return null;
-  if (projectIdCache.has(taskId)) return projectIdCache.get(taskId);
-  let id = null;
-  try {
-    const page = await notion.pages.retrieve({ page_id: taskId });
-    id = getProp(page, "Projects", "relation")?.[0] ?? null;
-  } catch (err) {
-    console.warn("[activity-log] project lookup failed:", err.message);
-  }
-  projectIdCache.set(taskId, id);
-  return id;
-}
-
-// `projectId` is optional: omit it and it is derived from taskId. Pass it explicitly (even
-// as null) when the caller already holds it, to save the lookup.
-async function createActivityLogEntry(notion, { taskId, projectId, source, tag, author, entry, detail, link }) {
+// Do NOT write Projects here. On 24 Sep 2026 the Log's Projects became a ROLLUP through
+// Task, so the project is computed from the item and cannot be written, cannot drift, and
+// cannot be edited by hand into disagreeing with the Task relation. Two fields that must
+// correlate are a defect waiting to happen; this removes the second field.
+async function createActivityLogEntry(notion, { taskId, source, tag, author, entry, detail, link }) {
   if (!ACTIVITY_LOG_DB) {
     console.warn("[activity-log] NOTION_DB_ACTIVITY_LOG not configured — skipping entry:", entry);
     return;
@@ -1027,8 +1009,6 @@ async function createActivityLogEntry(notion, { taskId, projectId, source, tag, 
       "Author": { rich_text: [{ text: { content: truncateForNotion(author || "System") } }] },
     };
     if (taskId) properties["Task"]   = { relation: [{ id: taskId }] };
-    const projId = projectId !== undefined ? projectId : await projectIdForTask(notion, taskId);
-    if (projId) properties["Projects"] = { relation: [{ id: projId }] };
     if (detail) properties["Detail"] = { rich_text: [{ text: { content: truncateForNotion(detail) } }] };
     if (link)   properties["Link"]   = { url: link };
 
@@ -1053,7 +1033,7 @@ async function createActivityLogEntry(notion, { taskId, projectId, source, tag, 
 // Same non-blocking contract as createActivityLogEntry: never throws, always awaited. A
 // submission whose queue row fails to open still submits; it just will not show in the open
 // queue, and its Activity Log entry is written regardless.
-async function createActionRow(notion, { taskId, projectId, personId, received, note, category, context, link }) {
+async function createActionRow(notion, { taskId, personId, received, note, category, context, link }) {
   if (!ACTIONS_INFO_DB) {
     console.warn("[a&i] NOTION_DB_ACTIONS_INFO not configured — skipping action row:", note);
     return null;
@@ -1070,11 +1050,9 @@ async function createActionRow(notion, { taskId, projectId, personId, received, 
     };
     if (category)  properties["Category"] = { select:   { name: category } };
     if (taskId)    properties["Items"]    = { relation: [{ id: taskId }] };
-    // Project and Person are set explicitly rather than left to be inferred later: A&I is
-    // filtered by project, and "whose submission is waiting on me" is the question the
-    // Person column answers for a review row. Both relations point at the same Projects and
-    // Team databases the Tasks and Submissions DBs use, so the ids carry straight across.
-    if (projectId) properties["Projects"] = { relation: [{ id: projectId }] };
+    // Projects is NOT written: it became a rollup through Items on 24 Sep 2026, for the same
+    // reason as the Log's. Person IS written — "whose submission is waiting on me" is the
+    // question that column answers, and it comes off the Submission, not the Item.
     if (personId)  properties["Person"]   = { relation: [{ id: personId }] };
     // Received is the date A&I is sorted and filtered by. For a submission, the information
     // arrived when the drawing landed — which is now. Email rows set it from the original
@@ -1369,8 +1347,7 @@ module.exports = function mountDrawingFlow(app, notion) {
 
     const dtName = dtPage ? (getProp(dtPage, "Name", "title") ?? dtInitials) : (dtInitials || "Unknown DT");
     await createActivityLogEntry(notion, {
-      taskId:    taskPage.id,
-      projectId: getProp(taskPage, "Projects", "relation")?.[0] ?? null,
+      taskId: taskPage.id,
       source: "Drawing Flow",
       tag:    "#submitted",
       author: dtName || "System",
@@ -1381,7 +1358,6 @@ module.exports = function mountDrawingFlow(app, notion) {
     // back onto the Submission so close-out can find it directly instead of searching A&I.
     const actionRowId = await createActionRow(notion, {
       taskId:    taskPage.id,
-      projectId: getProp(taskPage, "Projects", "relation")?.[0] ?? null,
       personId:  dtPage?.id ?? null,
       received:  new Date().toISOString(),
       note:     `Review ${drawingNo} Rev ${revision} — Suffix ${padItemNo(itemNo)}`,
