@@ -9,7 +9,8 @@ const fetchMock = async (url, opts) => { webhooks.push({ url, body: JSON.parse(o
 const mod = { exports: {} };
 const srcPath = fs.existsSync(__dirname + "/drawing-flow.js") ? __dirname + "/drawing-flow.js" : __dirname + "/../drawing-flow.js";
 vm.runInNewContext(fs.readFileSync(srcPath, "utf8"),
-  { module: mod, exports: mod.exports, require: (n) => n === "@netlify/blobs" ? blobs : require(n), process: { env }, console: { ...console, log(){}, warn(){} }, fetch: fetchMock, setTimeout, Promise, Date, Map, Set, JSON, Math });
+  { module: mod, exports: mod.exports, require: (n) => n === "@netlify/blobs" ? blobs
+      : n === "./public/lanes.js" ? require(srcPath.replace(/drawing-flow\.js$/, "public/lanes.js")) : require(n), process: { env }, console: { ...console, log(){}, warn(){} }, fetch: fetchMock, setTimeout, Promise, Date, Map, Set, JSON, Math });
 
 // ---- Notion mock ---------------------------------------------------------
 const title = (t) => ({ title: [{ plain_text: t }] });

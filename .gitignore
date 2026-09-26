@@ -4,3 +4,10 @@
 # Environment variables — never commit secrets
 .env
 node_modules/
+
+# Regenerated on demand by `node tests/activity.test.js --dump-summary` — not a source file.
+sample-summary.xlsx
+sample-combined.xlsx
+
+# Files delivered into the chat land here — not source.
+Claude outputs/

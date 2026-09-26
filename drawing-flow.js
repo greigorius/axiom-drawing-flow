@@ -34,6 +34,10 @@
 
 const { getStore } = require("@netlify/blobs");
 
+// The eight submission lanes, defined once. Lives under public/ so the same file serves the
+// Netlify function bundle (this require) and the browser (/lanes.js) — see public/lanes.js.
+const LANES = require("./public/lanes.js");
+
 // --- DB IDs ---
 const DRAWINGS_DB    = process.env.NOTION_DB_DRAWINGS;
 const SUBMISSIONS_DB = process.env.NOTION_DB_SUBMISSIONS;
@@ -582,6 +586,27 @@ function parseFilename(filename) {
 // Titles are {ProjectNo}-{Item}_{DrawingNo}_{Stage}_R{n}. The item can itself contain an
 // underscore ("200_1"), so work back from the stage marker instead of forward from the first
 // underscore; fall back to the old forward read when the stage isn't in the title.
+// Excel caps a worksheet name at 31 characters and rejects : \ / ? * [ ] outright. A blank
+// name or a duplicate does not raise a friendly error — it produces a workbook Excel refuses
+// to open. Sheet names in the combined export come from item titles the DM typed, so all
+// three cases turn up. Dedupe appends " (2)" *inside* the 31-character budget rather than
+// past it, which would reintroduce the length problem it is solving.
+function safeSheetName(raw, used) {
+  let name = String(raw ?? "").replace(/[:\\/?*\[\]]/g, " ").replace(/\s+/g, " ").trim();
+  if (!name) name = "Item";
+  if (name.length > 31) name = name.slice(0, 31).trim();
+  if (!used) return name;
+  if (!used.has(name)) { used.add(name); return name; }
+  for (let n = 2; n < 1000; n++) {
+    const suffix = ` (${n})`;
+    const candidate = name.slice(0, 31 - suffix.length).trim() + suffix;
+    if (!used.has(candidate)) { used.add(candidate); return candidate; }
+  }
+  const fallback = String(Date.now()).slice(-10);
+  used.add(fallback);
+  return fallback;
+}
+
 function parseSubmissionTitle(title, stage) {
   if (!title) return { taskCode: null, drawingNo: null };
   const firstUnder = title.indexOf("_");
@@ -3377,6 +3402,127 @@ module.exports = function mountDrawingFlow(app, notion) {
     };
   }
 
+  // fetchSummary — the executive-summary counterpart to fetchPosition.
+  //
+  // The feed answers "what happened"; this answers "where does each item stand". One row per
+  // item, carrying three badge groups: drawings by lane, open blockers, open RFIs.
+  //
+  // Everything here is machine-written. `Item Status` on the Tasks DB is deliberately NOT
+  // read: it is a hand-maintained Notion status property (formulas cannot write to a status
+  // property, so it cannot be made correct by construction the way `Projects` was), and it
+  // lags the drawings. A card that showed it would put a stale claim in front of a client.
+  // An item with no evidence gets no drawing badge rather than a guess — see handoff §7.5.
+  async function fetchSummary(q = {}) {
+    const { projectId, taskId } = q;
+    const errors = [];
+
+    let scopeIds = null;
+    if (taskId) {
+      scopeIds = [taskId];
+    } else if (projectId) {
+      scopeIds = await findTaskIdsForProject(notion, projectId);
+      if (!scopeIds.length) return { items: [], unlinked: { drawings: 0, position: 0 } };
+    }
+
+    // One pass over the whole Submissions DB rather than the cockpit's six per-status
+    // fetches. The badge needs terminal rows (Graded + DT Notified) that the board never
+    // asks for, and the per-status endpoints do DT and drawing lookups this does not need.
+    let drawings = { byItem: {}, unlinked: 0 };
+    if (SUBMISSIONS_DB) {
+      try {
+        const rows = await queryAll(notion, SUBMISSIONS_DB,
+          scopeIds ? { and: [taskScopeFilter("Item", scopeIds)] } : undefined);
+        drawings = LANES.summarise(rows.map((page) => {
+          const title = getProp(page, "Submission", "title");
+          const stage = getProp(page, "Stage", "select");
+          const { taskCode } = parseSubmissionTitle(title, stage);
+          // Comments are waiting when cr-ingest has flipped Ball In Court to DM, or when a
+          // logged comment path has not yet been moved under /Reviewed/ by Log Status.
+          const unreviewed = readPathList(page, "Comment Paths")
+            .some((path) => !/\/reviewed\//i.test(path));
+          return {
+            id:          page.id,
+            taskCode,
+            stage,
+            status:      getProp(page, "Status",       "select"),
+            qaRound:     getProp(page, "QA Round",     "number"),
+            submitted:   getProp(page, "Submitted",    "date"),
+            drawingIds:  getProp(page, "Drawing",      "relation"),
+            taskIds:     getProp(page, "Item",         "relation"),
+            dtNotified:  getProp(page, "DT Notified",  "checkbox") ?? false,
+            hasComments: getProp(page, "Ball In Court", "select") === "DM" || unreviewed,
+          };
+        }));
+      } catch (err) {
+        console.warn("[activity-summary] Submissions query failed:", err.message);
+        errors.push(`Drawings unavailable: ${err.message}`);
+      }
+    }
+
+    // Blockers and open RFIs come straight from fetchPosition — the same numbers the feed
+    // header shows, regrouped by item. Two fetchers, never two definitions of "blocked".
+    const position = await fetchPosition(q);
+
+    const byItem = new Map();
+    const ensure = (id, name, project) => {
+      if (!byItem.has(id)) {
+        byItem.set(id, {
+          taskId: id, taskName: name || null, projectName: project || null, taskCode: null,
+          drawings: [], drawingTotal: 0, blockers: [], rfis: [],
+        });
+      }
+      const e = byItem.get(id);
+      if (!e.taskName && name) e.taskName = name;
+      if (!e.projectName && project) e.projectName = project;
+      return e;
+    };
+
+    for (const [id, d] of Object.entries(drawings.byItem)) {
+      const e = ensure(id);
+      e.taskCode     = d.taskCode;
+      e.drawings     = d.lanes;
+      e.drawingTotal = d.total;
+    }
+    for (const r of position.items.ai) {
+      if (!r.taskId) continue;
+      const e = ensure(r.taskId, r.taskName, r.projectName);
+      if (r.blocker) e.blockers.push({ id: r.id, title: r.title, reason: r.blocker, bic: r.bic || "—", url: r.url });
+    }
+    for (const r of position.items.rfis) {
+      if (!r.taskId) continue;
+      const e = ensure(r.taskId, r.taskName, r.projectName);
+      e.rfis.push({ id: r.id, ref: r.ref, title: r.title, status: r.status, bic: r.bic || "—", url: r.url });
+    }
+
+    // Names are only known for items that surfaced through A&I or RFIs; a drawings-only item
+    // arrives with just its page id, so fill the gaps from the Tasks DB.
+    const resolveTaskName = makeTaskNameResolver(notion);
+    await Promise.all([...byItem.values()].filter((e) => !e.taskName).map(async (e) => {
+      try {
+        const { taskName, projectName } = await resolveTaskName(e.taskId);
+        e.taskName    = taskName;
+        e.projectName = projectName;
+      } catch { /* leave unnamed rather than fail the whole summary */ }
+    }));
+
+    // Most pressing first: blocked items, then most drawings needing attention.
+    const attention = (e) => e.drawings
+      .filter((l) => l.id === "bounced" || l.id === "comments" || l.id === "reviewed")
+      .reduce((n, l) => n + l.n, 0);
+    const items = [...byItem.values()].sort((a, b) =>
+      (b.blockers.length - a.blockers.length) ||
+      (b.rfis.length - a.rfis.length) ||
+      (attention(b) - attention(a)) ||
+      String(a.taskCode || a.taskName || "").localeCompare(String(b.taskCode || b.taskName || "")));
+
+    return {
+      items,
+      lanes: LANES.LANES,
+      unlinked: { drawings: drawings.unlinked, position: position.unassigned },
+      ...(errors.length ? { errors } : {}),
+    };
+  }
+
   // GET /api/df/activity-log?taskId=&projectId=&days=&limit=&tag=&source=&from=&to=
   // Scope, in priority order:
   //   taskId given    -> full history for that one item, unbounded by date.
@@ -3405,21 +3551,59 @@ module.exports = function mountDrawingFlow(app, notion) {
     }
   });
 
-  // GET /api/df/activity-export?<same filters as activity-log>
-  // Streams an .xlsx built server-side. Goes through the same two fetchers as the feed and
-  // the header, so what downloads is exactly what was on screen — if the UI shows 12
-  // entries, Sheet 1 has 12 rows.
+  // GET /api/df/activity-summary?projectId=&taskId=
+  // One row per item: drawing lanes (zeros dropped), open blockers, open RFIs.
+  app.get("/api/df/activity-summary", async (req, res) => {
+    if (!ACTIONS_INFO_DB) return res.status(503).json({ ok: false, error: "NOTION_DB_ACTIONS_INFO not configured" });
+    try {
+      res.json(await fetchSummary(req.query));
+    } catch (err) {
+      console.error("GET /api/df/activity-summary", err);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // GET /api/df/activity-export?mode=summary|detail|combined&<same filters as activity-log>
   //
-  // exceljs, not SheetJS. The brief named SheetJS, but the free `xlsx` build writes neither
-  // cell styles nor frozen panes (verified against the generated XML — styles are a Pro
-  // feature), and a bold header row and frozen top row are both explicit requirements.
+  // Three deliverables, not one workbook with everything in it. They have different readers:
+  //
+  //   summary   One sheet, one row per item: where each item's drawings stand, its blockers
+  //             and its open RFIs. This is what goes to a client. It does NOT list the
+  //             submissions — that detail is noise to them (handoff §7.6).
+  //   detail    The evidence behind the summary: the full filtered log, plus the open items
+  //             from both trackers. This is the old export, unchanged, and the default so
+  //             that any saved link keeps working.
+  //   combined  Summary first, then one sheet per item carrying that item's own log. For
+  //             handing over a project in a single file.
+  //
+  // Semantics worth knowing before reading a combined workbook: the summary sheet is
+  // SCOPE-only — it states where things stand now, and a tag or date filter has nothing to
+  // narrow in that. The log sheets are filter-driven. So narrowing to "#query, last 7 days"
+  // thins the log sheets and leaves the summary alone. That is intentional; the alternative
+  // is a position statement that changes depending on which slice of history you asked for.
+  const EXPORT_MODES = ["summary", "detail", "combined"];
+  // A client-facing workbook with 150 tabs is not a deliverable, and building it would run
+  // the Lambda past its timeout. Combined is in practice always scoped to a project.
+  const MAX_ITEM_SHEETS = 50;
+
   app.get("/api/df/activity-export", async (req, res) => {
     if (!ACTIVITY_LOG_DB) return res.status(503).json({ ok: false, error: "NOTION_DB_ACTIVITY_LOG not configured" });
+    const mode = String(req.query.mode || "detail").toLowerCase();
+    if (!EXPORT_MODES.includes(mode)) {
+      return res.status(400).json({ ok: false, error: `Invalid mode: ${mode}. One of ${EXPORT_MODES.join(", ")}.` });
+    }
     try {
       const ExcelJS = require("exceljs");
-      const [entries, position] = await Promise.all([
-        fetchActivityEntries(req.query),
-        ACTIONS_INFO_DB ? fetchPosition(req.query) : Promise.resolve(null),
+
+      // Fetch only what this mode actually prints. A summary export does not read the
+      // Activity Log at all, which makes it the cheapest of the three despite being the one
+      // most often run.
+      const wantsFeed    = mode !== "summary";
+      const wantsSummary = mode !== "detail";
+      const [entries, position, summary] = await Promise.all([
+        wantsFeed    ? fetchActivityEntries(req.query)      : Promise.resolve([]),
+        (wantsFeed && ACTIONS_INFO_DB) ? fetchPosition(req.query) : Promise.resolve(null),
+        wantsSummary ? fetchSummary(req.query)              : Promise.resolve(null),
       ]);
 
       const wb = new ExcelJS.Workbook();
@@ -3431,60 +3615,202 @@ module.exports = function mountDrawingFlow(app, notion) {
       const UK_DATETIME = "dd/mm/yyyy hh:mm";
       const UK_DATE     = "dd/mm/yyyy";
 
-      const finish = (ws, widths) => {
+      // Blocked rows go red so a glance finds what needs resolving. Excel's "Bad" pairing —
+      // light red fill, dark red text — because these workbooks are read and printed on
+      // white, not in the app's dark theme.
+      //
+      // The visible colour of a DIFFERENTIAL fill lives in bgColor, not fgColor. That is the
+      // opposite of an ordinary cell fill, and getting it wrong renders as no fill at all —
+      // indistinguishable from the rule never matching. Verified against the emitted
+      // styles.xml: <dxf><fill><patternFill patternType="solid"><bgColor rgb="FFF8D7DA"/>.
+      const BLOCKED_STYLE = {
+        fill: { type: "pattern", pattern: "solid", bgColor: { argb: "FFF8D7DA" } },
+        font: { color: { argb: "FF9C0006" } },
+      };
+
+      // Paint the whole row wherever `formula` holds. The column reference must be absolute
+      // and the row relative ($D2), or the rule tests one single cell for the entire range.
+      const highlightBlocked = (ws, colCount, formula) => {
+        // Header-only sheet: "A2:R1" is not a range Excel will accept.
+        if (ws.rowCount < 2) return;
+        const lastCol = ws.getColumn(colCount).letter;
+        ws.addConditionalFormatting({
+          ref: `A2:${lastCol}${ws.rowCount}`,
+          rules: [{ type: "expression", priority: 1, formulae: [formula], style: BLOCKED_STYLE }],
+        });
+      };
+
+      // On a log sheet there is no blockers column — the log's way of saying an item is
+      // stuck is the #blocked tag, which is column D.
+      const BLOCKED_TAG_RULE = '$D2="#blocked"';
+
+      const finish = (ws, widths, opts = {}) => {
+        const { freezeCols = 0, fitWide = false } = opts;
         // Per cell, not ws.getRow(1).font — a row-level font is not what Excel stores and
         // does not survive a write/read round-trip.
         ws.getRow(1).eachCell((c) => { c.font = { bold: true }; });
-        ws.views = [{ state: "frozen", ySplit: 1 }];
+        ws.views = [{ state: "frozen", ySplit: 1, ...(freezeCols ? { xSplit: freezeCols } : {}) }];
         ws.columns.forEach((c, i) => { c.width = widths[i]; });
         ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: widths.length } };
+        // Repeat the header on every printed page. A five-page log whose pages 2–5 have no
+        // column headings is a printout nobody can read.
+        ws.pageSetup = { ...(ws.pageSetup || {}), printTitlesRow: "1:1" };
+        if (fitWide) {
+          // A one-column-per-lane sheet runs to 18 columns. Left to itself it breaks across
+          // pages and page 2 arrives as a block of counts with no item name against them —
+          // the opposite of a sheet you can glance at. Landscape, one page wide, any number
+          // of pages long, with the identifying columns repeated on each.
+          ws.pageSetup = {
+            ...ws.pageSetup,
+            orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0,
+            ...(freezeCols ? { printTitlesColumn: `A:${ws.getColumn(freezeCols).letter}` } : {}),
+          };
+        }
       };
 
-      // ── Sheet 1: Activity Log ──────────────────────────────────────────
-      const s1 = wb.addWorksheet("Activity Log");
-      s1.addRow(["Date", "Project", "Item", "Tag", "Source", "Author", "Entry", "Detail", "Link"]);
-      for (const e of entries) {
-        const row = s1.addRow([
-          new Date(effectiveDate(e)),
-          e.projectName || "", e.taskName || "(unassigned)",
-          e.tag || "", e.source || "", e.author || "",
-          e.entry || "", e.detail || "", null,
+      // ── Summary: one row per item, one column per lane ─────────────────
+      const addSummarySheet = () => {
+        const ws = wb.addWorksheet("Summary");
+        // Lane columns come from LANE_ORDER, so a lane added to lanes.js appears here
+        // without anyone remembering to widen this header.
+        const laneIds = LANES.LANE_ORDER;
+        ws.addRow([
+          "Project", "Item", "Code",
+          ...laneIds.map((id) => LANES.LANE_SHORT[id]),
+          "Drawings", "Blockers", "Blocker detail", "Open RFIs", "RFI refs",
         ]);
-        row.getCell(1).numFmt = UK_DATETIME;
-        if (e.link) row.getCell(9).value = { text: "Open", hyperlink: e.link };
-      }
-      finish(s1, [18, 20, 32, 14, 14, 14, 70, 60, 10]);
-
-      // ── Sheet 2: Current Position ──────────────────────────────────────
-      const s2 = wb.addWorksheet("Current Position");
-      s2.addRow(["Source", "Ref", "Project", "Item", "Title", "Status", "Ball in Court", "Blocker", "Opened", "Days Open"]);
-      if (position) {
-        const rows = [
-          ...position.items.ai.map((r) => ({
-            source: "A&I", ref: "", project: r.projectName, item: r.taskName, title: r.title,
-            status: r.status, bic: r.bic, blocker: r.blocker, since: r.received || r.created,
-          })),
-          ...position.items.rfis.map((r) => ({
-            source: "RFI", ref: r.ref, project: r.projectName, item: r.taskName, title: r.title,
-            status: r.status, bic: r.bic, blocker: OPEN_RFIS_BLOCK ? "Awaiting RFI response" : null,
-            since: r.raised || r.created,
-          })),
-        ].sort((a, b) => new Date(a.since) - new Date(b.since)); // oldest first — what to chase
-        for (const r of rows) {
-          const row = s2.addRow([
-            r.source, r.ref || "", r.project || "", r.item || "(unassigned)", r.title || "",
-            r.status || "", r.bic || "", r.blocker || "",
-            r.since ? new Date(r.since) : null, daysOpen(r.since),
+        for (const it of (summary?.items || [])) {
+          const counts = Object.fromEntries((it.drawings || []).map((l) => [l.id, l.n]));
+          ws.addRow([
+            it.projectName || "", it.taskName || "(unnamed item)", it.taskCode || "",
+            // null, not 0 — "exclude any that equal 0" (Greig, 25 Sep). A blank cell also
+            // keeps the column sortable and filterable, which "0" would clutter.
+            ...laneIds.map((id) => counts[id] || null),
+            it.drawingTotal || null,
+            it.blockers.length || null,
+            it.blockers.map((b) => b.reason).join("; "),
+            it.rfis.length || null,
+            it.rfis.map((r) => r.ref).join(", "),
           ]);
-          row.getCell(9).numFmt = UK_DATE;
         }
+        // Blockers sits at 3 (Project/Item/Code) + one per lane + 2 (Drawings, Blockers).
+        // Blank means none — the count column writes null rather than 0 — so "not blank" is
+        // exactly "has something holding it up".
+        const blockersCol = ws.getColumn(5 + laneIds.length).letter;
+        highlightBlocked(ws, 8 + laneIds.length, `$${blockersCol}2<>""`);
+        // Freeze Project/Item/Code so scrolling right across the lanes keeps the item in
+        // view — the same problem on screen that printTitlesColumn solves on paper.
+        finish(ws, [20, 32, 12, ...laneIds.map(() => 12), 10, 10, 40, 10, 22],
+          { freezeCols: 3, fitWide: true });
+        return ws;
+      };
+
+      // ── Activity Log: the filtered feed, exactly as shown ──────────────
+      const LOG_HEADER = ["Date", "Project", "Item", "Tag", "Source", "Author", "Entry", "Detail", "Link"];
+      const LOG_WIDTHS = [18, 20, 32, 14, 14, 14, 70, 60, 10];
+      const addLogRows = (ws, rows, { withItem = true } = {}) => {
+        for (const e of rows) {
+          const row = ws.addRow([
+            new Date(effectiveDate(e)),
+            e.projectName || "", withItem ? (e.taskName || "(unassigned)") : "",
+            e.tag || "", e.source || "", e.author || "",
+            e.entry || "", e.detail || "", null,
+          ]);
+          row.getCell(1).numFmt = UK_DATETIME;
+          if (e.link) row.getCell(9).value = { text: "Open", hyperlink: e.link };
+        }
+      };
+
+      const addActivityLogSheet = () => {
+        const ws = wb.addWorksheet("Activity Log");
+        ws.addRow(LOG_HEADER);
+        addLogRows(ws, entries);
+        highlightBlocked(ws, LOG_HEADER.length, BLOCKED_TAG_RULE);
+        finish(ws, LOG_WIDTHS);
+      };
+
+      // ── Current Position: open rows across both trackers ───────────────
+      const addCurrentPositionSheet = () => {
+        const ws = wb.addWorksheet("Current Position");
+        ws.addRow(["Source", "Ref", "Project", "Item", "Title", "Status", "Ball in Court", "Blocker", "Opened", "Days Open"]);
+        if (position) {
+          const rows = [
+            ...position.items.ai.map((r) => ({
+              source: "A&I", ref: "", project: r.projectName, item: r.taskName, title: r.title,
+              status: r.status, bic: r.bic, blocker: r.blocker, since: r.received || r.created,
+            })),
+            ...position.items.rfis.map((r) => ({
+              source: "RFI", ref: r.ref, project: r.projectName, item: r.taskName, title: r.title,
+              status: r.status, bic: r.bic, blocker: OPEN_RFIS_BLOCK ? "Awaiting RFI response" : null,
+              since: r.raised || r.created,
+            })),
+          ].sort((a, b) => new Date(a.since) - new Date(b.since)); // oldest first — what to chase
+          for (const r of rows) {
+            const row = ws.addRow([
+              r.source, r.ref || "", r.project || "", r.item || "(unassigned)", r.title || "",
+              r.status || "", r.bic || "", r.blocker || "",
+              r.since ? new Date(r.since) : null, daysOpen(r.since),
+            ]);
+            row.getCell(9).numFmt = UK_DATE;
+          }
+        }
+        // Blocker is column H. fetchPosition already nulls an A&I "—" (assessed, nothing
+        // holding it up), so anything left in this column genuinely blocks.
+        highlightBlocked(ws, 10, '$H2<>""');
+        finish(ws, [10, 10, 20, 32, 50, 14, 16, 24, 12, 11]);
+      };
+
+      // ── One log sheet per item ─────────────────────────────────────────
+      // Costs no extra Notion calls: this regroups the entries the feed already fetched.
+      const addPerItemSheets = () => {
+        const byTask = new Map();
+        for (const e of entries) {
+          const key = e.taskId || "__unassigned__";
+          if (!byTask.has(key)) byTask.set(key, []);
+          byTask.get(key).push(e);
+        }
+        // Follow the summary's order — most pressing first — so tab order and the summary
+        // sheet agree. Items with entries but no summary row follow, unassigned last.
+        const ordered = [];
+        for (const it of (summary?.items || [])) {
+          if (byTask.has(it.taskId)) { ordered.push([it.taskCode || it.taskName, byTask.get(it.taskId)]); byTask.delete(it.taskId); }
+        }
+        for (const [key, rows] of byTask) {
+          if (key === "__unassigned__") continue;
+          ordered.push([rows[0].taskName || rows[0].taskId, rows]);
+        }
+        if (byTask.has("__unassigned__")) ordered.push(["Unassigned", byTask.get("__unassigned__")]);
+
+        const used = new Set(wb.worksheets.map((w) => w.name));
+        for (const [label, rows] of ordered.slice(0, MAX_ITEM_SHEETS)) {
+          const ws = wb.addWorksheet(safeSheetName(label, used));
+          ws.addRow(LOG_HEADER);
+          addLogRows(ws, rows);
+          highlightBlocked(ws, LOG_HEADER.length, BLOCKED_TAG_RULE);
+          finish(ws, LOG_WIDTHS);
+        }
+        return { total: ordered.length, written: Math.min(ordered.length, MAX_ITEM_SHEETS) };
+      };
+
+      let truncated = null;
+      if (mode === "summary") {
+        addSummarySheet();
+      } else if (mode === "detail") {
+        addActivityLogSheet();
+        addCurrentPositionSheet();
+      } else {
+        addSummarySheet();
+        const { total, written } = addPerItemSheets();
+        if (total > written) truncated = { total, written };
       }
-      finish(s2, [10, 10, 20, 32, 50, 14, 16, 24, 12, 11]);
 
       const buf = await wb.xlsx.writeBuffer();
       const stamp = new Date().toISOString().slice(0, 10);
       res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-      res.setHeader("Content-Disposition", `attachment; filename="activity-export_${stamp}.xlsx"`);
+      res.setHeader("Content-Disposition", `attachment; filename="activity-${mode}_${stamp}.xlsx"`);
+      // A silently shortened workbook is the kind of thing nobody notices until a client
+      // asks where their item went, so say so in a header the UI can surface.
+      if (truncated) res.setHeader("X-Export-Truncated", `${truncated.written}/${truncated.total}`);
       res.send(Buffer.from(buf));
     } catch (err) {
       console.error("GET /api/df/activity-export", err);

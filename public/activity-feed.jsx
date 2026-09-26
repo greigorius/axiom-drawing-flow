@@ -130,8 +130,19 @@ const ActivityFeed = () => {
   const [loadError,   setLoadError]   = useState(null);
   const [posError,    setPosError]    = useState(null);
   const [expandedIds, setExpandedIds] = useState(() => new Set());
-  const [exporting,   setExporting]   = useState(false);
+  // The mode currently downloading, or null — so only the clicked option shows a spinner.
+  const [exporting,   setExporting]   = useState(null);
   const [exportError, setExportError] = useState(null);
+  const [exportNote,  setExportNote]  = useState(null);
+  const [exportMenu,  setExportMenu]  = useState(false);
+
+  // Two views over the same scope. The feed answers "how did we get here"; the summary
+  // answers "where does it stand". Separate fetches, because the summary reads the
+  // Submissions DB and the feed does not — and nobody should pay for both on page load.
+  const [view,         setView]         = useState("feed");
+  const [summary,      setSummary]      = useState(null);
+  const [loadingSum,   setLoadingSum]   = useState(false);
+  const [sumError,     setSumError]     = useState(null);
 
   useEffect(() => {
     fetch("/api/projects").then((r) => r.json())
@@ -208,8 +219,44 @@ const ActivityFeed = () => {
     }
   }, [scopeParams]);
 
+  // Scope-only, like the position header — a tag or date filter has nothing to narrow in a
+  // statement about where things stand right now.
+  const loadSummary = useCallback(async () => {
+    setLoadingSum(true);
+    setSumError(null);
+    try {
+      const r = await fetch(`/api/df/activity-summary?${scopeParams.toString()}`);
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || "Failed to load summary");
+      setSummary(data);
+    } catch (err) {
+      setSumError(err.message);
+      setSummary(null);
+    } finally {
+      setLoadingSum(false);
+    }
+  }, [scopeParams]);
+
+  // A menu that will not close is worse than no menu. Pointerdown rather than click so it
+  // closes on the press, and capture so it still fires if the target stops propagation.
+  const exportMenuRef = useRef(null);
+  useEffect(() => {
+    if (!exportMenu) return;
+    const onDown = (e) => { if (!exportMenuRef.current?.contains(e.target)) setExportMenu(false); };
+    const onKey  = (e) => { if (e.key === "Escape") setExportMenu(false); };
+    document.addEventListener("pointerdown", onDown, true);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onDown, true);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [exportMenu]);
+
   useEffect(() => { loadEntries(); },  [loadEntries]);
   useEffect(() => { loadPosition(); }, [loadPosition]);
+  // Deliberately not on mount: the feed is the landing view, and the summary costs a full
+  // pass over the Submissions DB. Changing scope while on the summary tab refetches.
+  useEffect(() => { if (view === "summary") loadSummary(); }, [view, loadSummary]);
 
   const toggleExpanded = (id) => setExpandedIds((prev) => {
     const next = new Set(prev);
@@ -234,18 +281,34 @@ const ActivityFeed = () => {
 
   // Fetched as a blob rather than pointed at with window.location, so a 500 surfaces as a
   // message in the page instead of dumping raw JSON over the app in a new tab.
-  const handleExport = async () => {
-    setExporting(true);
+  // Three deliverables, three readers (§8). Summary is scope-only on the server, so the
+  // filter params it ignores are harmless to send.
+  const EXPORT_MODES = [
+    { id: "summary",  label: "Summary",  hint: "One row per item — for the client" },
+    { id: "detail",   label: "Detail",   hint: "The full log behind the summary" },
+    { id: "combined", label: "Combined", hint: "Summary, then a sheet per item" },
+  ];
+
+  const handleExport = async (mode) => {
+    setExportMenu(false);
+    setExporting(mode);
     setExportError(null);
+    setExportNote(null);
     try {
-      const r = await fetch(`/api/df/activity-export?${feedParams.toString()}`);
+      const params = new URLSearchParams(feedParams);
+      params.set("mode", mode);
+      const r = await fetch(`/api/df/activity-export?${params.toString()}`);
       if (!r.ok) {
         const data = await r.json().catch(() => ({}));
         throw new Error(data.error || `Export failed (${r.status})`);
       }
       const blob = await r.blob();
       const name = (r.headers.get("content-disposition") || "").match(/filename="([^"]+)"/)?.[1]
-        || `activity-export_${new Date().toISOString().slice(0, 10)}.xlsx`;
+        || `activity-${mode}_${new Date().toISOString().slice(0, 10)}.xlsx`;
+      // The server caps a combined workbook's item sheets. Say so — a quietly shortened
+      // file is the kind of thing nobody notices until a client asks where their item went.
+      const cut = r.headers.get("x-export-truncated");
+      if (cut) setExportNote(`Combined export capped at ${cut} items — narrow the scope to a project to include them all.`);
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url; a.download = name;
@@ -254,7 +317,7 @@ const ActivityFeed = () => {
     } catch (err) {
       setExportError(err.message);
     } finally {
-      setExporting(false);
+      setExporting(null);
     }
   };
 
@@ -306,14 +369,40 @@ const ActivityFeed = () => {
     <div>
       <div className="page-header">
         <h1 className="page-title">Activity Feed</h1>
-        <button
-          className="btn btn-ghost"
-          onClick={handleExport}
-          disabled={exporting || loadingData || entries.length === 0}
-          title={entries.length === 0 ? "Nothing to export" : "Download exactly what is shown below"}
-        >
-          {exporting ? "Preparing…" : "⤓ Export"}
-        </button>
+        <div className="export-menu" ref={exportMenuRef}>
+          <button
+            className="btn btn-ghost"
+            onClick={() => setExportMenu((v) => !v)}
+            disabled={!!exporting}
+            aria-haspopup="menu"
+            aria-expanded={exportMenu}
+          >
+            {exporting ? "Preparing…" : "⤓ Export ▾"}
+          </button>
+          {exportMenu && (
+            <div className="export-menu-list" role="menu">
+              {EXPORT_MODES.map((m) => {
+                // Summary reads the trackers, not the log, so it is downloadable even when
+                // the feed below is empty. The other two would produce a blank workbook.
+                const needsEntries = m.id !== "summary";
+                const disabled = !!exporting || (needsEntries && (loadingData || entries.length === 0));
+                return (
+                  <button
+                    key={m.id}
+                    role="menuitem"
+                    className="export-menu-item"
+                    disabled={disabled}
+                    title={disabled && needsEntries ? "Nothing in the feed to export" : ""}
+                    onClick={() => handleExport(m.id)}
+                  >
+                    <span className="export-menu-label">{m.label}</span>
+                    <span className="export-menu-hint">{m.hint}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="form-card">
@@ -450,22 +539,108 @@ const ActivityFeed = () => {
           </>
         )}
 
-        {/* ── Feed ───────────────────────────────────────────────────── */}
-        <div className="section-label" style={{ marginTop: 24 }}>Feed</div>
+        {/* ── Feed / Summary ─────────────────────────────────────────── */}
+        <div className="view-switch" role="group" aria-label="View">
+          <button type="button" aria-pressed={view === "feed"} onClick={() => setView("feed")}>Feed</button>
+          <button type="button" aria-pressed={view === "summary"} onClick={() => setView("summary")}>Summary</button>
+          <span className="view-switch-hint">
+            {view === "feed" ? "How did we get here" : "Where does it stand"}
+          </span>
+        </div>
 
         {exportError && <div className="save-result error" style={{ marginBottom: 12 }}>{exportError}</div>}
+        {exportNote && <div className="position-note">⚠ {exportNote}</div>}
 
-        {loadingData && (
+        {/* ── Summary ────────────────────────────────────────────────── */}
+        {view === "summary" && (
+          <>
+            {loadingSum && <div className="state-loading"><div className="spinner" /><div>Loading…</div></div>}
+            {!loadingSum && sumError && <div className="state-error">{sumError}</div>}
+
+            {!loadingSum && !sumError && summary?.errors?.length > 0 && (
+              <div className="position-note">⚠ {summary.errors.join(" · ")}</div>
+            )}
+
+            {!loadingSum && !sumError && summary && summary.items.length === 0 && (
+              <div className="state-empty">Nothing to summarise in this scope.</div>
+            )}
+
+            {!loadingSum && !sumError && summary?.items.length > 0 && (
+              <div className="summary-list">
+                {summary.items.map((it) => (
+                  <div key={it.taskId} className="summary-card">
+                    <div className="summary-card-head">
+                      <span className="summary-card-item">
+                        {showProjectLabel && it.projectName
+                          ? `${it.projectName} — ${it.taskName || it.taskCode || "(unnamed item)"}`
+                          : (it.taskName || it.taskCode || "(unnamed item)")}
+                      </span>
+                      {it.taskCode && <span className="summary-card-code">{it.taskCode}</span>}
+                    </div>
+
+                    <div className="summary-badges">
+                      <div className="summary-group">
+                        <span className="summary-group-legend">Drawings</span>
+                        {it.drawings.length > 0 ? it.drawings.map((l) => (
+                          <span key={l.id} className={`lane-pill lane-${l.id}`}>
+                            {l.title} <b>{l.n}</b>
+                          </span>
+                        )) : (
+                          /* No submissions on record. An em-dash, not a guess: `Item Status`
+                             would fill this in but it is hand-maintained and lags. */
+                          <span className="summary-none" title="No submissions recorded for this item yet">—</span>
+                        )}
+                      </div>
+
+                      {/* Absence is silent, as in the blocker strip above. */}
+                      {it.blockers.length > 0 && (
+                        <div className="summary-group">
+                          <span className="summary-group-legend">Blockers</span>
+                          {it.blockers.map((b) => (
+                            <span key={b.id} className="lane-pill lane-blocker" title={`${b.title || ""} · BIC ${b.bic}`}>
+                              {b.reason}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+
+                      {it.rfis.length > 0 && (
+                        <div className="summary-group">
+                          <span className="summary-group-legend">Open RFIs</span>
+                          {it.rfis.map((q) => (
+                            <span key={q.id} className="lane-pill lane-rfi" title={`${q.title || ""} · ${q.status} · TBC by ${q.bic}`}>
+                              {q.ref}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {!loadingSum && !sumError && summary?.unlinked.drawings > 0 && (
+              <div className="unassigned-note">
+                ⚠ {summary.unlinked.drawings} submission{summary.unlinked.drawings === 1 ? " is" : "s are"} not
+                linked to an item — {summary.unlinked.drawings === 1 ? "it is" : "they are"} missing from the
+                counts above until the Item relation is set in Notion.
+              </div>
+            )}
+          </>
+        )}
+
+        {view === "feed" && loadingData && (
           <div className="state-loading"><div className="spinner" /><div>Loading…</div></div>
         )}
 
-        {!loadingData && loadError && <div className="state-error">{loadError}</div>}
+        {view === "feed" && !loadingData && loadError && <div className="state-error">{loadError}</div>}
 
-        {!loadingData && !loadError && entries.length === 0 && (
+        {view === "feed" && !loadingData && !loadError && entries.length === 0 && (
           <div className="state-empty">{emptyLabel}</div>
         )}
 
-        {!loadingData && !loadError && entries.length > 0 && (
+        {view === "feed" && !loadingData && !loadError && entries.length > 0 && (
           <div className="activity-feed-list">
             {entries.map((e) => {
               const isOpen = expandedIds.has(e.id);

@@ -5,14 +5,16 @@ const fs = require("fs"), vm = require("vm"), assert = require("assert");
 
 const env = {
   NOTION_DB_ACTIVITY_LOG: "ACT", NOTION_DB_ACTIONS_INFO: "AI",
-  NOTION_DB_RFIS: "RFIS", NOTION_DB_TASKS: "TASKS",
+  NOTION_DB_RFIS: "RFIS", NOTION_DB_TASKS: "TASKS", NOTION_DB_SUBMISSIONS: "SUBS",
 };
 const mod = { exports: {} };
 const srcPath = fs.existsSync(__dirname + "/drawing-flow.js") ? __dirname + "/drawing-flow.js" : __dirname + "/../drawing-flow.js";
+const lanesPath = srcPath.replace(/drawing-flow\.js$/, "public/lanes.js");
 vm.runInNewContext(fs.readFileSync(srcPath, "utf8") +
-  "\n;module.exports.__t = { createActionRow, resolveActionRow, createActivityLogEntry };", {
+  "\n;module.exports.__t = { createActionRow, resolveActionRow, createActivityLogEntry, LANES, safeSheetName };", {
   module: mod, exports: mod.exports,
-  require: (n) => n === "@netlify/blobs" ? { getStore: () => ({ get: async () => [], setJSON: async () => {} }) } : require(n),
+  require: (n) => n === "@netlify/blobs" ? { getStore: () => ({ get: async () => [], setJSON: async () => {} }) }
+    : n === "./public/lanes.js" ? require(lanesPath) : require(n),
   process: { env }, console: { ...console, log() {}, warn() {} },
   fetch: async () => ({ ok: true, status: 200, text: async () => "" }),
   setTimeout, Promise, Date, Map, Set, JSON, Math, Buffer, ArrayBuffer, Uint8Array,
@@ -47,6 +49,8 @@ const actRows = [
     properties: { Entry: title("Backfilled: March kickoff decision."), Source: sel("Manual"), Tag: sel("#decision"), Author: rt("DM"), Detail: rt(""), Link: { url: null }, "Event Date": dt("2026-03-02"), Task: rel("task2") } },
   { id: "a4", url: "u/a4", created_time: "2026-09-16T11:00:00.000Z",
     properties: { Entry: title("Drawing A-101 Rev C02 approved by DM."), Source: sel("Drawing Flow"), Tag: sel("#approved"), Author: rt("DM"), Detail: rt(""), Link: { url: null }, "Event Date": dt(null), Task: rel("task2") } },
+  { id: "a5", url: "u/a5", created_time: "2026-09-15T10:00:00.000Z",
+    properties: { Entry: title("Suffix 112 on hold — awaiting structural sign-off."), Source: sel("A&I"), Tag: sel("#blocked"), Author: rt("DM"), Detail: rt(""), Link: { url: null }, "Event Date": dt(null), Task: rel("task1") } },
 ];
 
 const aiRows = [
@@ -63,6 +67,41 @@ const rfiRows = [
     "RFI Status": sel("Open"), "TBC by": sel("Architect"), "Date Raised": dt("2026-09-17"), "Related Item(s)": rel("task1") } },
 ];
 
+// Submissions. This is an EVENT LOG — one row per attempt — and these fixtures encode the
+// two ways a naive count gets it wrong:
+//   d1  bounced at S4 R1, then issued at S4 R2. The bounce is superseded; counting rows
+//       would report a drawing sitting with the DT that came back weeks ago.
+//   d2  graded at S4, then resubmitted at A4.5. Counting per stage would count it twice and
+//       claim a sign-off that the drawing has already moved past.
+const sub = (id, code, dwgNo, stage, status, extra = {}) => ({
+  id, url: "u/" + id, created_time: "2026-01-01T09:00:00.000Z",
+  properties: {
+    Submission:      title(`${code}_${dwgNo}_${stage}_R${extra.qa ?? 1}`),
+    Stage:           sel(stage),
+    Status:          sel(status),
+    "QA Round":      num(extra.qa ?? 1),
+    Submitted:       dt(extra.on || "2026-01-10"),
+    Drawing:         extra.dwg === null ? rel() : rel(extra.dwg),
+    Item:            extra.item ? rel(extra.item) : rel(),
+    "DT Notified":   chk(extra.notified ?? true),
+    "Ball In Court": sel(extra.bic || null),
+    "Comment Paths": rt(extra.paths || ""),
+  },
+});
+
+const subRows = [
+  sub("s1", "24-354-190", "DWG-A", "S4",   "Rejected", { dwg: "d1", item: "task1", qa: 1, on: "2026-01-10" }),
+  sub("s2", "24-354-190", "DWG-A", "S4",   "Issued",   { dwg: "d1", item: "task1", qa: 2, on: "2026-02-10" }),
+  sub("s3", "24-354-190", "DWG-B", "S4",   "Graded",   { dwg: "d2", item: "task1", qa: 1, on: "2026-01-11" }),
+  sub("s4", "24-354-190", "DWG-B", "A4.5", "Issued",   { dwg: "d2", item: "task1", qa: 1, on: "2026-03-01" }),
+  sub("s5", "24-354-200", "DWG-C", "AB",   "Graded",   { dwg: "d3", item: "task2" }),
+  sub("s6", "24-354-200", "DWG-D", "S4",   "Rejected", { dwg: "d4", item: "task2", notified: false }),
+  sub("s7", "24-354-200", "DWG-E", "S4",   "Schedule", { dwg: "d5", item: "task2" }),
+  sub("s8", "24-354-200", "DWG-F", "S5",   "Issued",   { dwg: "d6", item: "task2", bic: "DM" }),
+  // No Item relation — must be reported as unlinked, never folded onto someone else's card.
+  sub("s9", "24-354-200", "DWG-G", "S4",   "Submitted", { dwg: "d7" }),
+];
+
 // ---- Notion mock -----------------------------------------------------------
 const seen = { ACT: [], AI: [], RFIS: [], TASKS: [], SUBS: [] };
 let rfiShouldFail = false;
@@ -74,6 +113,7 @@ const notion = {
     seen[database_id].push(JSON.parse(JSON.stringify(filter ?? null)));
     if (database_id === "ACT")   return { results: actRows.slice(0, page_size ?? 100), has_more: false };
     if (database_id === "AI")    return { results: aiRows, has_more: false };
+    if (database_id === "SUBS")  return { results: subRows, has_more: false };
     if (database_id === "RFIS") { if (rfiShouldFail) throw new Error("boom"); return { results: rfiRows, has_more: false }; }
     // Only proj1 has items — an unknown project must come back empty, so the route's
     // "no items in scope" short-circuit is actually exercised.
@@ -125,7 +165,7 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   reset();
   let r = await call("GET /api/df/activity-log");
   assert.strictEqual(r.status, 200, JSON.stringify(r.json));
-  assert.strictEqual(r.json.entries.length, 4);
+  assert.strictEqual(r.json.entries.length, actRows.length);
   assert.ok(JSON.stringify(seen.ACT[0]).includes("on_or_after"), "default view applies a rolling window");
   ok("feed: default view is a rolling Created window");
 
@@ -180,7 +220,7 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   reset();
   r = await call("GET /api/df/activity-log", { from: "2026-09-01", to: "2026-09-30" });
   assert.ok(!r.json.entries.some((e) => e.id === "a3"), "backfilled entry must not leak into the month it was typed up");
-  assert.deepStrictEqual(r.json.entries.map((e) => e.id), ["a1", "a2", "a4"]);
+  assert.deepStrictEqual(r.json.entries.map((e) => e.id), ["a1", "a2", "a4", "a5"]);
   ok("feed: Created date alone never places an entry in the range");
 
   reset();
@@ -197,8 +237,9 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   // ── feed: ordering ──────────────────────────────────────────────────────
   reset();
   r = await call("GET /api/df/activity-log", { days: 365 });
-  assert.deepStrictEqual(r.json.entries.map((e) => e.id), ["a1", "a4", "a2", "a3"].sort((x, y) => {
-    const d = (id) => ({ a1: "2026-09-18T09:22", a2: "2026-09-17T16:40", a3: "2026-03-02", a4: "2026-09-16T11:00" }[id]);
+  assert.deepStrictEqual(r.json.entries.map((e) => e.id), ["a1", "a4", "a2", "a3", "a5"].sort((x, y) => {
+    const d = (id) => ({ a1: "2026-09-18T09:22", a2: "2026-09-17T16:40", a3: "2026-03-02",
+                         a4: "2026-09-16T11:00", a5: "2026-09-15T10:00" }[id]);
     return new Date(d(y)) - new Date(d(x));
   }));
   assert.strictEqual(r.json.entries.at(-1).id, "a3", "the March entry sorts to the bottom, not the top");
@@ -286,6 +327,10 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
     await routesH[key]({ body: {}, params: {}, query }, res);
     return { status, headers, buffer: sent, json };
   };
+  // The lane definitions, as the source file sees them — both the export sheet and the
+  // summary cards are asserted against these rather than a hand-copied list.
+  const { LANES } = mod.exports.__t;
+
   const readBack = async (buf) => { const wb = new ExcelJS.Workbook(); await wb.xlsx.load(buf); return wb; };
   const rowVals = (ws, i) => ws.getRow(i).values.slice(1);
 
@@ -293,8 +338,9 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   let x = await callH("GET /api/df/activity-export", { days: 365 });
   assert.strictEqual(x.status, 200, JSON.stringify(x.json));
   assert.match(x.headers["content-type"], /spreadsheetml\.sheet/);
-  assert.match(x.headers["content-disposition"], /attachment; filename="activity-export_\d{4}-\d{2}-\d{2}\.xlsx"/);
-  ok("export: served as a downloadable .xlsx with a dated filename");
+  // No mode given means detail — the old two-sheet workbook, so a saved link keeps working.
+  assert.match(x.headers["content-disposition"], /attachment; filename="activity-detail_\d{4}-\d{2}-\d{2}\.xlsx"/);
+  ok("export: served as a downloadable .xlsx with a dated filename, defaulting to detail");
 
   let wb = await readBack(x.buffer);
   assert.deepStrictEqual(wb.worksheets.map((w) => w.name), ["Activity Log", "Current Position"]);
@@ -351,6 +397,172 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   const refs = []; s2.eachRow((r, i) => { if (i > 1) refs.push(r.getCell(2).value); });
   assert.ok(refs.includes("RFI-014"), "RFI rows carry their zero-padded ref");
   ok("export: Current Position lists both trackers with a numeric Days Open");
+
+  // ── export modes (§8) ───────────────────────────────────────────────────
+  // Three deliverables with different readers: summary for the client, detail as the
+  // evidence behind it, combined for handing over a project in one file.
+  reset();
+  x = await callH("GET /api/df/activity-export", { mode: "summary" });
+  assert.strictEqual(x.status, 200, JSON.stringify(x.json));
+  assert.match(x.headers["content-disposition"], /filename="activity-summary_\d{4}-\d{2}-\d{2}\.xlsx"/);
+  wb = await readBack(x.buffer);
+  assert.deepStrictEqual(wb.worksheets.map((w) => w.name), ["Summary"],
+    "the client workbook is the summary alone — the submission detail is noise to them");
+  ok("export: summary mode is one sheet, named for what it is");
+
+  const sum = wb.getWorksheet("Summary");
+  const head = rowVals(sum, 1);
+  assert.deepStrictEqual(head.slice(0, 3), ["Project", "Item", "Code"]);
+  // Lane columns are generated from LANE_ORDER, so adding a lane cannot leave the
+  // spreadsheet a column short of the badges.
+  assert.deepStrictEqual(head.slice(3, 3 + LANES.LANE_ORDER.length),
+    LANES.LANE_ORDER.map((id) => LANES.LANE_SHORT[id]));
+  assert.deepStrictEqual(head.slice(3 + LANES.LANE_ORDER.length),
+    ["Drawings", "Blockers", "Blocker detail", "Open RFIs", "RFI refs"]);
+  ok("export: one column per lane, driven by lanes.js, then the totals");
+
+  const sumRows = {};
+  sum.eachRow((r, i) => { if (i > 1) sumRows[r.getCell(3).value] = r; });
+  const col = (row, laneId) => row.getCell(4 + LANES.LANE_ORDER.indexOf(laneId)).value;
+  const r190 = sumRows["24-354-190"], r200 = sumRows["24-354-200"];
+  assert.ok(r190 && r200, `expected both items on the summary, got ${Object.keys(sumRows)}`);
+
+  assert.strictEqual(col(r190, "awaiting-comments"), 1);
+  assert.strictEqual(col(r190, "signoff"), 1);
+  // The whole point of the lane count: the bounce is superseded, so the cell is empty
+  // rather than reporting a drawing that came back weeks ago.
+  assert.ok(col(r190, "bounced") == null, "a superseded bounce leaves the cell empty");
+  ok("export: superseded rounds do not reach the client's spreadsheet");
+
+  for (const laneId of LANES.LANE_ORDER) {
+    const v = col(r200, laneId);
+    assert.ok(v == null || v > 0, `lane ${laneId} exported a zero instead of a blank cell`);
+  }
+  assert.strictEqual(col(r200, "closed"), 1, "a signed-off drawing is what the client wants to read");
+  assert.strictEqual(col(r200, "scheduled"), 1);
+  ok("export: zeros are blank cells, never 0 — the spreadsheet form of dropping them");
+
+  const nLanes = LANES.LANE_ORDER.length;
+  assert.strictEqual(r190.getCell(4 + nLanes).value, 2, "Drawings total");
+  assert.strictEqual(r190.getCell(5 + nLanes).value, 1, "Blockers count");
+  assert.strictEqual(r190.getCell(6 + nLanes).value, "Awaiting decision", "blocker reasons spelled out");
+  assert.strictEqual(r190.getCell(7 + nLanes).value, 1, "Open RFIs count");
+  assert.strictEqual(r190.getCell(8 + nLanes).value, "RFI-014", "RFI refs so they can be looked up");
+  ok("export: totals, blocker reasons and RFI refs make the summary self-contained");
+
+  reset();
+  x = await callH("GET /api/df/activity-export", { mode: "combined", days: 365 });
+  assert.match(x.headers["content-disposition"], /filename="activity-combined_\d{4}-\d{2}-\d{2}\.xlsx"/);
+  wb = await readBack(x.buffer);
+  const names = wb.worksheets.map((w) => w.name);
+  assert.strictEqual(names[0], "Summary", "the summary leads — it is what gets read first");
+  assert.ok(names.length > 1, "then a sheet per item");
+  assert.ok(names.every((n) => n.length <= 31), `Excel caps sheet names at 31: ${names}`);
+  assert.strictEqual(new Set(names).size, names.length, "duplicate sheet names corrupt the workbook");
+  ok("export: combined leads with the summary, then one sheet per item");
+
+  // Every entry lands on exactly one item sheet, and none is lost on the way.
+  const perItemRows = wb.worksheets.slice(1).reduce((n, w) => n + w.rowCount - 1, 0);
+  assert.strictEqual(perItemRows, actRows.length,
+    "every entry in the filtered feed appears on exactly one item sheet");
+  ok("export: splitting by item neither drops nor duplicates an entry");
+
+  reset();
+  x = await callH("GET /api/df/activity-export", { mode: "nonsense" });
+  assert.strictEqual(x.status, 400);
+  assert.match(x.json.error, /Invalid mode/);
+  ok("export: an unknown mode is refused rather than quietly served as something else");
+
+  // Summary mode must not pay for the Activity Log it does not print.
+  reset();
+  await callH("GET /api/df/activity-export", { mode: "summary" });
+  assert.strictEqual(seen.ACT.length, 0, "summary mode never queries the Activity Log");
+  reset();
+  await callH("GET /api/df/activity-export", { mode: "combined", days: 365 });
+  const combinedActCalls = seen.ACT.length;
+  reset();
+  await callH("GET /api/df/activity-export", { days: 365 });
+  assert.strictEqual(combinedActCalls, seen.ACT.length,
+    "combined regroups the entries it already fetched — no extra Notion calls per sheet");
+  ok("export: each mode fetches only what it prints");
+
+  // ── blocked rows go red ─────────────────────────────────────────────────
+  // "A quick glance can reveal the issues that need resolving" (Greig, 26 Sep). Asserted by
+  // reading the rule back out of the written workbook, not by trusting the call that set it.
+  const cfOf = (ws) => (ws.conditionalFormattings || []).flatMap((c) =>
+    (c.rules || []).map((rule) => ({ ref: c.ref, formula: rule.formulae?.[0], style: rule.style })));
+
+  reset();
+  wb = await readBack((await callH("GET /api/df/activity-export", { mode: "summary" })).buffer);
+  const sumWs = wb.getWorksheet("Summary");
+  const sumCf = cfOf(sumWs);
+  assert.strictEqual(sumCf.length, 1, "one rule, not one per row");
+  // Absolute column, relative row. "$Q$2" would test a single cell for the whole range and
+  // "Q2" would drift a column at a time across it.
+  const blockersLetter = sumWs.getColumn(5 + LANES.LANE_ORDER.length).letter;
+  assert.strictEqual(sumCf[0].formula, `$${blockersLetter}2<>""`,
+    "keyed on the Blockers column, absolute column and relative row");
+  assert.strictEqual(sumCf[0].ref, `A2:${sumWs.getColumn(8 + LANES.LANE_ORDER.length).letter}${sumWs.rowCount}`,
+    "the whole row is painted, header excluded");
+  ok("export: Summary highlights any row with a blocker, across every column");
+
+  // The trap that renders as no fill at all: a DIFFERENTIAL fill's visible colour lives in
+  // bgColor, the opposite of an ordinary cell fill.
+  assert.strictEqual(sumCf[0].style?.fill?.pattern, "solid");
+  assert.ok(/F8D7DA$/i.test(sumCf[0].style?.fill?.bgColor?.argb || ""),
+    `differential fill must set bgColor, got ${JSON.stringify(sumCf[0].style?.fill)}`);
+  assert.ok(/9C0006$/i.test(sumCf[0].style?.font?.color?.argb || ""), "dark red text on the light red fill");
+  ok("export: the highlight is a real differential fill, colour in bgColor where Excel reads it");
+
+  reset();
+  wb = await readBack((await callH("GET /api/df/activity-export", { days: 365 })).buffer);
+  const logCf = cfOf(wb.getWorksheet("Activity Log"));
+  assert.strictEqual(logCf.length, 1);
+  // A log sheet has no blockers column — the log's way of saying an item is stuck is the tag.
+  assert.strictEqual(logCf[0].formula, '$D2="#blocked"');
+  assert.ok(logCf[0].ref.startsWith("A2:I"), `should span all nine log columns, got ${logCf[0].ref}`);
+  const posCf = cfOf(wb.getWorksheet("Current Position"));
+  assert.strictEqual(posCf[0].formula, '$H2<>""', "Current Position keys on its own Blocker column");
+  ok("export: log sheets redden #blocked rows, Current Position its Blocker column");
+
+  // Guard the fixture the rule depends on, so a tag rename cannot leave a rule matching
+  // nothing while every test still passes.
+  const tagsInLog = [];
+  wb.getWorksheet("Activity Log").eachRow((r2, i) => { if (i > 1) tagsInLog.push(r2.getCell(4).value); });
+  assert.ok(tagsInLog.includes("#blocked"),
+    "no #blocked row in the export — the rule would be dead and nothing would say so");
+  ok("export: there is a #blocked row for the rule to act on");
+
+  reset();
+  wb = await readBack((await callH("GET /api/df/activity-export", { mode: "combined", days: 365 })).buffer);
+  for (const ws2 of wb.worksheets.slice(1)) {
+    const rules = cfOf(ws2);
+    assert.strictEqual(rules.length, 1, `item sheet "${ws2.name}" has no highlight rule`);
+    assert.strictEqual(rules[0].formula, '$D2="#blocked"');
+  }
+  ok("export: every item sheet in a combined workbook carries the same rule");
+
+  // A sheet with nothing under the header must get no rule: "A2:I1" is not a range Excel
+  // will open.
+  reset();
+  wb = await readBack((await callH("GET /api/df/activity-export", { from: "2020-01-01", to: "2020-12-31" })).buffer);
+  const emptyLog = wb.getWorksheet("Activity Log");
+  assert.strictEqual(emptyLog.rowCount, 1, "sanity: header only");
+  assert.strictEqual(cfOf(emptyLog).length, 0, "an empty sheet gets no rule rather than an invalid range");
+  ok("export: a header-only sheet is left alone rather than given a broken range");
+
+  // A client-facing sheet gets printed and PDF'd. At 18 columns it breaks across pages, and
+  // page 2 of a default layout is a block of counts with no item name beside them.
+  reset();
+  wb = await readBack((await callH("GET /api/df/activity-export", { mode: "summary" })).buffer);
+  const psum = wb.getWorksheet("Summary");
+  assert.strictEqual(psum.pageSetup?.fitToWidth, 1, "one page wide");
+  assert.strictEqual(psum.pageSetup?.fitToHeight, 0, "any number of pages long");
+  assert.strictEqual(psum.pageSetup?.orientation, "landscape");
+  assert.strictEqual(psum.pageSetup?.printTitlesColumn, "A:C", "item columns repeat on every page");
+  assert.strictEqual(psum.pageSetup?.printTitlesRow, "1:1");
+  assert.strictEqual(psum.views?.[0]?.xSplit, 3, "Project/Item/Code stay put when scrolling the lanes");
+  ok("export: the Summary prints one page wide with the item columns repeated");
 
   // ── A&I action rows (§6.1) ──────────────────────────────────────────────
   //
@@ -469,6 +681,131 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   }
   assert.ok(source.includes("createActionRow(notion, {"), "ingest must open the row");
   ok("A&I row: every DM action endpoint closes the row ingest opened");
+
+  // ── summary: drawing lanes ──────────────────────────────────────────────
+  // The executive-summary view. Three badge groups per item — drawings by lane, blockers,
+  // open RFIs — and no reliance on the hand-maintained `Item Status`.
+  const laneMap = (item) => Object.fromEntries(item.drawings.map((l) => [l.id, l.n]));
+
+  reset();
+  r = await call("GET /api/df/activity-summary");
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  const byCode = Object.fromEntries(r.json.items.map((i) => [i.taskCode, i]));
+
+  // d1: R1 Rejected superseded by R2 Issued. This is the 24-354-190 case — the naive row
+  // count says "Bounced — With DT 8" where the truthful answer is zero.
+  assert.strictEqual(laneMap(byCode["24-354-190"]).bounced, undefined,
+    "a bounce with a later round on the same drawing is not current state");
+  assert.strictEqual(laneMap(byCode["24-354-190"])["awaiting-comments"], 1,
+    "the drawing counts once, at the round it actually sits on");
+  ok("summary: a superseded bounce does not count — one row per drawing, latest round");
+
+  // d2: Graded at S4, reissued at A4.5. Stage outranks round, so the later stage wins.
+  assert.strictEqual(laneMap(byCode["24-354-190"]).signoff, 1);
+  assert.strictEqual(laneMap(byCode["24-354-190"]).closed, undefined,
+    "a drawing that moved on to a later stage is not still signed off at the earlier one");
+  assert.strictEqual(byCode["24-354-190"].drawingTotal, 2, "two drawings, two badge slots");
+  ok("summary: a later stage supersedes an earlier one, however many rounds it ran");
+
+  const t200 = laneMap(byCode["24-354-200"]);
+  assert.deepStrictEqual(t200, { reviewed: 1, comments: 1, closed: 1, scheduled: 1 });
+  assert.ok(byCode["24-354-200"].drawings.every((l) => l.n > 0), "zeros are excluded");
+  assert.deepStrictEqual(byCode["24-354-200"].drawings.map((l) => l.id),
+    ["reviewed", "comments", "closed", "scheduled"], "badges read in board order");
+  assert.ok(byCode["24-354-200"].drawings.every((l) => l.title),
+    "each badge carries its full lane title, not just an id");
+  ok("summary: lanes are counted, zeros dropped, board order preserved");
+
+  // Graded + DT Notified has left the cockpit board entirely, but it is the one thing a
+  // client actually wants to read off the card.
+  assert.strictEqual(t200.closed, 1, "a graded, notified drawing reports as signed off");
+  assert.strictEqual(t200.scheduled, 1, "placeholder rows are counted apart from work in flight");
+  ok("summary: terminal and placeholder rows have lanes of their own");
+
+  assert.strictEqual(r.json.unlinked.drawings, 1,
+    "a submission with no Item is surfaced as unlinked, not folded onto another card");
+  assert.ok(!r.json.items.some((i) => i.taskCode === null && i.drawingTotal > 0));
+  ok("summary: a submission with no Item is reported, never silently reassigned");
+
+  // Blockers and RFIs come from fetchPosition — one definition of "blocked", two surfaces.
+  assert.strictEqual(byCode["24-354-190"].blockers.length, 1);
+  assert.strictEqual(byCode["24-354-190"].blockers[0].reason, "Awaiting decision");
+  assert.strictEqual(byCode["24-354-190"].rfis.length, 1);
+  assert.strictEqual(byCode["24-354-190"].rfis[0].ref, "RFI-014");
+  assert.strictEqual(byCode["24-354-200"].blockers.length, 0,
+    "Blocker = '—' means assessed and clear, which is not a blocker");
+  ok("summary: blockers and open RFIs reuse fetchPosition's numbers");
+
+  assert.strictEqual(r.json.items[0].taskCode, "24-354-190", "blocked items sort to the top");
+  ok("summary: most pressing item first");
+
+  // `Item Status` is hand-maintained and lags the drawings; a client-facing card must not
+  // quote it. This guard is the whole reason the drawing badge exists.
+  const summarySrc = fs.readFileSync(srcPath, "utf8");
+  const fsStart = summarySrc.indexOf("async function fetchSummary(");
+  assert.ok(fsStart > -1);
+  const fsEnd = summarySrc.indexOf("\n  // GET /api/df/activity-log", fsStart);
+  assert.ok(!summarySrc.slice(fsStart, fsEnd).includes("Item Status"),
+    "fetchSummary must not read Item Status — it is manual and stale (handoff 7.5)");
+  ok("summary: the card never quotes the hand-maintained Item Status");
+
+  reset();
+  await call("GET /api/df/activity-summary", { taskId: "task1" });
+  assert.deepStrictEqual(seen.SUBS[0], { and: [{ property: "Item", relation: { contains: "task1" } }] });
+  ok("summary: taskId scopes the Submissions query on the Item relation");
+
+  reset();
+  await call("GET /api/df/activity-summary", { projectId: "proj1" });
+  assert.ok(seen.SUBS[0].and[0].or, "project scope OR's the project's task ids");
+  assert.ok(depth(seen.SUBS[0]) <= 2, "filter stays inside Notion's two-level nesting limit");
+  ok("summary: project scope composes without breaching Notion's nesting limit");
+
+  reset();
+  r = await call("GET /api/df/activity-summary", { projectId: "nope" });
+  assert.deepStrictEqual(r.json.items, [], "an empty project short-circuits");
+  ok("summary: a project with no items returns empty rather than the whole portfolio");
+
+  // ── anti-drift: one definition of the lanes ─────────────────────────────
+  // The lane rules used to live only as client-side buckets in cockpit.jsx. If a lane is
+  // added to the board and not to lanes.js, the client card and the cockpit start telling
+  // different stories about the same drawings — this is the test that stops that.
+  const cockpit  = fs.readFileSync(srcPath.replace(/drawing-flow\.js$/, "public/cockpit.jsx"), "utf8");
+  const colsSrc  = cockpit.slice(cockpit.indexOf("const COLS = ["));
+  const boardIds = [...colsSrc.slice(0, colsSrc.indexOf("\n  ];")).matchAll(/\{ id: "([^"]+)"/g)].map((m) => m[1]);
+  assert.ok(boardIds.length >= 8, `expected the board's lanes, found ${boardIds.length}`);
+  for (const id of boardIds) {
+    assert.ok(LANES.LANE_ORDER.includes(id), `cockpit lane "${id}" is missing from lanes.js`);
+  }
+  assert.deepStrictEqual(boardIds, LANES.LANE_ORDER.slice(0, boardIds.length),
+    "lanes.js must list the board's lanes first, in the board's order");
+  ok("summary: every cockpit board lane is defined in lanes.js, in the same order");
+
+  // A lane added to lanes.js but not to the stylesheet renders as unstyled grey text — it
+  // still says the right thing, but it stops looking like a state, which on a client-facing
+  // card is its own kind of wrong.
+  const css = fs.readFileSync(srcPath.replace(/drawing-flow\.js$/, "public/styles.css"), "utf8");
+  for (const id of LANES.LANE_ORDER) {
+    assert.ok(css.includes(`.lane-${id}`), `lane "${id}" has no .lane-${id} rule in styles.css`);
+  }
+  ok("summary: every lane has a pill style");
+
+  // Optional: `node tests/activity.test.js --dump-summary` writes the Summary sheet the real
+  // route produces, both as a grid on stdout and as a .xlsx, so the client-facing workbook
+  // can be eyeballed without standing the whole app up against Notion.
+  if (process.argv.includes("--dump-summary")) {
+    reset();
+    const dump = await callH("GET /api/df/activity-export", { mode: "summary" });
+    fs.writeFileSync(__dirname + "/../sample-summary.xlsx", dump.buffer);
+    reset();
+    const dumpC = await callH("GET /api/df/activity-export", { mode: "combined", days: 365 });
+    fs.writeFileSync(__dirname + "/../sample-combined.xlsx", dumpC.buffer);
+    const dws = (await readBack(dump.buffer)).getWorksheet("Summary");
+    const grid = [];
+    dws.eachRow((r) => grid.push(r.values.slice(1).map((v) => (v == null ? "" : String(v)))));
+    const w = grid[0].map((_, i) => Math.max(...grid.map((r) => (r[i] || "").length)));
+    console.log("\n" + grid.map((r) => r.map((c, i) => (c || "").padEnd(w[i])).join(" | ")).join("\n"));
+    console.log("\nwrote sample-summary.xlsx and sample-combined.xlsx");
+  }
 
   console.log(`\n${n} activity tests passed`);
 })().catch((e) => { console.error("FAIL", e); process.exit(1); });

@@ -1228,3 +1228,155 @@ main {
   padding: 8px 12px;
   margin-bottom: 16px;
 }
+
+/* ─── Summary view ───────────────────────────────────────────────────── */
+/* The executive-summary counterpart to the feed. The feed is a narrative; this is a
+   position statement — one card per item, three badge groups, nothing that needs reading
+   in order. Lane colours reuse the cockpit board's accents so a drawing sitting in
+   "Bounced — With DT" looks the same on the client card as it does on the board. */
+
+.view-switch {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin: 24px 0 16px;
+}
+.view-switch button {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  color: var(--text2);
+  font: 600 12px/1 var(--font);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 8px 16px;
+  cursor: pointer;
+}
+.view-switch button:first-of-type  { border-radius: var(--radius) 0 0 var(--radius); }
+.view-switch button:nth-of-type(2) { border-radius: 0 var(--radius) var(--radius) 0; border-left: none; }
+.view-switch button:hover { color: var(--text); }
+.view-switch button[aria-pressed="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.view-switch-hint {
+  margin-left: 12px;
+  font-size: 12px;
+  color: var(--text3);
+}
+
+.summary-list { display: flex; flex-direction: column; gap: 10px; }
+
+.summary-card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius2);
+  padding: 12px 16px;
+}
+
+.summary-card-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-bottom: 10px;
+}
+.summary-card-item { font-size: 14px; font-weight: 600; color: var(--text); }
+/* nowrap: at phone width the flex row would otherwise break "24-354-003" across three
+   lines mid-code, which reads as three different numbers. */
+.summary-card-code { font: 11px/1 var(--font-mono); color: var(--text3); white-space: nowrap; }
+
+/* Wraps rather than scrolls: an item with six lanes in play is exactly the item whose
+   badges must all be readable at once. */
+.summary-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+}
+.summary-group {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.summary-group-legend {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text3);
+  margin-right: 2px;
+}
+
+.lane-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  line-height: 1;
+  padding: 5px 9px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.lane-pill b { font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+/* Deep backgrounds against white text — the same contrast approach as the tag pills, so
+   both badge rows stay legible side by side. */
+.lane-bounced           { background: #7f1d1d; color: #fff; } /* red-900    */
+.lane-submitted         { background: #1e3a8a; color: #fff; } /* blue-900   */
+.lane-reviewed          { background: #14532d; color: #fff; } /* green-900  */
+.lane-approved          { background: #065f46; color: #fff; } /* emerald-900 */
+.lane-awaiting-comments { background: #0c4a6e; color: #fff; } /* sky-900    */
+.lane-comments          { background: #831843; color: #fff; } /* pink-900   */
+.lane-signoff           { background: #78350f; color: #fff; } /* amber-900  */
+.lane-graded            { background: #581c87; color: #fff; } /* purple-900 */
+.lane-closed            { background: #134e4a; color: #fff; } /* teal-900   */
+/* Placeholder rows are not work in flight, so they read as an outline, not a state. */
+.lane-scheduled {
+  background: transparent;
+  border-color: var(--border);
+  color: var(--text3);
+}
+
+.lane-blocker { background: rgba(239, 68, 68, 0.14); border-color: rgba(239, 68, 68, 0.4); color: #fca5a5; }
+.lane-rfi     { background: rgba(245, 158, 11, 0.14); border-color: rgba(245, 158, 11, 0.4); color: #fcd34d; }
+
+/* "Nothing recorded", which is a different statement from "nothing happening". */
+.summary-none { font-size: 12px; color: var(--text3); cursor: help; }
+
+/* ─── Export menu ────────────────────────────────────────────────────── */
+/* Three deliverables with different readers (§8), so the button opens rather than acting:
+   picking the wrong one wastes a download and, worse, sends a client the submission log. */
+
+.export-menu { position: relative; }
+
+.export-menu-list {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 40;
+  min-width: 260px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius2);
+  padding: 4px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+}
+
+.export-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  cursor: pointer;
+  font: inherit;
+  color: var(--text);
+}
+.export-menu-item:hover:not(:disabled) { background: var(--bg4); }
+.export-menu-item:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.export-menu-label { display: block; font-size: 13px; font-weight: 600; }
+.export-menu-hint  { display: block; font-size: 11px; color: var(--text3); margin-top: 2px; }

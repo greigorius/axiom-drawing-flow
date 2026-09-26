@@ -1,9 +1,11 @@
 // Unit tests for the pure path/filename helpers in drawing-flow.js.  Run: node tests/parsing.test.js
 const fs = require("fs"), vm = require("vm"), assert = require("assert");
-const src = fs.readFileSync(fs.existsSync(__dirname + "/drawing-flow.js") ? __dirname + "/drawing-flow.js" : __dirname + "/../drawing-flow.js", "utf8") +
+const srcPath = fs.existsSync(__dirname + "/drawing-flow.js") ? __dirname + "/drawing-flow.js" : __dirname + "/../drawing-flow.js";
+const src = fs.readFileSync(srcPath, "utf8") +
   "\n;module.exports.__t = { parsePath, parseFilename, parseSubmissionName, computeDropboxMove, gradeReturnsFolder, toShortDropboxPath, locateProject, computeReviewedMove, computeGradeReturnMove, computeIssueMove, computeSignedOffMove, isGradeReturnName, parseClientCommentName, parseSubmissionTitle, padItemNo, itemNoFromTaskName };";
 const mod = { exports: {} };
-vm.runInNewContext(src, { module: mod, exports: mod.exports, require: (n) => n === "@netlify/blobs" ? { getStore(){} } : require(n), process, console, Date });
+vm.runInNewContext(src, { module: mod, exports: mod.exports, require: (n) => n === "@netlify/blobs" ? { getStore(){} }
+  : n === "./public/lanes.js" ? require(srcPath.replace(/drawing-flow\.js$/, "public/lanes.js")) : require(n), process, console, Date });
 const t = mod.exports.__t;
 const R = "/DESIGN KNOW HOW/TMJ Interiors/Drawing Submissions";
 let n = 0; const ok = (name, fn) => { fn(); n++; console.log("✓", name); };
