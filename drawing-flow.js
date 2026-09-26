@@ -126,6 +126,20 @@ const BIC = {
   COMMENTS_RECEIVED: "DM",  // Client comments landed on an Issued submission — DM needs to review
 };
 
+// Actions & Info shares this vocabulary as of 26 Sep 2026 — the same word means the same
+// thing on both sides of a handover. (Note the spelling: Submissions has "Ball In Court"
+// with a capital I, A&I has "Ball in Court". Two properties on two databases; the casing
+// difference is real and reading the wrong one returns undefined rather than erroring.)
+//
+// Everyone outside the design team. A row whose ball sits with one of these is a row you
+// are waiting on somebody for — which is what "blocked" now means, since the hand-filled
+// `Blocker` select reached 0 of 91 rows and was deleted.
+const EXTERNAL_BIC = new Set([
+  "Client", "Consultant", "Supplier", "Architect", "Contractor",
+  "Project Team", "Production", "Site", "Document Control",
+]);
+const isExternalBIC = (bic) => !!bic && EXTERNAL_BIC.has(bic);
+
 // ── Working-days helper ──────────────────────────────────────────────────────
 function addWorkingDays(dateStr, days) {
   const d = new Date(dateStr);
@@ -1067,11 +1081,18 @@ async function createActionRow(notion, { taskId, personId, received, note, categ
     const properties = {
       "Note":          { title:  [{ text: { content: truncateForNotion(note) } }] },
       "Source":        { select: { name: "Submission" } },
-      // Status is what marks a row as live work. It replaced the old Tags="Track" flag on
-      // 23 Sep 2026: "Tags" read as a sibling of the Activity Log's "Tag" and was not one,
-      // and a row that has a Status is exactly a row being tracked.
-      "Status":        { select: { name: "Open" } },
-      "Ball in Court": { select: { name: "Me"   } },
+      // Ball in Court is what marks a row as live work, and it is the ONLY thing that does.
+      //
+      // `Status` used to carry that job. It was filled on 15 of 91 rows and only ever held
+      // one of its three values, while gating both the Tracked view and the position header
+      // — so 76 rows were invisible to the tracker meant to be showing them. It also said
+      // the same thing as this field twice over: "Waiting" means someone else holds it,
+      // "Open" means you do. Deleted 26 Sep 2026; do not reinstate it.
+      //
+      // "DM", not "Me": the vocabulary now matches the Submissions DB's own Ball In Court
+      // (note the capital I there — they are different properties on different databases)
+      // so the same word means the same thing on both sides of a handover.
+      "Ball in Court": { select: { name: BIC.SUBMITTED } },
     };
     if (category)  properties["Category"] = { select:   { name: category } };
     if (taskId)    properties["Items"]    = { relation: [{ id: taskId }] };
@@ -1102,15 +1123,26 @@ async function createActionRow(notion, { taskId, personId, received, note, categ
 async function resolveActionRow(notion, actionRowId) {
   if (!actionRowId) return;
   try {
-    // Done is now a single flag. A&I used to carry three — Checked (the human tick),
-    // Archived (the automated one) and Track Status="Resolved" — which let views disagree
-    // about whether a row was finished. Checked survived because Make's scenarios already
-    // map to it; clearing Status takes the row out of the open queue.
+    // Done is a single flag, and closing touches NOTHING ELSE. A&I used to carry three —
+    // Checked (the human tick), Archived (the automated one) and Track Status="Resolved" —
+    // which let views disagree about whether a row was finished. Checked is the one that
+    // survived, and it is the same tick a human uses, so a row closed here and a row closed
+    // by hand end up in the same state.
+    //
+    // This deliberately does NOT clear Ball in Court, for two reasons:
+    //
+    //   1. Unticking has to put the row back exactly as it was. Open work is
+    //      `Ball in Court is not empty AND Checked is false` — the Checked half excludes a
+    //      ticked row on its own, so clearing the ball buys nothing and costs the undo:
+    //      a row closed in error and then unticked would come back with no ball, landing in
+    //      Unfiled instead of back where it was.
+    //   2. Who held it at the point it closed is worth keeping. "Closed while with the
+    //      contractor" is a different fact from "closed while with me", and the export's
+    //      Current Position and the client summary both read that column.
+    //
+    // Idempotent: closing an already-closed row writes the same true again.
     await notion.pages.update({ page_id: actionRowId, properties: {
-      "Checked":       { checkbox: true },
-      "Status":        { select:   null },
-      "Ball in Court": { select:   null },
-      "Blocker":       { select:   null },
+      "Checked": { checkbox: true },
     }});
   } catch (err) {
     console.warn("[a&i] action row resolve failed:", err.message);
@@ -3299,13 +3331,18 @@ module.exports = function mountDrawingFlow(app, notion) {
       if (!scopeIds.length) return empty;
     }
 
-    // A row is live work when it has a Status and has not been ticked off. Both halves
-    // matter: Status alone would keep resolved rows in the count, and Checked alone would
-    // sweep in every unclassified note in A&I — half the database has no Item and was never
+    // A row is live work when someone holds it and it has not been ticked off. Both halves
+    // matter: Ball in Court alone would keep resolved rows in the count, and Checked alone
+    // would sweep in every unclassified note in A&I — a majority of the database was never
     // meant to show in a position header.
+    //
+    // This gated on `Status` until 26 Sep 2026. Status was filled on 15 of 91 rows and only
+    // ever held one of its three values, so 76 rows — including 31 of the 33 typed by hand —
+    // were invisible here. Ball in Court is the field that was actually being used, and it
+    // says the same thing: "Waiting" meant someone else held it, "Open" meant the DM did.
     const aiClauses = [
-      { property: "Status",  select:   { is_not_empty: true } },
-      { property: "Checked", checkbox: { equals: false } },
+      { property: "Ball in Court", select:   { is_not_empty: true } },
+      { property: "Checked",       checkbox: { equals: false } },
     ];
     if (scopeIds) aiClauses.push(taskScopeFilter("Items", scopeIds));
     const aiRows = await queryAll(notion, ACTIONS_INFO_DB, { and: aiClauses });
@@ -3334,16 +3371,20 @@ module.exports = function mountDrawingFlow(app, notion) {
       const { taskName, projectName } = itemId
         ? await resolveTaskName(itemId)
         : { taskName: null, projectName: null };
-      // "—" is the explicit "looked at it, nothing is holding it up" option, a different
-      // statement from a blank Blocker ("not assessed"). Neither is a blocker.
-      const blocker = getProp(page, "Blocker", "select");
+      // Blocked is DERIVED from who holds the row, not typed. The old `Blocker` select was
+      // filled on 0 of 91 rows a month after it was added — a fourth field nobody was ever
+      // going to complete — so the concept moved to something already being maintained:
+      // if the ball is with someone outside the team, you are waiting on them.
+      // What is lost is the reason ("Design conflict" vs "Commercial"); what is gained is a
+      // blocker list that is actually populated.
+      const bic     = getProp(page, "Ball in Court", "select");
+      const blocker = isExternalBIC(bic) ? `Waiting on ${bic}` : null;
       return {
         id:       page.id,
         title:    getProp(page, "Note", "title"),
-        status:   getProp(page, "Status",        "select"),
-        bic:      getProp(page, "Ball in Court", "select"),
+        bic,
         category: getProp(page, "Category",      "select"),
-        blocker:  blocker && blocker !== "—" ? blocker : null,
+        blocker,
         created:  page.created_time,
         // When the Email Tracker set a Received date, that — not the row's creation time —
         // is when the clock started on this action.
@@ -3394,7 +3435,7 @@ module.exports = function mountDrawingFlow(app, notion) {
     return {
       open:    ai.length + rfis.length,
       blocked: blockers.length,
-      withDM:  ai.filter((r) => r.bic === "Me").length,
+      withDM:  ai.filter((r) => r.bic === BIC.SUBMITTED).length,   // BIC.SUBMITTED === "DM"
       unassigned,
       blockers,
       items: { ai, rfis },
@@ -3736,8 +3777,11 @@ module.exports = function mountDrawingFlow(app, notion) {
         if (position) {
           const rows = [
             ...position.items.ai.map((r) => ({
+              // A&I no longer has a Status property — Ball in Court carries that meaning now
+              // (§5.3). Every row reaching this sheet is by definition open, so say so,
+              // rather than leaving the column blank beside the RFI rows' Raise/Open.
               source: "A&I", ref: "", project: r.projectName, item: r.taskName, title: r.title,
-              status: r.status, bic: r.bic, blocker: r.blocker, since: r.received || r.created,
+              status: "Open", bic: r.bic, blocker: r.blocker, since: r.received || r.created,
             })),
             ...position.items.rfis.map((r) => ({
               source: "RFI", ref: r.ref, project: r.projectName, item: r.taskName, title: r.title,

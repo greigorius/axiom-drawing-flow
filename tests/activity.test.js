@@ -55,11 +55,11 @@ const actRows = [
 
 const aiRows = [
   { id: "ai1", url: "u/ai1", created_time: "2026-09-01T09:00:00.000Z", properties: { Note: title("Confirm grid B4"), Tags: msel("Track"), Archived: chk(false),
-    "Status": sel("Waiting"), "Ball in Court": sel("Client"), Blocker: sel("Awaiting decision"), Category: sel("Design Coordination"), Items: rel("task1") } },
+    "Ball in Court": sel("Client"), Category: sel("Design Coordination"), Items: rel("task1") } },
   { id: "ai2", url: "u/ai2", created_time: "2026-09-16T09:00:00.000Z", properties: { Note: title("Review A-101 Rev C02"), Tags: msel("Track"), Archived: chk(false),
-    "Status": sel("Open"), "Ball in Court": sel("Me"), Blocker: sel("—"), Category: sel("Drawing Update"), Items: rel("task2") } },
+    "Ball in Court": sel("DM"), Category: sel("Drawing Update"), Items: rel("task2") } },
   { id: "ai3", url: "u/ai3", created_time: "2026-08-20T09:00:00.000Z", properties: { Note: title("Chase panel finish sample"), Tags: msel("Track"), Archived: chk(false),
-    "Status": sel("Open"), "Ball in Court": sel("Me"), Blocker: sel(null), Category: sel("Supplier Coordination"), Items: rel() } },
+    "Ball in Court": sel("DM"), Category: sel("Supplier Coordination"), Items: rel() } },
 ];
 
 const rfiRows = [
@@ -250,15 +250,29 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   r = await call("GET /api/df/activity-position");
   assert.strictEqual(r.status, 200, JSON.stringify(r.json));
   assert.strictEqual(r.json.open, 4, "3 tracked A&I rows + 1 open RFI");
-  assert.strictEqual(r.json.withDM, 2, "two A&I rows sit with Me");
-  assert.strictEqual(r.json.blocked, 2, "one real A&I blocker + one open RFI");
+  assert.strictEqual(r.json.withDM, 2, "two A&I rows sit with the DM");
+  assert.strictEqual(r.json.blocked, 2, "one A&I row held externally + one open RFI");
   ok("position: open / withDM / blocked counted across A&I and RFIs");
 
+  // Blocked is derived from who holds the row, not typed: the hand-filled `Blocker` select
+  // reached 0 of 91 rows and was deleted (§5.3). A row in the DM's own court is work to do,
+  // not a blocker — being blocked means waiting on somebody else.
   assert.ok(!r.json.blockers.some((b) => b.title === "Review A-101 Rev C02"),
-    '"—" means assessed-and-clear, and must not count as a blocker');
+    "a row in the DM's own court is work to do, not a blocker");
   assert.ok(!r.json.blockers.some((b) => b.title === "Chase panel finish sample"),
-    "a blank Blocker is not a blocker either");
-  ok("position: neither an em-dash nor a blank Blocker counts as blocked");
+    "nor is a second DM-held row");
+  const aiBlk = r.json.blockers.find((b) => b.source === "A&I");
+  assert.strictEqual(aiBlk.reason, "Waiting on Client",
+    "the reason names who you are waiting on, since nothing types one any more");
+  ok("position: blocked is derived from an external Ball in Court, not a typed Blocker");
+
+  // The gate. This filter is why 76 of 91 rows used to be invisible: it asked for `Status`,
+  // which was filled on 15. It must now ask for Ball in Court and nothing else.
+  assert.ok(JSON.stringify(seen.AI[0]).includes("Ball in Court"),
+    "the open-work filter gates on Ball in Court");
+  assert.ok(!JSON.stringify(seen.AI[0]).includes('"Status"'),
+    "Status is gone from A&I — filtering on it would 400 against the live database");
+  ok("position: open work is gated on Ball in Court, never on the deleted Status");
 
   const rfiBlk = r.json.blockers.find((b) => b.source === "RFI");
   assert.strictEqual(rfiBlk.ref, "RFI-014", "RFI number is zero-padded for display");
@@ -445,7 +459,8 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   const nLanes = LANES.LANE_ORDER.length;
   assert.strictEqual(r190.getCell(4 + nLanes).value, 2, "Drawings total");
   assert.strictEqual(r190.getCell(5 + nLanes).value, 1, "Blockers count");
-  assert.strictEqual(r190.getCell(6 + nLanes).value, "Awaiting decision", "blocker reasons spelled out");
+  assert.strictEqual(r190.getCell(6 + nLanes).value, "Waiting on Client",
+    "the blocker column names who you are waiting on");
   assert.strictEqual(r190.getCell(7 + nLanes).value, 1, "Open RFIs count");
   assert.strictEqual(r190.getCell(8 + nLanes).value, "RFI-014", "RFI refs so they can be looked up");
   ok("export: totals, blocker reasons and RFI refs make the summary self-contained");
@@ -589,10 +604,12 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(writes.created[0].parent.database_id, "AI");
   // joined rather than deepStrictEqual: the array is built in the vm realm, so a
   // structural compare against a host-realm literal fails on prototype identity.
-  assert.strictEqual(props["Status"].select.name, "Open", "born tracked — no manual step for submissions");
+  assert.ok(!("Status" in props),
+    "Status was deleted on 26 Sep 2026 — writing it would 400 (§5.3)");
   assert.ok(!("Tags" in props),     "Tags is gone — Status is the tracking flag");
   assert.ok(!("Archived" in props), "Archived is gone — Checked is the only done flag");
-  assert.strictEqual(props["Ball in Court"].select.name, "Me", "a submission lands in the DM's court");
+  assert.strictEqual(props["Ball in Court"].select.name, "DM",
+    "a submission lands in the DM's court, in the Submissions vocabulary");
   assert.strictEqual(props["Items"].relation[0].id, "task1");
   assert.strictEqual(props["Category"].select.name, "Drawing Update");
   ok("A&I row: opens tracked, Open, with DM, tied to the item");
@@ -646,13 +663,53 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   await resolveActionRow(aiNotion, "ai-new");
   const up = writes.updated[0].properties;
   assert.strictEqual(writes.updated[0].page_id, "ai-new");
-  assert.strictEqual(up["Status"].select, null, "clearing Status takes it out of the open queue");
+  assert.ok(!("Status" in up), "Status no longer exists to clear");
   assert.ok(!("Archived" in up), "Archived is gone — Checked is the only done flag");
   assert.strictEqual(up["Checked"].checkbox, true,
     "Checked is the done-flag the Response Reconciler and Chase List read — resolve must set it too");
-  assert.strictEqual(up["Ball in Court"].select, null, "nobody holds a closed item");
-  assert.strictEqual(up["Blocker"].select, null);
-  ok("A&I row: closing ticks Checked, clears Status and clears who holds it");
+  // Closing must be a one-property write. Anything else it cleared could not be restored by
+  // unticking the box, which is the only undo there is.
+  assert.ok(!("Ball in Court" in up),
+    "closing must not clear the ball — unticking has to restore the row exactly as it was");
+  assert.deepStrictEqual(Object.keys(up), ["Checked"],
+    "Checked is the only thing a close writes");
+  assert.ok(!("Blocker" in up), "Blocker no longer exists to clear");
+  ok("A&I row: closing ticks Checked and touches nothing else");
+
+  // ── check / uncheck round trip ──────────────────────────────────────────
+  // A row ticked in error has exactly one undo: untick the box. That only works if closing
+  // wrote nothing but the box — so this walks the full cycle against the open-work rule
+  // rather than trusting the single-property assertion above.
+  const OPEN = (row) => !!row["Ball in Court"] && !row["Checked"];
+
+  let row = { "Ball in Court": "Contractor", "Checked": false };
+  assert.ok(OPEN(row), "a row with a ball and no tick is open");
+
+  // Close it the way the code does — apply exactly the properties resolveActionRow writes.
+  writes.updated.length = 0;
+  await resolveActionRow(aiNotion, "ai-new");
+  for (const [k, v] of Object.entries(writes.updated[0].properties)) {
+    row[k] = v.checkbox !== undefined ? v.checkbox : (v.select ? v.select.name : null);
+  }
+  assert.strictEqual(row["Checked"], true);
+  assert.ok(!OPEN(row), "closed rows leave the open set");
+  assert.strictEqual(row["Ball in Court"], "Contractor", "the ball is remembered, not wiped");
+
+  // The undo: untick, and nothing else.
+  row["Checked"] = false;
+  assert.ok(OPEN(row), "unticking alone puts the row back into open work");
+  assert.strictEqual(row["Ball in Court"], "Contractor",
+    "and back with the same party holding it — not stranded in Unfiled");
+  ok("A&I row: ticking in error is undone by unticking, with the ball intact");
+
+  // Closing twice is the same as closing once — the drawing flow can resolve a row that a
+  // human already ticked.
+  writes.updated.length = 0;
+  await resolveActionRow(aiNotion, "ai-new");
+  await resolveActionRow(aiNotion, "ai-new");
+  assert.ok(writes.updated.every((u) => u.properties["Checked"].checkbox === true));
+  assert.strictEqual(writes.updated.length, 2, "both calls write; neither writes anything else");
+  ok("A&I row: closing is idempotent");
 
   writes.updated.length = 0;
   await resolveActionRow(aiNotion, null);
@@ -729,11 +786,11 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
 
   // Blockers and RFIs come from fetchPosition — one definition of "blocked", two surfaces.
   assert.strictEqual(byCode["24-354-190"].blockers.length, 1);
-  assert.strictEqual(byCode["24-354-190"].blockers[0].reason, "Awaiting decision");
+  assert.strictEqual(byCode["24-354-190"].blockers[0].reason, "Waiting on Client");
   assert.strictEqual(byCode["24-354-190"].rfis.length, 1);
   assert.strictEqual(byCode["24-354-190"].rfis[0].ref, "RFI-014");
   assert.strictEqual(byCode["24-354-200"].blockers.length, 0,
-    "Blocker = '—' means assessed and clear, which is not a blocker");
+    "a DM-held row is work to do, not a blocker");
   ok("summary: blockers and open RFIs reuse fetchPosition's numbers");
 
   assert.strictEqual(r.json.items[0].taskCode, "24-354-190", "blocked items sort to the top");
