@@ -533,6 +533,47 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.ok(!Object.keys(updates.find((u) => u.page_id === "dwgP")?.properties || {}).some((k) => /Comments$/.test(k)));
   ok("log-status: PRD keeps the note on the submission — no MDS Comments property to write to");
 
+  // The sign-off stages used to send no date at all, so the MDS was stamped with whenever
+  // the DM got round to logging it. C01 Sign Off in particular is read by the programme.
+  pages.dwgS = { id: "dwgS", properties: {} };
+  const dateOf = (id, prop) => updates.find((u) => u.page_id === id)?.properties?.[prop]?.date?.start;
+  const signOffSub = (id, stage, drawing) => ({ id, properties: {
+    "Status": sel("Issued"), "Stage": sel(stage), "Revision": sel("C01"),
+    "Submission": title(`24-367-003_${DWG}_${stage}_R1`), "Drawing": rel(drawing), "Item": rel(),
+    "Dropbox Path": { url: `Drawing Submissions/24-367/04_Issued/003_${stage}_C01_${DWG}_GF.pdf` } } });
+
+  submissions = [signOffSub("subA45", "A4.5", "dwgS")];
+  updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/log-status",
+    { params: { id: "subA45" }, body: { grade: "Approved", returnDate: "2026-09-30" } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  assert.strictEqual(dateOf("dwgS", "C01 Sign Off"), "2026-09-30",
+    "A4.5 sign-off is dated when it was signed off, not when it was logged");
+
+  submissions = [signOffSub("subPRD2", "PRD", "dwgS")];
+  updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/log-status",
+    { params: { id: "subPRD2" }, body: { grade: "Approved", returnDate: "2026-09-29" } });
+  assert.strictEqual(dateOf("dwgS", "PRD Status Date"), "2026-09-29");
+
+  submissions = [signOffSub("subAB2", "AB", "dwgS")];
+  updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/log-status",
+    { params: { id: "subAB2" }, body: { grade: "Approved", returnDate: "2026-09-28" } });
+  assert.strictEqual(dateOf("dwgS", "AB Status Date"), "2026-09-28");
+  ok("log-status: a supplied date reaches C01 Sign Off / PRD Status Date / AB Status Date");
+
+  // Unchanged on purpose: A4.5 Rejected writes no date, so the column keeps meaning
+  // "signed off" rather than "last decision". The modal still asks for one.
+  submissions = [signOffSub("subA45r", "A4.5", "dwgS")];
+  updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/log-status",
+    { params: { id: "subA45r" }, body: { grade: "Rejected", returnDate: "2026-09-30" } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  assert.strictEqual(dateOf("dwgS", "C01 Sign Off"), undefined,
+    "a rejected A4.5 is not a sign-off, so C01 Sign Off stays empty");
+  ok("log-status: A4.5 Rejected still writes no C01 Sign Off date");
+
   // The DT only learns what to change from the email when there was no mark-up to send.
   submissions = [
     { id: "gc", properties: { "Status": sel("Graded"), "DT Notified": { checkbox: false }, "Stage": sel("S4"), "Client Grade": sel("B"), "Revision": sel("P01"),

@@ -10,6 +10,25 @@ const { useState, useEffect, useRef, useCallback } = React;
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
+// Every graded stage records a real date rather than the day it happened to be logged.
+// S4/S5 take the date the return was filed on the project system; A4.5 and PRD the date
+// it was actually signed off; AB the date the status changed. Leaving these to default to
+// today quietly post-dated anything logged a few days late — and for A4.5 that date is
+// `C01 Sign Off`, which the programme reads.
+const STATUS_DATE_LABEL = {
+  "S4":   "Return date (as filed on project system)",
+  "S5":   "Return date (as filed on project system)",
+  "A4.5": "Sign-off date (contractor)",
+  "PRD":  "Sign-off date (factory)",
+  "AB":   "Status date",
+};
+// One stage gives its own label; a batch spanning A4.5/PRD/AB falls back to the neutral
+// one rather than naming a party that is wrong for half the set.
+const statusDateLabel = (stages) => {
+  const labels = [...new Set(stages.map((st) => STATUS_DATE_LABEL[st]).filter(Boolean))];
+  return labels.length === 1 ? labels[0] : "Sign-off date";
+};
+
 function stageBadgeClass(stage) {
   if (!stage) return "";
   if (stage === "S4") return "badge-s4";
@@ -118,7 +137,7 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
   const isPRD = submission.stage === "PRD";
   // A4.5 and PRD share the same Approved/Rejected mechanics and file moves.
   const isSignOff = isA45 || isPRD;
-  const needsReturnDate = !isAB && !isSignOff;   // S4/S5 have a project-system return date
+  const dateLabel = statusDateLabel([submission.stage]);
   // Only S4/S5/A4.5 carry a `{stage} Comments` property on the MDS. A note typed against
   // PRD or AB still reaches the submission and the DT's email, it just has no MDS home.
   const commentsTracked = ["S4", "S5", "A4.5"].includes(submission.stage);
@@ -129,8 +148,8 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
                : "A = accepted · B = minor revision · C = major revision · NA = not applicable";
 
   const select = async (grade) => {
-    if (needsReturnDate && !returnDate) {
-      alert("Please enter the date the return was filed on the project system.");
+    if (!returnDate) {
+      alert(`Please enter the ${dateLabel.toLowerCase()}.`);
       return;
     }
     setChosen(grade);
@@ -154,19 +173,18 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
         <div className="modal-sub">
           {submission.stage} · Rev {submission.revision}
         </div>
-        {needsReturnDate && (
-          <div style={{ margin: "16px 0 4px" }}>
-            <label style={{ fontSize: 12, color: "var(--text2)", display: "block", marginBottom: 4 }}>
-              Return date (as filed on project system) *
-            </label>
-            <input
-              type="date"
-              value={returnDate}
-              onChange={(e) => setReturnDate(e.target.value)}
-              style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid var(--border)", background: "var(--surface2)", color: "var(--text1)", fontSize: 13 }}
-            />
-          </div>
-        )}
+        <div style={{ margin: "16px 0 4px" }}>
+          <label style={{ fontSize: 12, color: "var(--text2)", display: "block", marginBottom: 4 }}>
+            {dateLabel} *
+          </label>
+          <input
+            type="date"
+            value={returnDate}
+            onChange={(e) => setReturnDate(e.target.value)}
+            disabled={busy}
+            style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid var(--border)", background: "var(--surface2)", color: "var(--text1)", fontSize: 13 }}
+          />
+        </div>
         {/* Optional, and usually empty: a client either sends a marked-up PDF or writes a
             line. This is the second case — it lands in the same {stage} Comments field the
             comment PDFs do, and reaches the DT in the grade email. */}
@@ -258,6 +276,127 @@ const IssueModal = ({ submission, onConfirm, onClose }) => {
 };
 
 // ─── Submission row ───────────────────────────────────────────────────────────
+
+// Grade several drawings in one pass from the bulk bar. Deliberately not a loop around
+// LogStatusModal: one grade, one return date and one comment are entered once and applied
+// to every selected drawing, which is the real case — a client replies about a set of
+// drawings at once, with one verdict.
+const BatchGradeModal = ({ submissions, onConfirm, onClose }) => {
+  const [returnDate, setReturnDate] = useState("");
+  const [comment,    setComment]    = useState("");
+  const [chosen,     setChosen]     = useState(null);
+  const [progress,   setProgress]   = useState(null);   // { done, total, current }
+  const [failures,   setFailures]   = useState(null);   // [{ label, error }]
+
+  const stages    = [...new Set(submissions.map((s) => s.stage))];
+  const isSignOff = stages.every((st) => ["A4.5", "PRD", "AB"].includes(st));
+  const grades    = isSignOff ? ["Approved", "Rejected"] : ["A", "B", "C", "NA"];
+  const dateLabel = statusDateLabel(stages);
+  const commentsTracked = stages.every((st) => ["S4", "S5", "A4.5"].includes(st));
+  // PRD is graded by the factory, every other stage by the client. A set spanning both
+  // gets the neutral wording rather than a label that is wrong for half of it.
+  const actor = stages.every((st) => st === "PRD") ? "factory "
+              : stages.some((st) => st === "PRD")  ? ""
+              : "client ";
+  const label     = (sub) => sub.drawingNo || sub.title || sub.id;
+  const busy      = !!progress && !failures;
+  const done      = !!failures;
+
+  const select = async (grade) => {
+    if (!returnDate) {
+      alert(`Please enter the ${dateLabel.toLowerCase()}.`);
+      return;
+    }
+    setChosen(grade);
+    const fails = [];
+    // One at a time. Each log-status call fans out to Notion and fires its own move-files
+    // webhook; firing thirty of those inside the same second is what left 4 of 31 files
+    // moved on the 109 issue. Slower, but every drawing actually lands.
+    for (let i = 0; i < submissions.length; i++) {
+      const sub = submissions[i];
+      setProgress({ done: i, total: submissions.length, current: label(sub) });
+      const err = await onConfirm(sub.id, grade, returnDate || null, comment.trim() || null);
+      if (err) fails.push({ label: label(sub), error: err });
+    }
+    setProgress({ done: submissions.length, total: submissions.length, current: null });
+    // Failures keep the modal open and named — "3 of 12 failed, check console" tells you
+    // nothing you can act on.
+    if (fails.length) setFailures(fails);
+    else onClose();
+  };
+
+  const shown = submissions.slice(0, 8);
+
+  return (
+    <div className="modal-backdrop" onClick={busy ? undefined : onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h3>Grade {submissions.length} drawing{submissions.length === 1 ? "" : "s"}</h3>
+        <div className="modal-sub">{stages.join(" · ")} — one {actor}grade applied to all</div>
+
+        <ul className="batch-grade-list">
+          {shown.map((sub) => <li key={sub.id}><code>{label(sub)}</code> <span>{sub.stage} · Rev {sub.revision}</span></li>)}
+          {submissions.length > shown.length && <li className="more">+{submissions.length - shown.length} more</li>}
+        </ul>
+
+        {!done && (
+          <div style={{ margin: "14px 0 4px" }}>
+            <label style={{ fontSize: 12, color: "var(--text2)", display: "block", marginBottom: 4 }}>
+              {dateLabel} *
+            </label>
+            <input type="date" value={returnDate} onChange={(e) => setReturnDate(e.target.value)} disabled={busy}
+              style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid var(--border)", background: "var(--surface2)", color: "var(--text1)", fontSize: 13 }} />
+          </div>
+        )}
+
+        {!done && (
+          <div style={{ margin: "14px 0 4px" }}>
+            <label style={{ fontSize: 12, color: "var(--text2)", display: "block", marginBottom: 4 }}>
+              Comment (optional — applied to every drawing above)
+            </label>
+            <textarea value={comment} onChange={(e) => setComment(e.target.value)} rows={3} disabled={busy}
+              placeholder={commentsTracked
+                ? "Client's written comments — saved against each drawing's Comments and sent to the DT"
+                : "Note for the DT — sent with the grade email"}
+              style={{ width: "100%", boxSizing: "border-box", padding: "6px 10px", borderRadius: 6,
+                       border: "1px solid var(--border)", background: "var(--surface2)", color: "var(--text1)",
+                       fontSize: 13, fontFamily: "inherit", resize: "vertical" }} />
+          </div>
+        )}
+
+        {!done && (
+          <div className="grade-buttons" style={{ marginTop: 16 }}>
+            {grades.map((g) => (
+              <button key={g} className={`grade-btn ${g}${chosen === g ? " is-selected" : ""}`}
+                onClick={() => select(g)} disabled={busy} aria-busy={busy && chosen === g}>
+                {g}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {busy && (
+          <div className="modal-working" role="status" aria-live="polite">
+            <span className="spinner" />
+            <span>Grading {Math.min(progress.done + 1, progress.total)} of {progress.total}
+              {progress.current ? ` — ${progress.current}` : ""}…</span>
+          </div>
+        )}
+
+        {done && (
+          <div className="batch-grade-fail">
+            <strong>{failures.length} of {submissions.length} could not be graded</strong>
+            <ul>{failures.map((f) => <li key={f.label}><code>{f.label}</code> — {f.error}</li>)}</ul>
+            <span className="note">The rest went through. Re-select just these and try again.</span>
+          </div>
+        )}
+
+        <div className="modal-actions" style={{ marginTop: 16 }}>
+          <button className="btn btn-ghost btn-sm" onClick={onClose} disabled={busy}>{done ? "Close" : "Cancel"}</button>
+        </div>
+      </div>
+    </div>
+  );
+};
 
 const SubmissionRow = ({ sub, onApprove, onBounce, onLogStatus, onIssue, onHold, busy, selected, onToggleSelect }) => {
   const isBusy = busy === sub.id;
@@ -538,6 +677,7 @@ const Cockpit = () => {
   const [lastPoll,             setLastPoll]             = useState(null);
   const [busy,                 setBusy]                 = useState(null);
   const [batchBusy,            setBatchBusy]            = useState(false);
+  const [batchGradeTargets,    setBatchGradeTargets]    = useState(null);
   const [sendEmailBusy,        setSendEmailBusy]        = useState(false);
   const [sendEmailResult,      setSendEmailResult]      = useState(null); // "ok" | "error" | null
   const [bounceTarget,         setBounceTarget]         = useState(null);
@@ -868,6 +1008,29 @@ const Cockpit = () => {
     }
   };
 
+  // One drawing's grade, returning null on success or a message on failure, so the batch
+  // modal can name what went wrong per drawing instead of counting anonymous failures.
+  const runOneGrade = async (id, grade, returnDate, comment) => {
+    try {
+      const res = await fetch(`/api/df/submissions/${id}/log-status`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ grade, ...(returnDate ? { returnDate } : {}), ...(comment ? { comment } : {}) }),
+      });
+      if (res.ok) return null;
+      const body = await res.json().catch(() => ({}));
+      return body.error || res.statusText || `HTTP ${res.status}`;
+    } catch (err) {
+      return err.message || "Network error";
+    }
+  };
+
+  const closeBatchGrade = async () => {
+    setBatchGradeTargets(null);
+    clearSelection();
+    await fetchQueue(true);
+  };
+
   const handleBatchApprove = (ids) => runBatch(ids, "approve");
   const handleBatchBounce  = (ids) => runBatch(ids, "bounce", "PATCH", {});
   const handleBatchIssue   = (ids) => runBatch(ids, "issue");
@@ -1030,6 +1193,20 @@ const Cockpit = () => {
   // "nothing selected in this column", which the send handlers treat as "send everything".
   const reviewedSelectedIds = reviewedNotify.filter((s) => selectedIds.has(s.id)).map((s) => s.id);
   const gradedSelectedIds   = graded.filter((s) => selectedIds.has(s.id)).map((s) => s.id);
+  // Batch grading works off the Issued pool — the only cards that carry a Grade button at
+  // all. Anything else caught in the selection (Submitted, Approved, Awaiting Issue) is
+  // left alone rather than quietly pushed through log-status, which does not check status.
+  const gradeSelected = issued.filter((s) => selectedIds.has(s.id));
+  const gradeFamilyOf = (s) => (["A4.5", "PRD", "AB"].includes(s.stage) ? "sign-off" : "abc");
+  const gradeFamilies = [...new Set(gradeSelected.map(gradeFamilyOf))];
+  // A mixed selection is refused rather than part-graded: the two families do not share a
+  // grade vocabulary, so there is no single button that means the right thing for both.
+  const batchGradeBlocked =
+    gradeSelected.length === 0
+      ? "Select Issued drawings to grade — nothing else can be"
+      : gradeFamilies.length > 1
+        ? "Mixed stages: S4/S5 grade A/B/C/NA, A4.5/PRD/AB grade Approved/Rejected — narrow the selection to one or the other"
+        : null;
   // Approved drawings only enter the Awaiting-Issue column once the DT has been notified;
   // until their DWGs are uploaded (Make flips status → "Awaiting Issue") the Issue button stays grey.
   const approvedItems    = awaitingIssue.filter((s) => s.status === "Awaiting Issue" || s.dtNotified);
@@ -1254,10 +1431,23 @@ const Cockpit = () => {
           <button className="k-btn" onClick={clearSelection} disabled={batchBusy}>Clear</button>
           <button className="k-btn" onClick={() => handleBatchApprove([...selectedIds])} disabled={batchBusy}>Approve</button>
           <button className="k-btn" onClick={() => handleBatchBounce([...selectedIds])} disabled={batchBusy}>Bounce</button>
+          <button className="k-btn" onClick={() => setBatchGradeTargets(gradeSelected)}
+            disabled={batchBusy || !!batchGradeBlocked}
+            title={batchGradeBlocked || `Grade ${gradeSelected.length} selected drawing${gradeSelected.length === 1 ? "" : "s"}`}>
+            Grade{gradeSelected.length ? ` (${gradeSelected.length})` : ""}
+          </button>
           <button className="k-btn" onClick={() => handleBatchHold([...selectedIds])} disabled={batchBusy}
             title="Put selected drawings on hold (RFI / Design Change)">Hold</button>
           <button className="k-btn primary" onClick={() => handleBatchIssue([...selectedIds])} disabled={batchBusy}>Issue</button>
         </div>
+      )}
+
+      {batchGradeTargets && batchGradeTargets.length > 0 && (
+        <BatchGradeModal
+          submissions={batchGradeTargets}
+          onConfirm={runOneGrade}
+          onClose={closeBatchGrade}
+        />
       )}
 
       {bounceTarget && (
