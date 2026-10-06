@@ -1073,11 +1073,16 @@ const Cockpit = () => {
     }
     // Client comments are reviewed in Drawboard, then graded here — Log Status moves the
     // comment PDFs to 05_Client Comments/Reviewed/R_… (the Comment Reviewer app is retired).
-    // "Awaiting Comments" cards have no Grade button: they're graded once the client's
-    // comments arrive (Scan Comments moves them to Review Client Comments). Hold still shows.
-    else if (colId === "signoff" || colId === "comments") primary = (
-      <button className="k-act go" onClick={(e) => { e.stopPropagation(); setLogStatusTarget(s); }}
-        title={colId === "comments" ? "Review the comment PDF in Drawboard, then grade" : "Log the client grade"}>Grade</button>
+    // "Awaiting Comments" also gets Grade: a client who returns Status A (approved, no
+    // mark-ups) sends no comment PDF, so the card never moves to Review Client Comments
+    // and would otherwise sit there forever. Grade is secondary (not "go") there, since the
+    // normal path is still to wait for comments.
+    else if (colId === "signoff" || colId === "comments" || colId === "awaiting-comments") primary = (
+      <button className={`k-act${colId === "awaiting-comments" ? "" : " go"}`}
+        onClick={(e) => { e.stopPropagation(); setLogStatusTarget(s); }}
+        title={colId === "comments" ? "Review the comment PDF in Drawboard, then grade"
+             : colId === "awaiting-comments" ? "Log the client grade (no comments received — e.g. Status A)"
+             : "Log the client grade"}>Grade</button>
     );
     return (<>{primary}{hold}</>);
   };

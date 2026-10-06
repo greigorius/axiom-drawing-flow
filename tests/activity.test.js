@@ -60,6 +60,11 @@ const aiRows = [
     "Ball in Court": sel("DM"), Category: sel("Drawing Update"), Items: rel("task2") } },
   { id: "ai3", url: "u/ai3", created_time: "2026-08-20T09:00:00.000Z", properties: { Note: title("Chase panel finish sample"), Tags: msel("Track"), Archived: chk(false),
     "Ball in Court": sel("DM"), Category: sel("Supplier Coordination"), Items: rel() } },
+  // The internal half of the blocker fork. DT holding a row is a chase down the corridor,
+  // not something the client hears about, so this row must reach `waiting` and must NOT
+  // reach `blockers` — the assertion that keeps the two counts from silently re-merging.
+  { id: "ai4", url: "u/ai4", created_time: "2026-09-10T09:00:00.000Z", properties: { Note: title("DT to reissue A-101 cloud"), Tags: msel("Track"), Archived: chk(false),
+    "Ball in Court": sel("DT"), Category: sel("Drawing Update"), Items: rel("task2") } },
 ];
 
 const rfiRows = [
@@ -249,10 +254,11 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   reset();
   r = await call("GET /api/df/activity-position");
   assert.strictEqual(r.status, 200, JSON.stringify(r.json));
-  assert.strictEqual(r.json.open, 4, "3 tracked A&I rows + 1 open RFI");
+  assert.strictEqual(r.json.open, 5, "4 tracked A&I rows + 1 open RFI");
   assert.strictEqual(r.json.withDM, 2, "two A&I rows sit with the DM");
   assert.strictEqual(r.json.blocked, 2, "one A&I row held externally + one open RFI");
-  ok("position: open / withDM / blocked counted across A&I and RFIs");
+  assert.strictEqual(r.json.waiting, 1, "the DT-held row is waiting, not blocked");
+  ok("position: open / withDM / blocked / waiting counted across A&I and RFIs");
 
   // Blocked is derived from who holds the row, not typed: the hand-filled `Blocker` select
   // reached 0 of 91 rows and was deleted (§5.3). A row in the DM's own court is work to do,
@@ -262,9 +268,25 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.ok(!r.json.blockers.some((b) => b.title === "Chase panel finish sample"),
     "nor is a second DM-held row");
   const aiBlk = r.json.blockers.find((b) => b.source === "A&I");
-  assert.strictEqual(aiBlk.reason, "Waiting on Client",
-    "the reason names who you are waiting on, since nothing types one any more");
+  assert.strictEqual(aiBlk.reason, "Blocked — with Client",
+    "the reason names who is holding it, since nothing types one any more");
   ok("position: blocked is derived from an external Ball in Court, not a typed Blocker");
+
+  // ── the blocker fork (§5.3b) ────────────────────────────────────────────
+  // Eleven Ball in Court values, three courts: DM is work, six internal parties are a
+  // chase, four external ones are a blocker. The failure this guards against is the easy
+  // one — quietly widening EXTERNAL_BIC again until "blocked" means "not with me", which is
+  // how the count got to be mostly our own team in the first place.
+  assert.ok(!r.json.blockers.some((b) => b.title === "DT to reissue A-101 cloud"),
+    "an internally-held row is a chase, not a blocker — DT must not reach the blocked count");
+  assert.strictEqual(r.json.waitingRows.length, 1);
+  assert.strictEqual(r.json.waitingRows[0].reason, "Waiting on DT");
+  assert.strictEqual(r.json.waitingRows[0].bic, "DT");
+  assert.ok(!r.json.waitingRows.some((b) => b.bic === "DM"),
+    "a DM-held row is neither blocked nor waiting — it is the work");
+  assert.ok(r.json.blockers.every((b) => !r.json.waitingRows.some((w) => w.id === b.id)),
+    "the ball is in one court: no row may appear in both lists");
+  ok("position: internal holds are waiting, external holds are blocked, DM is neither");
 
   // The gate. This filter is why 76 of 91 rows used to be invisible: it asked for `Status`,
   // which was filled on 15. It must now ask for Ball in Court and nothing else.
@@ -312,7 +334,7 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   reset(); rfiShouldFail = true;
   r = await call("GET /api/df/activity-position");
   assert.strictEqual(r.status, 200, "an RFI outage must not blank the whole header");
-  assert.strictEqual(r.json.open, 3, "A&I numbers still come through");
+  assert.strictEqual(r.json.open, 4, "A&I numbers still come through");
   assert.strictEqual(r.json.blocked, 1);
   assert.ok(r.json.errors?.[0]?.includes("RFIs unavailable"));
   ok("position: an RFI failure degrades to A&I-only with the problem reported");
@@ -402,15 +424,25 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
 
   const s2 = wb.getWorksheet("Current Position");
   assert.deepStrictEqual(rowVals(s2, 1),
-    ["Source", "Ref", "Project", "Item", "Title", "Status", "Ball in Court", "Blocker", "Opened", "Days Open"]);
+    ["Source", "Ref", "Project", "Item", "Title", "Status", "Ball in Court",
+     "Blocked", "Waiting on", "Opened", "Days Open"]);
   assert.strictEqual(s2.rowCount, aiRows.length + rfiRows.length + 1, "every open item, from both trackers");
   const days = [];
-  s2.eachRow((r, i) => { if (i > 1) days.push(r.getCell(10).value); });
-  assert.ok(days.length === 4 && days.every((v) => typeof v === "number" && v >= 0),
+  s2.eachRow((r, i) => { if (i > 1) days.push(r.getCell(11).value); });
+  assert.ok(days.length === 5 && days.every((v) => typeof v === "number" && v >= 0),
     `Days Open must be backend-computed numbers, got ${JSON.stringify(days)}`);
   const refs = []; s2.eachRow((r, i) => { if (i > 1) refs.push(r.getCell(2).value); });
   assert.ok(refs.includes("RFI-014"), "RFI rows carry their zero-padded ref");
   ok("export: Current Position lists both trackers with a numeric Days Open");
+
+  // One row can never fill both fork columns, and the red-row rule tests H (Blocked) only,
+  // so an internal hold must land in I or it would redden a client's copy of the sheet.
+  const posRows = [];
+  s2.eachRow((r, i) => { if (i > 1) posRows.push({ bic: r.getCell(7).value, blocked: r.getCell(8).value, waiting: r.getCell(9).value }); });
+  assert.ok(posRows.every((r) => !(r.blocked && r.waiting)), "Blocked and Waiting on are exclusive");
+  assert.deepStrictEqual(posRows.find((r) => r.bic === "DT"), { bic: "DT", blocked: "", waiting: "Waiting on DT" });
+  assert.deepStrictEqual(posRows.find((r) => r.bic === "Client"), { bic: "Client", blocked: "Blocked — with Client", waiting: "" });
+  ok("export: the fork reaches the sheet as two exclusive columns, red on Blocked alone");
 
   // ── export modes (§8) ───────────────────────────────────────────────────
   // Three deliverables with different readers: summary for the client, detail as the
@@ -459,8 +491,8 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   const nLanes = LANES.LANE_ORDER.length;
   assert.strictEqual(r190.getCell(4 + nLanes).value, 2, "Drawings total");
   assert.strictEqual(r190.getCell(5 + nLanes).value, 1, "Blockers count");
-  assert.strictEqual(r190.getCell(6 + nLanes).value, "Waiting on Client",
-    "the blocker column names who you are waiting on");
+  assert.strictEqual(r190.getCell(6 + nLanes).value, "Blocked — with Client",
+    "the blocker column names who is holding it");
   assert.strictEqual(r190.getCell(7 + nLanes).value, 1, "Open RFIs count");
   assert.strictEqual(r190.getCell(8 + nLanes).value, "RFI-014", "RFI refs so they can be looked up");
   ok("export: totals, blocker reasons and RFI refs make the summary self-contained");
@@ -786,12 +818,20 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
 
   // Blockers and RFIs come from fetchPosition — one definition of "blocked", two surfaces.
   assert.strictEqual(byCode["24-354-190"].blockers.length, 1);
-  assert.strictEqual(byCode["24-354-190"].blockers[0].reason, "Waiting on Client");
+  assert.strictEqual(byCode["24-354-190"].blockers[0].reason, "Blocked — with Client");
   assert.strictEqual(byCode["24-354-190"].rfis.length, 1);
   assert.strictEqual(byCode["24-354-190"].rfis[0].ref, "RFI-014");
   assert.strictEqual(byCode["24-354-200"].blockers.length, 0,
     "a DM-held row is work to do, not a blocker");
   ok("summary: blockers and open RFIs reuse fetchPosition's numbers");
+
+  // The fork again, on the card the client reads: the DT row rides the same item as the
+  // DM one and must show up as a waiting pill rather than inflating its blocker count.
+  assert.strictEqual(byCode["24-354-200"].waiting.length, 1);
+  assert.strictEqual(byCode["24-354-200"].waiting[0].reason, "Waiting on DT");
+  assert.strictEqual(byCode["24-354-190"].waiting.length, 0,
+    "an externally-blocked item is not also waiting — the ball is in one court");
+  ok("summary: internal holds ride alongside blockers as their own group");
 
   assert.strictEqual(r.json.items[0].taskCode, "24-354-190", "blocked items sort to the top");
   ok("summary: most pressing item first");

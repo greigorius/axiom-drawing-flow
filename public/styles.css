@@ -1191,6 +1191,16 @@ main {
   margin-bottom: 16px;
 }
 
+/* The internal half of the fork, deliberately cooler than the red strip above it: the
+   distinction between "the client is sitting on it" and "DT is sitting on it" is the whole
+   point of splitting them, and it should be visible before either is read. */
+.waiting-strip {
+  background: rgba(148, 163, 184, 0.06);
+  border-color: rgba(148, 163, 184, 0.28);
+}
+
+.waiting-strip .blocker-strip-title { color: var(--text2); }
+
 .blocker-strip-title {
   font-size: 11px;
   font-weight: 700;
@@ -1339,6 +1349,9 @@ main {
 }
 
 .lane-blocker { background: rgba(239, 68, 68, 0.14); border-color: rgba(239, 68, 68, 0.4); color: #fca5a5; }
+/* Slate, not amber: amber is already the RFI pill, and an internal hold should read as
+   "parked" rather than as a second flavour of warning. */
+.lane-waiting { background: rgba(148, 163, 184, 0.14); border-color: rgba(148, 163, 184, 0.35); color: #cbd5e1; }
 .lane-rfi     { background: rgba(245, 158, 11, 0.14); border-color: rgba(245, 158, 11, 0.4); color: #fcd34d; }
 
 /* "Nothing recorded", which is a different statement from "nothing happening". */

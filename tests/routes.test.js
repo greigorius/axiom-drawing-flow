@@ -3,7 +3,21 @@
 const fs = require("fs"), vm = require("vm"), assert = require("assert");
 const env = { NOTION_DB_SUBMISSIONS: "SUBS", NOTION_DB_DRAWINGS: "DWGS", NOTION_DB_TEAM: "TEAM", NOTION_DB_TASKS: "TASKS", MAKE_ACTIONS_WEBHOOK: "https://hook.test/actions" };
 const feed = [];
-const blobs = { getStore: () => ({ get: async () => feed, setJSON: async (_k, v) => { feed.splice(0, feed.length, ...v); } }) };
+// Minimal Netlify Blobs stub. getWithMetadata/etag is modelled because addNotification
+// compare-and-swaps on the etag (dozens of cr-ingest calls can land at once). Both reads
+// hand back a *snapshot*, as a real store does over the wire — returning the live array
+// would hide exactly the lost-update bug the CAS retry exists to prevent.
+let feedEtag = 0;
+const blobs = { getStore: () => ({
+  get:             async () => feed.slice(),
+  getWithMetadata: async () => (feed.length ? { data: feed.slice(), etag: `e${feedEtag}` } : null),
+  setJSON:         async (_k, v, opts) => {
+    if (opts?.onlyIfMatch && opts.onlyIfMatch !== `e${feedEtag}`) return { modified: false };
+    if (opts?.onlyIfNew  && feed.length)                         return { modified: false };
+    feed.splice(0, feed.length, ...v); feedEtag++;
+    return { modified: true };
+  },
+}) };
 const webhooks = [];
 const fetchMock = async (url, opts) => { webhooks.push({ url, body: JSON.parse(opts.body) }); return { ok: true, status: 200, text: async () => "Accepted" }; };
 const mod = { exports: {} };
@@ -459,6 +473,35 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(dsOf("dwgPRD"),    "Schedule");
   assert.strictEqual(dsOf("dwgPRDrej"), "DT Review");
   ok("grade email finalises Drawing Status: A4.5 Approved → Production Updates, PRD Approved → Schedule, Rejected → DT Review");
+
+  // Grade A = client accepted as issued (no mark-ups came back, so no comment PDF and no
+  // revision). Only B asks for the next revision. A used to fall through to B's label.
+  submissions = [
+    { id: "ga", properties: { "Status": sel("Graded"), "DT Notified": { checkbox: false }, "Stage": sel("S4"), "Client Grade": sel("A"), "Revision": sel("P01"),
+      "Submission": title(`24-367-003_${DWG}_S4_R1`), "DT": rel("dtAI"), "Drawing": rel(),
+      "Dropbox Path": { url: `Drawing Submissions/24-367/04_Issued/003_S4_P01_${DWG}_GF.pdf` } } },
+    { id: "gb", properties: { "Status": sel("Graded"), "DT Notified": { checkbox: false }, "Stage": sel("S4"), "Client Grade": sel("B"), "Revision": sel("P01"),
+      "Submission": title(`24-367-004_${DWG}_S4_R1`), "DT": rel("dtAI"), "Drawing": rel(),
+      "Comment Paths": rt(`Drawing Submissions/24-367/05_Client Comments/Reviewed/R_260910_MC_004_S4_P01_${DWG}.pdf`) } },
+  ];
+  webhooks.length = 0; updates.length = 0;
+  r = await call("POST /api/df/send-grade-emails", { body: {} });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  const rowsHtml = hook("grade-summary").folderBlocks.map((f) => f.drawingsHtml).join("");
+  assert.ok(rowsHtml.includes("Accepted as issued — no revision required"), rowsHtml);
+  assert.ok(rowsHtml.includes("Update to next revision"), rowsHtml);
+  ok("grade email action label: A → accepted as issued, B → update to next revision");
+
+  // ── Notification feed survives a parallel batch ─────────────────────
+  // Scenario 3 lists a Dropbox tree and POSTs one cr-ingest per comment PDF with Sequential
+  // off, so dozens arrive at once. The feed is one blob key: a plain read-modify-write kept
+  // only the last writer, so a batch of failed ingests showed up in the cockpit as silence.
+  feed.length = 0;
+  await Promise.all(Array.from({ length: 12 }, (_, i) =>
+    call("POST /api/df/cr-ingest", { body: { filePath: `${R}/24-367/05_Client Comments/not-a-valid-name-${i}.pdf` } })));
+  assert.strictEqual(feed.length, 12, `expected 12 feed entries, got ${feed.length}`);
+  assert.strictEqual(new Set(feed.map((f) => f.filename)).size, 12);
+  ok("notification feed: 12 concurrent cr-ingest failures all reach the cockpit, none clobbered");
 
   // ── DT emails: filename (with _R#) + folder link ───────────────────────
   submissions = [

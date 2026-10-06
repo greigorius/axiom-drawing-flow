@@ -362,6 +362,9 @@ const ActivityFeed = () => {
         : `No activity logged across any project in the last ${DEFAULT_WINDOW_DAYS} days.`;
 
   const blockers   = position?.blockers || [];
+  // Internal holds, kept apart from blockers on purpose: "blocked" on this page now means
+  // somebody outside the business is sitting on it. See EXTERNAL_BIC in drawing-flow.js.
+  const waitingOn  = position?.waitingRows || [];
   const unassigned = position?.unassigned || 0;
   const withDMZero = position && position.withDM === 0;
 
@@ -505,6 +508,11 @@ const ActivityFeed = () => {
                   <div className={`stat-value${position.blocked > 0 ? " stat-value-alert" : ""}`}>{position.blocked}</div>
                   <div className="stat-label">blocked</div>
                 </div>
+                {/* Not alerting even at 20 — an internal hold is a corridor conversation. */}
+                <div className="stat-tile">
+                  <div className="stat-value">{position.waiting ?? 0}</div>
+                  <div className="stat-label">waiting on</div>
+                </div>
               </div>
             </div>
 
@@ -520,6 +528,23 @@ const ActivityFeed = () => {
                   <div key={b.id} className="blocker-row">
                     <span className={`source-badge source-badge-${b.source === "RFI" ? "rfi" : "ai"}`}>{b.source}</span>
                     <span className="blocker-item">{b.ref ? `${b.ref} — ` : ""}{b.item || "(unassigned)"}</span>
+                    <span className="blocker-reason">{b.reason}</span>
+                    <span className="blocker-bic">BIC {b.bic}</span>
+                    {b.url && <a className="activity-row-link" href={b.url} target="_blank" rel="noreferrer">↗</a>}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Below the blocker strip and visually quieter: same information shape, lower
+                temperature. Absence is silent here too. */}
+            {waitingOn.length > 0 && (
+              <div className="blocker-strip waiting-strip">
+                <div className="blocker-strip-title">⏳ Waiting on</div>
+                {waitingOn.map((b) => (
+                  <div key={b.id} className="blocker-row">
+                    <span className="source-badge source-badge-ai">{b.source}</span>
+                    <span className="blocker-item">{b.item || "(unassigned)"}</span>
                     <span className="blocker-reason">{b.reason}</span>
                     <span className="blocker-bic">BIC {b.bic}</span>
                     {b.url && <a className="activity-row-link" href={b.url} target="_blank" rel="noreferrer">↗</a>}
@@ -598,6 +623,17 @@ const ActivityFeed = () => {
                           <span className="summary-group-legend">Blockers</span>
                           {it.blockers.map((b) => (
                             <span key={b.id} className="lane-pill lane-blocker" title={`${b.title || ""} · BIC ${b.bic}`}>
+                              {b.reason}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+
+                      {(it.waiting || []).length > 0 && (
+                        <div className="summary-group">
+                          <span className="summary-group-legend">Waiting on</span>
+                          {it.waiting.map((b) => (
+                            <span key={b.id} className="lane-pill lane-waiting" title={`${b.title || ""} · BIC ${b.bic}`}>
                               {b.reason}
                             </span>
                           ))}

@@ -131,14 +131,25 @@ const BIC = {
 // with a capital I, A&I has "Ball in Court". Two properties on two databases; the casing
 // difference is real and reading the wrong one returns undefined rather than erroring.)
 //
-// Everyone outside the design team. A row whose ball sits with one of these is a row you
-// are waiting on somebody for — which is what "blocked" now means, since the hand-filled
-// `Blocker` select reached 0 of 91 rows and was deleted.
+// Blocked and waiting-on are both derived from the ball — the hand-filled `Blocker` select
+// reached 0 of 91 rows and was deleted — but they are not the same thing, and collapsing
+// them is what made the blocked count mostly our own team.
+//
+// Eleven Ball in Court values, three courts, one/six/four plus blank, and a row sits in
+// exactly one of them. DM is your own work. Six internal parties are a chase down the
+// corridor. Four external ones sit outside the business: those cost programme, come out
+// red in the client export, and are the ones worth raising in a meeting.
+//
+// The failure to guard against is the easy one — quietly widening EXTERNAL_BIC until
+// "blocked" means "not with me" again.
 const EXTERNAL_BIC = new Set([
-  "Client", "Consultant", "Supplier", "Architect", "Contractor",
-  "Project Team", "Production", "Site", "Document Control",
+  "Client", "Consultant", "Architect", "Contractor",
+]);
+const INTERNAL_BIC = new Set([
+  "DT", "Project Team", "Production", "Site", "Supplier", "Document Control",
 ]);
 const isExternalBIC = (bic) => !!bic && EXTERNAL_BIC.has(bic);
+const isInternalBIC = (bic) => !!bic && INTERNAL_BIC.has(bic);
 
 // ── Working-days helper ──────────────────────────────────────────────────────
 function addWorkingDays(dateStr, days) {
@@ -1165,22 +1176,41 @@ async function resolveActionRow(notion, actionRowId) {
 const NOTIFICATIONS_STORE = "cockpit-notifications";
 const NOTIFICATIONS_KEY   = "feed";
 const NOTIFICATIONS_MAX   = 200;
+const NOTIFICATIONS_CAS_TRIES = 8;
 
 // type: "success" | "skip" | "error"
+//
+// The feed is one JSON array under one blob key, so concurrent writers have to coordinate.
+// This used to be a plain read-modify-write, on the assumption that only a handful of
+// ingests land per poll window. That assumption is wrong: the Make scenarios list a whole
+// Dropbox tree and then POST one request per file with Sequential off, so dozens of calls
+// arrive inside the same second, each reads the same array and the last one to write wins.
+// A batch where most files failed therefore looked like silence in the cockpit — which is
+// exactly how a stalled comment ingest hides. Compare-and-swap on the blob's etag instead
+// and retry on a clash, so every entry survives however they interleave.
 async function addNotification({ type, filename, message }) {
+  const entry = {
+    id:       `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    ts:       new Date().toISOString(),
+    type,
+    filename: filename ?? null,
+    message,
+  };
   try {
-    const store   = getStore(NOTIFICATIONS_STORE);
-    const current = (await store.get(NOTIFICATIONS_KEY, { type: "json" })) || [];
-    const entry = {
-      id:       `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      ts:       new Date().toISOString(),
-      type,
-      filename: filename ?? null,
-      message,
-    };
-    // Simple read-modify-write — fine at this volume (a handful of ingests per poll window);
-    // not worth adding locking for the rare case two land in the same instant.
-    await store.setJSON(NOTIFICATIONS_KEY, [entry, ...current].slice(0, NOTIFICATIONS_MAX));
+    const store = getStore(NOTIFICATIONS_STORE);
+    for (let attempt = 0; attempt < NOTIFICATIONS_CAS_TRIES; attempt++) {
+      const { data, etag } = (await store.getWithMetadata(NOTIFICATIONS_KEY, { type: "json" })) ?? {};
+      const current = Array.isArray(data) ? data : [];
+      const result  = await store.setJSON(
+        NOTIFICATIONS_KEY,
+        [entry, ...current].slice(0, NOTIFICATIONS_MAX),
+        etag ? { onlyIfMatch: etag } : { onlyIfNew: true },
+      );
+      // modified === false means someone else wrote in between — re-read and try again.
+      if (result?.modified !== false) return;
+      await new Promise((r) => setTimeout(r, 40 + Math.random() * 160));
+    }
+    console.warn(`[notifications] dropped after ${NOTIFICATIONS_CAS_TRIES} contended writes:`, message);
   } catch (err) {
     console.warn("[notifications] write failed:", err.message);
   }
@@ -2120,9 +2150,13 @@ module.exports = function mountDrawingFlow(app, notion) {
               ? "Revise to the returned comments and resubmit"
               : grade === "Approved" && movesPdfOnGrade(stage)
                 ? "Approved — proceed with production"
-                : isProductionRev
-                  ? "Update drawings for production"
-                  : "Update to next revision";
+                // Grade A is the client accepting the drawing as issued — no mark-ups came
+                // back, so there is nothing to revise. Only B asks for the next revision.
+                : grade === "A"
+                  ? "Accepted as issued — no revision required"
+                  : isProductionRev
+                    ? "Update drawings for production"
+                    : "Update to next revision";
 
         // Completion date: return date + revision days from Projects DB
         // Falls back to today if "Reviewed" was never set on this submission (there is no
@@ -3320,7 +3354,8 @@ module.exports = function mountDrawingFlow(app, notion) {
   async function fetchPosition(q = {}) {
     const { projectId, taskId } = q;
     const errors = [];
-    const empty = { open: 0, blocked: 0, withDM: 0, unassigned: 0, blockers: [], items: { ai: [], rfis: [] } };
+    const empty = { open: 0, blocked: 0, waiting: 0, withDM: 0, unassigned: 0,
+                    blockers: [], waitingRows: [], items: { ai: [], rfis: [] } };
 
     // null scope = global (no relation filter at all).
     let scopeIds = null;
@@ -3378,13 +3413,15 @@ module.exports = function mountDrawingFlow(app, notion) {
       // What is lost is the reason ("Design conflict" vs "Commercial"); what is gained is a
       // blocker list that is actually populated.
       const bic     = getProp(page, "Ball in Court", "select");
-      const blocker = isExternalBIC(bic) ? `Waiting on ${bic}` : null;
+      const blocker = isExternalBIC(bic) ? `Blocked — with ${bic}` : null;
+      const waiting = isInternalBIC(bic) ? `Waiting on ${bic}`       : null;
       return {
         id:       page.id,
         title:    getProp(page, "Note", "title"),
         bic,
         category: getProp(page, "Category",      "select"),
         blocker,
+        waiting,
         created:  page.created_time,
         // When the Email Tracker set a Received date, that — not the row's creation time —
         // is when the clock started on this action.
@@ -3428,6 +3465,13 @@ module.exports = function mountDrawingFlow(app, notion) {
       })) : []),
     ];
 
+    // The other half of the fork, same shape so both lists render alike — but counted
+    // apart, because an internal hold must never reach the blocked number.
+    const waitingRows = ai.filter((r) => r.waiting).map((r) => ({
+      source: "A&I", ref: null, id: r.id, title: r.title,
+      item: r.taskName, reason: r.waiting, bic: r.bic, url: r.url,
+    }));
+
     // An untethered tracked row can never reach an item feed. Surfaced, not swallowed — it
     // is a data-quality problem and hiding it is worse than showing it (§6.4).
     const unassigned = [...ai, ...rfis].filter((r) => !r.taskId).length;
@@ -3435,9 +3479,11 @@ module.exports = function mountDrawingFlow(app, notion) {
     return {
       open:    ai.length + rfis.length,
       blocked: blockers.length,
+      waiting: waitingRows.length,
       withDM:  ai.filter((r) => r.bic === BIC.SUBMITTED).length,   // BIC.SUBMITTED === "DM"
       unassigned,
       blockers,
+      waitingRows,
       items: { ai, rfis },
       ...(errors.length ? { errors } : {}),
     };
@@ -3509,7 +3555,7 @@ module.exports = function mountDrawingFlow(app, notion) {
       if (!byItem.has(id)) {
         byItem.set(id, {
           taskId: id, taskName: name || null, projectName: project || null, taskCode: null,
-          drawings: [], drawingTotal: 0, blockers: [], rfis: [],
+          drawings: [], drawingTotal: 0, blockers: [], waiting: [], rfis: [],
         });
       }
       const e = byItem.get(id);
@@ -3528,6 +3574,7 @@ module.exports = function mountDrawingFlow(app, notion) {
       if (!r.taskId) continue;
       const e = ensure(r.taskId, r.taskName, r.projectName);
       if (r.blocker) e.blockers.push({ id: r.id, title: r.title, reason: r.blocker, bic: r.bic || "—", url: r.url });
+      if (r.waiting) e.waiting.push({  id: r.id, title: r.title, reason: r.waiting, bic: r.bic || "—", url: r.url });
     }
     for (const r of position.items.rfis) {
       if (!r.taskId) continue;
@@ -3773,7 +3820,8 @@ module.exports = function mountDrawingFlow(app, notion) {
       // ── Current Position: open rows across both trackers ───────────────
       const addCurrentPositionSheet = () => {
         const ws = wb.addWorksheet("Current Position");
-        ws.addRow(["Source", "Ref", "Project", "Item", "Title", "Status", "Ball in Court", "Blocker", "Opened", "Days Open"]);
+        ws.addRow(["Source", "Ref", "Project", "Item", "Title", "Status", "Ball in Court",
+                   "Blocked", "Waiting on", "Opened", "Days Open"]);
         if (position) {
           const rows = [
             ...position.items.ai.map((r) => ({
@@ -3781,27 +3829,29 @@ module.exports = function mountDrawingFlow(app, notion) {
               // (§5.3). Every row reaching this sheet is by definition open, so say so,
               // rather than leaving the column blank beside the RFI rows' Raise/Open.
               source: "A&I", ref: "", project: r.projectName, item: r.taskName, title: r.title,
-              status: "Open", bic: r.bic, blocker: r.blocker, since: r.received || r.created,
+              status: "Open", bic: r.bic, blocker: r.blocker, waiting: r.waiting,
+              since: r.received || r.created,
             })),
             ...position.items.rfis.map((r) => ({
               source: "RFI", ref: r.ref, project: r.projectName, item: r.taskName, title: r.title,
               status: r.status, bic: r.bic, blocker: OPEN_RFIS_BLOCK ? "Awaiting RFI response" : null,
-              since: r.raised || r.created,
+              waiting: null, since: r.raised || r.created,
             })),
           ].sort((a, b) => new Date(a.since) - new Date(b.since)); // oldest first — what to chase
           for (const r of rows) {
             const row = ws.addRow([
               r.source, r.ref || "", r.project || "", r.item || "(unassigned)", r.title || "",
-              r.status || "", r.bic || "", r.blocker || "",
+              r.status || "", r.bic || "", r.blocker || "", r.waiting || "",
               r.since ? new Date(r.since) : null, daysOpen(r.since),
             ]);
-            row.getCell(9).numFmt = UK_DATE;
+            row.getCell(10).numFmt = UK_DATE;
           }
         }
-        // Blocker is column H. fetchPosition already nulls an A&I "—" (assessed, nothing
-        // holding it up), so anything left in this column genuinely blocks.
-        highlightBlocked(ws, 10, '$H2<>""');
-        finish(ws, [10, 10, 20, 32, 50, 14, 16, 24, 12, 11]);
+        // Blocked is column H and the red rule tests it alone — an internally-held row
+        // lands in I (Waiting on) and must not redden a client's copy of the sheet. The
+        // two columns are exclusive by construction: one ball, one court.
+        highlightBlocked(ws, 11, '$H2<>""');
+        finish(ws, [10, 10, 20, 32, 50, 14, 16, 24, 24, 12, 11]);
       };
 
       // ── One log sheet per item ─────────────────────────────────────────
