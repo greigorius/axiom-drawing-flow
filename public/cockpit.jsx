@@ -109,6 +109,9 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
   const [busy,       setBusy]       = useState(false);
   const [returnDate, setReturnDate] = useState("");
   const [comment,    setComment]    = useState("");
+  // Which grade was clicked. Set before the await so the button lights up on press and
+  // stays lit until the modal closes, rather than reverting the moment the pointer lifts.
+  const [chosen,     setChosen]     = useState(null);
 
   const isAB  = submission.stage === "AB";
   const isA45 = submission.stage === "A4.5";
@@ -130,10 +133,18 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
       alert("Please enter the date the return was filed on the project system.");
       return;
     }
+    setChosen(grade);
     setBusy(true);
-    await onConfirm(submission.id, grade, returnDate || null, comment.trim() || null);
-    setBusy(false);
-    onClose();
+    try {
+      // handleLogStatus reports its own failures and resolves either way, so the modal
+      // closes on both paths — same as Bounce and Issue. The try/finally is only here so
+      // an unexpected throw hands the buttons back instead of freezing the selection.
+      await onConfirm(submission.id, grade, returnDate || null, comment.trim() || null);
+      onClose();
+    } finally {
+      setBusy(false);
+      setChosen(null);
+    }
   };
 
   return (
@@ -177,11 +188,18 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
         </div>
         <div className="grade-buttons" style={{ marginTop: 16 }}>
           {grades.map((g) => (
-            <button key={g} className={`grade-btn ${g}`} onClick={() => select(g)} disabled={busy}>
+            <button key={g} className={`grade-btn ${g}${chosen === g ? " is-selected" : ""}`}
+              onClick={() => select(g)} disabled={busy} aria-busy={busy && chosen === g}>
               {g}
             </button>
           ))}
         </div>
+        {busy && (
+          <div className="modal-working" role="status" aria-live="polite">
+            <span className="spinner" />
+            <span>Logging grade {chosen} — updating Notion{submission.hasComments ? " and moving the comment PDFs" : ""}…</span>
+          </div>
+        )}
         <div className="modal-actions" style={{ marginTop: 16 }}>
           <button className="btn btn-ghost btn-sm" onClick={onClose} disabled={busy}>Cancel</button>
         </div>

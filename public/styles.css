@@ -341,6 +341,44 @@ main {
 .grade-btn.Approved:hover { border-color: var(--success); color: var(--success); }
 .grade-btn.Rejected:hover { border-color: var(--danger);  color: var(--danger);  }
 
+/* The grade that was clicked stays lit while the request is in flight, and through the
+   moment the modal closes. Without this the button reverts to its resting colour the
+   instant the pointer is released, so the only feedback was the pause itself. */
+.grade-btn.is-selected,
+.grade-btn.is-selected:disabled {
+  opacity: 1;
+  color: var(--bg);
+  font-weight: 700;
+}
+.grade-btn.A.is-selected,
+.grade-btn.Approved.is-selected { background: var(--success); border-color: var(--success); }
+.grade-btn.B.is-selected        { background: var(--warning); border-color: var(--warning); }
+.grade-btn.C.is-selected,
+.grade-btn.Rejected.is-selected { background: var(--danger);  border-color: var(--danger);  }
+.grade-btn.NA.is-selected       { background: var(--text2);   border-color: var(--text2);   }
+
+/* The others recede rather than vanish, so the chosen one reads as the answer. */
+.grade-btn:disabled { cursor: default; }
+.grade-btn:disabled:not(.is-selected) { opacity: 0.35; }
+.grade-btn:disabled:hover { background: var(--bg3); border-color: var(--border); color: var(--text); }
+.grade-btn.is-selected:hover { color: var(--bg); }
+
+/* Progress badge inside a modal — the grade write fans out to Notion, Dropbox moves and
+   the activity log, so it is rarely instant. */
+.modal-working {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg3);
+  font-size: 12px;
+  color: var(--text2);
+}
+.modal-working .spinner { width: 14px; height: 14px; margin: 0; }
+
 /* ─── Blocked / On Hold rows ─────────────────────────────────────────── */
 .queue-row.blocked {
   background: rgba(245, 158, 11, 0.07);
