@@ -2,7 +2,7 @@ const { Client } = require("@notionhq/client");
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 const DRAWINGS_DB = process.env.NOTION_DB_DRAWINGS || "13b210e4582e8168923ff79fa8628b59";
-const COMMENT_PROPS = ["S4 Comment Files", "S5 Comment Files", "A4.5 Comment Files"];
+const COMMENT_PROPS = ["S4 Comments", "S5 Comments", "A4.5 Comments"];
 
 async function queryAll(dbId) {
   const pages = [];

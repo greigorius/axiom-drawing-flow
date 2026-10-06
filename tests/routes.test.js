@@ -231,7 +231,7 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   const subUpd = updates.find((u) => u.page_id === "subI").properties;
   assert.strictEqual(subUpd["DM Action"].select.name, "Review Comments");
   assert.strictEqual(subUpd["Comment Paths"].rich_text[0].text.content, `Drawing Submissions/24-367/05_Client Comments/MC_260910_${DWG}_P02.pdf`);
-  assert.ok(updates.find((u) => u.page_id === "dwg1").properties["S5 Comment Files"]);
+  assert.ok(updates.find((u) => u.page_id === "dwg1").properties["S5 Comments"]);
   ok("cr-ingest (project-level folder) → stage from Issued submission, path stored");
 
   updates.length = 0;
@@ -246,7 +246,7 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(r.status, 200, JSON.stringify(r.json));
   assert.strictEqual(r.json.stage, "S4"); assert.strictEqual(r.json.submissionId, "subS4"); assert.strictEqual(r.json.clientAcronym, "F&P");
   const s4Dwg = updates.find((u) => u.page_id === "dwg1").properties;
-  assert.ok(s4Dwg["S4 Comment Files"]); assert.strictEqual(JSON.stringify(s4Dwg["S4 Client Reviewers"].multi_select), JSON.stringify([{ name: "F&P" }]));
+  assert.ok(s4Dwg["S4 Comments"]); assert.strictEqual(JSON.stringify(s4Dwg["S4 Client Reviewers"].multi_select), JSON.stringify([{ name: "F&P" }]));
   assert.ok(updates.find((u) => u.page_id === "subS4")); assert.ok(!updates.find((u) => u.page_id === "subS5"));
   ok("cr-ingest: 260604_F&P_003_S4_P01_{DrawingNo}.PDF → S4 submission (stage from filename, not the newer S5)");
 
@@ -491,6 +491,60 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.ok(rowsHtml.includes("Accepted as issued — no revision required"), rowsHtml);
   assert.ok(rowsHtml.includes("Update to next revision"), rowsHtml);
   ok("grade email action label: A → accepted as issued, B → update to next revision");
+
+  // ── Typed grade comment ────────────────────────────────────────
+  // A client answers with a marked-up PDF or with words, rarely both. The words arrive
+  // through the grading modal and land in the same `<stage> Comments` field cr-ingest
+  // fills with file links — stamped with the date and grade so successive rounds stay apart.
+  pages.dwgC = { id: "dwgC", properties: { "S4 Comments": rt("260811_AXS_003_S4_P01_EIT.PDF") } };
+  submissions = [{ id: "subC", properties: { "Status": sel("Issued"), "Stage": sel("S4"), "Revision": sel("P01"),
+    "Submission": title(`24-367-003_${DWG}_S4_R1`), "Drawing": rel("dwgC"), "Item": rel() } }];
+  updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/log-status",
+    { params: { id: "subC" }, body: { grade: "B", returnDate: "2026-10-06", comment: "  Plinth setting-out   to be confirmed  " } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  const subC = updates.find((u) => u.page_id === "subC").properties;
+  assert.strictEqual(subC["Grade Comment"].rich_text[0].text.content, "Plinth setting-out   to be confirmed");
+  const dwgC = updates.find((u) => u.page_id === "dwgC").properties["S4 Comments"].rich_text;
+  assert.strictEqual(dwgC.map((x) => x.text.content).join(""),
+    "260811_AXS_003_S4_P01_EIT.PDF, 261006 (B): Plinth setting-out to be confirmed",
+    "the note is appended after what cr-ingest logged, stamped with date and grade");
+  assert.strictEqual(dwgC[0].text.content, "260811_AXS_003_S4_P01_EIT.PDF", "the existing file entry survives intact");
+  ok("log-status: a typed comment is stamped and appended to {stage} Comments, keeping the file entries");
+
+  // No comment typed — nothing written, so grading never blanks the field.
+  updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/log-status", { params: { id: "subC" }, body: { grade: "A" } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  assert.ok(!updates.find((u) => u.page_id === "subC").properties["Grade Comment"]);
+  assert.ok(!(updates.find((u) => u.page_id === "dwgC")?.properties?.["S4 Comments"]));
+  ok("log-status: no comment typed → neither property is touched");
+
+  // PRD has no `<stage> Comments` property, so the note lives on the submission alone.
+  pages.dwgP = { id: "dwgP", properties: {} };
+  submissions = [{ id: "subP", properties: { "Status": sel("Issued"), "Stage": sel("PRD"), "Revision": sel("C01"),
+    "Submission": title(`24-367-004_${DWG}_PRD_R1`), "Drawing": rel("dwgP"), "Item": rel(),
+    "Dropbox Path": { url: `Drawing Submissions/24-367/04_Issued/004_PRD_C01_${DWG}_GF.pdf` } } }];
+  updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/log-status",
+    { params: { id: "subP" }, body: { grade: "Approved", comment: "Factory happy" } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  assert.strictEqual(updates.find((u) => u.page_id === "subP").properties["Grade Comment"].rich_text[0].text.content, "Factory happy");
+  assert.ok(!Object.keys(updates.find((u) => u.page_id === "dwgP")?.properties || {}).some((k) => /Comments$/.test(k)));
+  ok("log-status: PRD keeps the note on the submission — no MDS Comments property to write to");
+
+  // The DT only learns what to change from the email when there was no mark-up to send.
+  submissions = [
+    { id: "gc", properties: { "Status": sel("Graded"), "DT Notified": { checkbox: false }, "Stage": sel("S4"), "Client Grade": sel("B"), "Revision": sel("P01"),
+      "Submission": title(`24-367-003_${DWG}_S4_R1`), "DT": rel("dtAI"), "Drawing": rel(),
+      "Grade Comment": rt('Tighten the reveal <3mm> & re-check "datum"') } },
+  ];
+  webhooks.length = 0;
+  r = await call("POST /api/df/send-grade-emails", { body: {} });
+  const gcHtml = hook("grade-summary").folderBlocks.map((f) => f.drawingsHtml).join("");
+  assert.ok(gcHtml.includes("Tighten the reveal &lt;3mm&gt; &amp; re-check &quot;datum&quot;"),
+    `the note reaches the DT, HTML-escaped: ${gcHtml}`);
+  ok("grade email: a typed comment rides with the drawing row, escaped");
 
   // ── Notification feed survives a parallel batch ─────────────────────
   // Scenario 3 lists a Dropbox tree and POSTs one cr-ingest per comment PDF with Sequential

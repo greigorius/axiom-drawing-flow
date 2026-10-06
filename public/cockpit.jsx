@@ -108,6 +108,7 @@ const BounceModal = ({ submission, onConfirm, onClose }) => {
 const LogStatusModal = ({ submission, onConfirm, onClose }) => {
   const [busy,       setBusy]       = useState(false);
   const [returnDate, setReturnDate] = useState("");
+  const [comment,    setComment]    = useState("");
 
   const isAB  = submission.stage === "AB";
   const isA45 = submission.stage === "A4.5";
@@ -115,6 +116,9 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
   // A4.5 and PRD share the same Approved/Rejected mechanics and file moves.
   const isSignOff = isA45 || isPRD;
   const needsReturnDate = !isAB && !isSignOff;   // S4/S5 have a project-system return date
+  // Only S4/S5/A4.5 carry a `{stage} Comments` property on the MDS. A note typed against
+  // PRD or AB still reaches the submission and the DT's email, it just has no MDS home.
+  const commentsTracked = ["S4", "S5", "A4.5"].includes(submission.stage);
   const grades = (isAB || isSignOff) ? ["Approved", "Rejected"] : ["A", "B", "C", "NA"];
   const hint   = isAB  ? "Approved = As Built accepted · Rejected = revision required"
                : isPRD ? "Approved = Factory sign-off · Rejected = revision required"
@@ -127,7 +131,7 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
       return;
     }
     setBusy(true);
-    await onConfirm(submission.id, grade, returnDate || null);
+    await onConfirm(submission.id, grade, returnDate || null, comment.trim() || null);
     setBusy(false);
     onClose();
   };
@@ -152,6 +156,25 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
             />
           </div>
         )}
+        {/* Optional, and usually empty: a client either sends a marked-up PDF or writes a
+            line. This is the second case — it lands in the same {stage} Comments field the
+            comment PDFs do, and reaches the DT in the grade email. */}
+        <div style={{ margin: "16px 0 4px" }}>
+          <label style={{ fontSize: 12, color: "var(--text2)", display: "block", marginBottom: 4 }}>
+            Comment (optional)
+          </label>
+          <textarea
+            value={comment}
+            onChange={(e) => setComment(e.target.value)}
+            rows={3}
+            placeholder={commentsTracked
+              ? `Client's written comments — saved to ${submission.stage} Comments and sent to the DT`
+              : "Note for the DT — sent with the grade email"}
+            style={{ width: "100%", boxSizing: "border-box", padding: "6px 10px", borderRadius: 6,
+                     border: "1px solid var(--border)", background: "var(--surface2)", color: "var(--text1)",
+                     fontSize: 13, fontFamily: "inherit", resize: "vertical" }}
+          />
+        </div>
         <div className="grade-buttons" style={{ marginTop: 16 }}>
           {grades.map((g) => (
             <button key={g} className={`grade-btn ${g}`} onClick={() => select(g)} disabled={busy}>
@@ -782,13 +805,13 @@ const Cockpit = () => {
     }
   };
 
-  const handleLogStatus = async (id, grade, returnDate) => {
+  const handleLogStatus = async (id, grade, returnDate, comment) => {
     setBusy(id);
     try {
       const res = await fetch(`/api/df/submissions/${id}/log-status`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ grade, ...(returnDate ? { returnDate } : {}) }),
+        body: JSON.stringify({ grade, ...(returnDate ? { returnDate } : {}), ...(comment ? { comment } : {}) }),
       });
       if (!res.ok) {
         const body = await res.json();

@@ -373,6 +373,33 @@ function richTextChunks(str, max = 1900) {
   for (let i = 0; i < (str || "").length; i += max) out.push({ type: "text", text: { content: str.slice(i, i + max) } });
   return out;
 }
+// The DM's typed note is free text going into an HTML email, so it is escaped at the point
+// of render. Everything else in those emails is drawn from controlled vocabularies.
+function escapeHtml(str) {
+  return String(str ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// Append one entry to a `<stage> Comments` rich_text, preserving what is already there and
+// the hyperlinks on it. `link` makes the entry clickable (cr-ingest's file names); a typed
+// note has none. Returns null when the entry is already recorded, so callers can skip the
+// write rather than accumulate duplicates.
+function appendCommentEntry(drawingPage, prop, text, link = null) {
+  const existingRT = drawingPage.properties?.[prop]?.rich_text ?? [];
+  const existing   = existingRT.map((r) => r.text?.content ?? "").join("");
+  if (existing.toLowerCase().includes(text.toLowerCase())) return null;
+  const separator = existingRT.length ? [{ type: "text", text: { content: ", " } }] : [];
+  return { rich_text: [...existingRT, ...separator,
+    { type: "text", text: { content: text, link: link ? { url: link } : null } }] };
+}
+
+// "261006 (B): client happy, plinth setting-out to be confirmed" — the date and grade make it
+// obvious which grading round a note belongs to once there is more than one in the field.
+function stampedComment(text, grade, date) {
+  const dateTag = (date || now()).replace(/-/g, "").slice(2, 8);   // YYYY-MM-DD… → YYMMDD
+  return `${dateTag} (${grade}): ${String(text).trim().replace(/\s+/g, " ")}`;
+}
+
 function readPathList(page, prop) {
   return (getProp(page, prop, "rich_text") || "").split("\n").map((p) => p.trim()).filter(Boolean);
 }
@@ -537,9 +564,12 @@ function parseClientCommentName(baseName) {
   return bad(`Client comment filename should be ${CLIENT_COMMENT_NAME_HINT}`);
 }
 
-// Stages whose client comments are tracked on the MDS (`<stage> Comment Files` / `<stage> Client Reviewers`).
+// Stages whose client comments are tracked on the MDS (`<stage> Comments` / `<stage> Client Reviewers`).
+// `<stage> Comments` holds whichever form the client's response took — a hyperlinked mark-up
+// PDF written by cr-ingest, or a note the DM typed into the grading modal. In practice it is
+// one or the other, not both: a client who marks up a drawing rarely also writes prose.
 // PRD is deliberately absent: the factory grades Approved/Rejected in the Hub rather than
-// returning marked-up PDFs, so there are no `PRD Comment Files` / `PRD Client Reviewers`
+// returning marked-up PDFs, so there are no `PRD Comments` / `PRD Client Reviewers`
 // properties. A PRD comment PDF dropped into 05_Client Comments is rejected by cr-ingest
 // with a clear message. Add "PRD" here (and both MDS properties) if that changes.
 // PRD grade returns written by log-status are unaffected — isGradeReturnName() skips them.
@@ -1580,7 +1610,7 @@ module.exports = function mountDrawingFlow(app, notion) {
           try {
             const dwg = await notion.pages.retrieve({ page_id: drawingIds[0] });
             const stage = getProp(page, "Stage", "select");
-            hasComments = !!getProp(dwg, `${stage} Comment Files`, "rich_text");
+            hasComments = !!getProp(dwg, `${stage} Comments`, "rich_text");
           } catch { /* ignore */ }
           await sleep(100);
         }
@@ -1756,7 +1786,7 @@ module.exports = function mountDrawingFlow(app, notion) {
           if (drawingIds?.length) {
             try {
               const dwg = await getDrawing(drawingIds[0]);
-              hasComments = !!getProp(dwg, `${stage} Comment Files`, "rich_text");
+              hasComments = !!getProp(dwg, `${stage} Comments`, "rich_text");
             } catch { /* drawing fetch failed — leave hasComments false */ }
           }
         }
@@ -2178,6 +2208,10 @@ module.exports = function mountDrawingFlow(app, notion) {
           grade,
           revision,
           action,
+          // The note the DM typed when grading. When the client sent words instead of a
+          // marked-up PDF this is the only thing telling the DT what to change, so it
+          // travels with the row rather than sitting unseen in Notion.
+          comment: getProp(page, "Grade Comment", "rich_text") || null,
           returnDate,
           completionDate,
           revisionDays,
@@ -2222,7 +2256,9 @@ module.exports = function mountDrawingFlow(app, notion) {
               <td style="padding:4px 8px;color:#555;">${d.stage}</td>
               <td style="padding:4px 8px;color:#555;">${d.revision}</td>
               <td style="padding:4px 8px;font-weight:600;color:#333;">${d.grade}</td>
-              <td style="padding:4px 8px;color:#555;">${d.action}</td>
+              <td style="padding:4px 8px;color:#555;">${d.action}${d.comment
+                ? `<div style="margin-top:4px;padding:4px 8px;border-left:2px solid #d0d0d0;color:#333;font-size:12px;">${escapeHtml(d.comment)}</div>`
+                : ""}</td>
               <td style="padding:4px 8px;color:#555;">${d.completionDate}</td>
             </tr>`
           ).join("") + filenameFormatNote;
@@ -2360,7 +2396,7 @@ module.exports = function mountDrawingFlow(app, notion) {
   // /api/df/cr-ingest (below) to populate Notion. The file is NOT renamed at this point —
   // the filename only changes once a human has actually reviewed it. Re-running this scan is
   // safe: /api/df/cr-ingest dedupes by checking whether the filename is already recorded in
-  // Notion's Comment Files field, independent of any `R_` prefix on disk. Replaces continuous
+  // Notion's {Stage} Comments field, independent of any `R_` prefix on disk. Replaces continuous
   // folder-watching (saves Make credits).
 
   app.post("/api/df/scan-comments", async (req, res) => {
@@ -2380,7 +2416,7 @@ module.exports = function mountDrawingFlow(app, notion) {
   //           {ProjectNo}/{Stage}/Client Comments/    (legacy — stage from the folder)
   //
   // Effects:
-  //   MDS drawing   → appends the file (hyperlinked) to `<stage> Comment Files` and the client to
+  //   MDS drawing   → appends the file (hyperlinked) to `<stage> Comments` and the client to
   //                   `<stage> Client Reviewers` (existing values preserved)
   //   Submission    → Ball In Court = DM, DM Action = "Review Comments" (drives the cockpit's
   //                   Review Client Comments column), and the file's Dropbox path is added to
@@ -2457,7 +2493,7 @@ module.exports = function mountDrawingFlow(app, notion) {
         return res.json({ ok: true, matched: false, note: message });
       }
 
-      const commentProp  = `${stage} Comment Files`;
+      const commentProp  = `${stage} Comments`;
       const reviewerProp = `${stage} Client Reviewers`;
 
       // Deduplicate — skip if this filename (with or without R_ prefix) is already recorded.
@@ -2505,7 +2541,7 @@ module.exports = function mountDrawingFlow(app, notion) {
           console.warn(`[cr-ingest] Submission update failed for ${drawingNo} ${stage}:`, err.message);
         }
       } else {
-        console.warn(`[cr-ingest] no Issued submission found for ${drawingNo} ${stage} — Comment Files written but Ball In Court not updated`);
+        console.warn(`[cr-ingest] no Issued submission found for ${drawingNo} ${stage} — ${stage} Comments written but Ball In Court not updated`);
       }
 
       console.log(`[cr-ingest] ${name} → ${drawingNo} ${stage} (${clientAcronym})`);
@@ -2939,7 +2975,11 @@ module.exports = function mountDrawingFlow(app, notion) {
 
   app.patch("/api/df/submissions/:id/log-status", async (req, res) => {
     const { id } = req.params;
-    const { grade, returnDate } = req.body;   // returnDate = date filed on project system (YYYY-MM-DD)
+    // `comment` is the optional note the DM types in the grading modal. A client responds
+    // either by marking up a PDF or by writing a line in an email — rarely both — so this is
+    // the typed half of the same field cr-ingest fills with file links.
+    const { grade, returnDate, comment } = req.body;   // returnDate = date filed on project system (YYYY-MM-DD)
+    const gradeComment = String(comment ?? "").trim();
     let submissionPage;
     try { submissionPage = await notion.pages.retrieve({ page_id: id }); }
     catch (_e) { return res.status(404).json({ ok: false, error: "Submission not found" }); }
@@ -3010,6 +3050,7 @@ module.exports = function mountDrawingFlow(app, notion) {
         // Also clears a "Review Comments" DM Action set by cr-ingest.
         "DM Action":     { select: { name: "Log Status"     } },
         "Client Grade":  { select: { name: grade            } },
+        ...(gradeComment ? { "Grade Comment": { rich_text: richTextChunks(gradeComment) } } : {}),
         "Reviewed":      { date:   { start: gradedAt        } },
         "DT Notified":   { checkbox: false                   },
         "Ball In Court": newBIC ? { select: { name: newBIC    } } : { select: null },
@@ -3021,10 +3062,27 @@ module.exports = function mountDrawingFlow(app, notion) {
       return res.status(500).json({ ok: false, error: "Submission update failed", detail: err.message });
     }
 
+    // Only the three stages with a `<stage> Comments` property get the note mirrored onto
+    // the drawing. PRD and AB have no such property — the note still reaches the submission
+    // and the DT's grade email, it just has nowhere to live on the MDS row.
+    const commentProp  = COMMENT_STAGES.includes(stage) ? `${stage} Comments` : null;
+    const stampedNote  = gradeComment ? stampedComment(gradeComment, grade, statusDate) : null;
+
     for (const drawingId of drawingIds) {
       try {
         const mdsProps = {};
         if (!deferDrawingStatus) mdsProps["Drawing Status"] = { select: { name: drawingStatus } };
+        if (commentProp && stampedNote) {
+          // Read-modify-write: the property already holds whatever cr-ingest logged, and
+          // those entries carry links, so the existing runs are reused rather than rebuilt.
+          try {
+            const dwg      = await notion.pages.retrieve({ page_id: drawingId });
+            const appended = appendCommentEntry(dwg, commentProp, stampedNote);
+            if (appended) mdsProps[commentProp] = appended;
+          } catch (err) {
+            console.warn(`[log-status] could not append the note to ${commentProp} on ${drawingId}:`, err.message);
+          }
+        }
         if (stageMap.statusField) mdsProps[stageMap.statusField] = { select: { name: grade } };
         // Status Date uses the project-system return date (or today if not provided).
         // A4.5 is the exception: C01 Sign Off is a sign-off date, so it is only set when
