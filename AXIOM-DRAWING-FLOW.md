@@ -423,3 +423,8 @@ Tests: `node tests/parsing.test.js` and `node tests/routes.test.js` (no dependen
 Netlify Blobs are mocked). Run both plus `node --check drawing-flow.js` before every push.
 
 When extending the backend, mount new routes in `drawing-flow.js` following the existing pattern. All routes receive `(app, notion)` via the module export. Never add routes directly to `app.js` — that file only mounts the drawing-flow module and the static file server.
+
+
+### Drawings with no client approval
+
+Sketches issued straight to a supplier never go out for review. Tick **No Client Approval** on the MDS drawing and Issue becomes the end of the line: the PDF still moves `03_Ready For Issue` → `04_Issued`, but the submission goes to **Complete**, Drawing Status to **Complete**, and Ball In Court is cleared — no Issued column, no grade to log. The cockpit shows these as **Issue → Supplier** before you press anything, and the Issue modal says it will complete the drawing. Without the tick nothing changes. If the MDS drawing can't be read the normal client route is used, since parking a drawing is recoverable and closing one is not.

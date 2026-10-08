@@ -428,6 +428,53 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   delete env.MAKE_ISSUE_FILES_WEBHOOK;
   ok("issue → issue-files webhook moves every file for that drawing number");
 
+  // ── No client approval: issue is the end of the line ────────────────────
+  // Sketches go straight to a supplier. Before this, they were issued into the Awaiting
+  // Comments column to wait for a grade nobody was ever going to give — 7 of the 79 Sketch
+  // rows were sitting in Client Review when this was written.
+  pages.dwgNCA = { id: "dwgNCA", properties: { "No Client Approval": { checkbox: true } } };
+  pages.dwgNorm = { id: "dwgNorm", properties: { "No Client Approval": { checkbox: false } } };
+  const awaitingIssueSub = (id, drawing) => ({ id, properties: {
+    "Status": sel("Awaiting Issue"), "Stage": sel("S4"), "Drawing": rel(drawing), "Item": rel(),
+    "Submission": title(`24-367-003_${DWG}_S4_R1`), "Revision": sel("P01"),
+    "Dropbox Path": { url: `Drawing Submissions/24-367/03_Ready For Issue/003_S4_P01_${DWG}_GF.pdf` } } });
+
+  env.MAKE_ISSUE_FILES_WEBHOOK = "https://hook/issue";
+  submissions = [awaitingIssueSub("subNCA", "dwgNCA")];
+  webhooks.length = 0; updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/issue", { params: { id: "subNCA" } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  assert.strictEqual(r.json.noClientApproval, true);
+  const ncaSub = updates.find((u) => u.page_id === "subNCA").properties;
+  assert.strictEqual(ncaSub["Status"].select.name, "Complete", "issue completes a no-approval drawing");
+  assert.strictEqual(ncaSub["Ball In Court"].select, null, "nobody holds a finished drawing");
+  assert.strictEqual(ncaSub["BIC Since"].date, null);
+  assert.strictEqual(updates.find((u) => u.page_id === "dwgNCA").properties["Drawing Status"].select.name, "Complete");
+  // The files still move — it is issued, just not for approval.
+  assert.ok(hook("issue-files"), "the PDF and DWGs still move to 04_Issued");
+  ok("issue: No Client Approval → Status Complete, ball put down, files still moved");
+
+  submissions = [awaitingIssueSub("subNorm", "dwgNorm")];
+  webhooks.length = 0; updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/issue", { params: { id: "subNorm" } });
+  assert.strictEqual(r.json.noClientApproval, false);
+  const normSub = updates.find((u) => u.page_id === "subNorm").properties;
+  assert.strictEqual(normSub["Status"].select.name, "Issued", "an ordinary drawing still goes to the client");
+  assert.strictEqual(normSub["Ball In Court"].select.name, "Contractor");
+  assert.strictEqual(updates.find((u) => u.page_id === "dwgNorm").properties["Drawing Status"].select.name, "Client Review");
+  ok("issue: without the flag the client route is unchanged");
+
+  // Reading the flag must never be the thing that closes a drawing early.
+  submissions = [awaitingIssueSub("subMissing", "dwgGone")];
+  webhooks.length = 0; updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/issue", { params: { id: "subMissing" } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  assert.strictEqual(r.json.noClientApproval, false);
+  assert.strictEqual(updates.find((u) => u.page_id === "subMissing").properties["Status"].select.name, "Issued",
+    "an unreadable drawing falls back to the client route — parking a drawing is recoverable, closing one is not");
+  ok("issue: an unreadable MDS drawing falls back to the client route");
+  delete env.MAKE_ISSUE_FILES_WEBHOOK;
+
   // ── Grade emails: folder per stage ─────────────────────────────────────
   submissions = [
     { id: "g1", properties: { "Status": sel("Graded"), "DT Notified": { checkbox: false }, "Stage": sel("S5"), "Client Grade": sel("B"), "Revision": sel("P02"),

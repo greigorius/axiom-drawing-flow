@@ -260,14 +260,24 @@ const IssueModal = ({ submission, onConfirm, onClose }) => {
           {submission.stage} · Rev {submission.revision}
           {submission.dtName ? ` · ${submission.dtName}` : ""}
         </div>
+        {/* Issue means two different things depending on the flag, so say which one. */}
         <p style={{ fontSize: 13, color: "var(--text2)", margin: "16px 0 0" }}>
-          Confirm you have issued the drawings to the client. The PDF moves from <code>03_Ready For Issue</code> to{" "}
-          <code>04_Issued</code> (DWGs stay put), Notion and the MDS are updated, and the DT is notified.
+          {submission.noClientApproval
+            ? <>Confirm you have issued the drawings to the supplier. The PDF moves from <code>03_Ready For Issue</code> to{" "}
+               <code>04_Issued</code> (DWGs stay put), and Notion and the MDS are updated.</>
+            : <>Confirm you have issued the drawings to the client. The PDF moves from <code>03_Ready For Issue</code> to{" "}
+               <code>04_Issued</code> (DWGs stay put), Notion and the MDS are updated, and the DT is notified.</>}
         </p>
+        {submission.noClientApproval && (
+          <p className="issue-nca">
+            <strong>No client approval</strong> — this drawing goes straight to the supplier, so issuing it
+            marks it <strong>Complete</strong>. It leaves the board now; there is no grade to log afterwards.
+          </p>
+        )}
         <div className="modal-actions">
           <button className="btn btn-ghost" onClick={onClose} disabled={busy}>Cancel</button>
           <button className="btn btn-issue" onClick={submit} disabled={busy}>
-            {busy ? "Issuing…" : "Confirm Issue"}
+            {busy ? "Issuing…" : submission.noClientApproval ? "Issue & Complete" : "Confirm Issue"}
           </button>
         </div>
       </div>
@@ -1255,7 +1265,11 @@ const Cockpit = () => {
       case "bounced":           return { cls: "danger", txt: `R${s.qaRound ?? "?"} Bounced` };
       case "submitted":         return { cls: "info",  txt: "Submitted" };
       case "reviewed":          return s.status === "Rejected" ? { cls: "danger", txt: "Bounced" } : { cls: "ok", txt: "Approved" };
-      case "approved":          return s.status === "Awaiting Issue" ? { cls: "ok", txt: "Ready to Issue" } : { cls: "warn", txt: "Awaiting DT Upload" };
+      // A no-approval drawing is issued to a supplier and completed in the same press, so
+      // the pill says so before you reach for the button.
+      case "approved":          return s.status !== "Awaiting Issue" ? { cls: "warn", txt: "Awaiting DT Upload" }
+                                     : s.noClientApproval            ? { cls: "ok",   txt: "Issue → Supplier" }
+                                     :                                 { cls: "ok",   txt: "Ready to Issue" };
       case "awaiting-comments": return { cls: "info",  txt: "Issued" };
       case "comments":          return { cls: "grade", txt: "Review Comments" };
       case "signoff":           return { cls: "warn",  txt: "Sign-Off" };
@@ -1286,7 +1300,9 @@ const Cockpit = () => {
       primary = (
         <button className={`k-act${ready ? " go" : ""}`} disabled={isBusy || !ready}
           onClick={(e) => { e.stopPropagation(); setIssueTarget(s); }}
-          title={ready ? "Issue the drawing" : "Awaiting DT to upload DWGs"}>Issue</button>
+          title={!ready ? "Awaiting DT to upload DWGs"
+               : s.noClientApproval ? "Issue to the supplier — no client approval, marks the drawing Complete"
+               : "Issue the drawing"}>Issue</button>
       );
     }
     // Client comments are reviewed in Drawboard, then graded here — Log Status moves the

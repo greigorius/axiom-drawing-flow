@@ -1791,8 +1791,22 @@ module.exports = function mountDrawingFlow(app, notion) {
           }
         }
 
+        // Sketches issued straight to a supplier never go out for client approval. The flag
+        // lives on the MDS drawing, and the card needs it *before* Issue is pressed, since
+        // for these Issue is the end of the line rather than the start of a review.
+        let noClientApproval = false;
+        if (statusFilter === "Awaiting Issue") {
+          const drawingIds = getProp(page, "Drawing", "relation");
+          if (drawingIds?.length) {
+            try {
+              const dwg = await getDrawing(drawingIds[0]);
+              noClientApproval = getProp(dwg, "No Client Approval", "checkbox") === true;
+            } catch { /* drawing fetch failed — treat as a normal client issue */ }
+          }
+        }
+
         return {
-          id: page.id, title, taskCode, drawingNo, dtName, stage,
+          id: page.id, title, taskCode, drawingNo, dtName, stage, noClientApproval,
           revision:    getProp(page, "Revision",     "select"),
           qaRound:     getProp(page, "QA Round",     "number"),
           status:      getProp(page, "Status",       "select"),
@@ -2747,17 +2761,37 @@ module.exports = function mountDrawingFlow(app, notion) {
     // Everything for this drawing moves 03_Ready For Issue/ → 04_Issued/, filenames unchanged:
     // the PDF (which Notion tracks) plus the DWGs and anything else the DT uploaded alongside it.
     // The PDF's new path is written in the same Notion call; Make matches the rest by drawing number.
+    // Drawings marked `No Client Approval` on the MDS — sketches that go straight to a
+    // supplier — are finished the moment they are issued. There is no client review to
+    // wait for, so they must not land in the Issued columns waiting for a grade that is
+    // never coming. (Until now nothing read this property at all, which is exactly how
+    // sketches ended up parked in Client Review.)
+    let noClientApproval = false;
+    if (drawingIds?.[0]) {
+      try {
+        const dwg = await notion.pages.retrieve({ page_id: drawingIds[0] });
+        noClientApproval = getProp(dwg, "No Client Approval", "checkbox") === true;
+      } catch (err) {
+        // Reading it failed, so fall through to the normal client route: leaving a drawing
+        // in the queue is recoverable, closing one that still needs approval is not.
+        console.warn(`[issue] could not read No Client Approval for ${drawingIds[0]}:`, err.message);
+      }
+    }
+    const issueStatus        = noClientApproval ? "Complete" : "Issued";
+    const issueDrawingStatus = noClientApproval ? "Complete" : drawingStatus;
+
     const issueMove       = computeIssueMove(getProp(submissionPage, "Dropbox Path", "url"));
     const issueFilesHook  = process.env.MAKE_ISSUE_FILES_WEBHOOK;
     const issueDrawingNo  = parseSubmissionTitle(getProp(submissionPage, "Submission", "title"), stage).drawingNo;
 
     try {
       await notion.pages.update({ page_id: id, properties: {
-        "Status":        { select: { name: "Issued"    } },
+        "Status":        { select: { name: issueStatus } },
         "DM Action":     { select: { name: "Approve"   } },
         "Issued":        { date:   { start: issuedDate } },
-        "Ball In Court": { select: { name: bicValue    } },
-        "BIC Since":     { date:   { start: issuedDate } },
+        // Nobody holds a finished drawing, so the ball is put down rather than handed on.
+        "Ball In Court": noClientApproval ? { select: null } : { select: { name: bicValue    } },
+        "BIC Since":     noClientApproval ? { date:   null } : { date:   { start: issuedDate } },
         ...(issueMove ? { "Dropbox Path": { url: toShortDropboxPath(issueMove.to) } } : {}),
       }});
     } catch (err) {
@@ -2792,7 +2826,8 @@ module.exports = function mountDrawingFlow(app, notion) {
     for (const drawingId of drawingIds) {
       try {
         await notion.pages.update({ page_id: drawingId, properties: {
-          "Drawing Status":     { select: { name: drawingStatus } },
+          "Drawing Status":     { select: { name: issueDrawingStatus } },
+          // The submit date is still real and still worth recording, approval or not.
           [stageMap.dateField]: { date:   { start: issuedDate  } },
         }});
       } catch (err) {
@@ -2809,15 +2844,18 @@ module.exports = function mountDrawingFlow(app, notion) {
       source: "Drawing Flow",
       tag:    "#issued",
       author: "DM",
-      entry:  `Drawing ${issueDrawingNo} Rev ${revision} issued to client.`,
+      entry:  noClientApproval
+        ? `Drawing ${issueDrawingNo} Rev ${revision} issued to supplier — no client approval required, drawing complete.`
+        : `Drawing ${issueDrawingNo} Rev ${revision} issued to client.`,
     });
 
     // The DM decision this submission was queued for has been made — close the A&I row.
     await resolveActionRow(notion, getProp(submissionPage, "A&I Row", "rich_text"));
 
     // DT email is batched via POST /api/df/send-dt-emails
-    console.log(`[issue] ${id} => ${drawingStatus}${issueMove ? ` · moved to ${issueMove.to}` : ""}`);
-    res.json({ ok: true, issuedDate, drawingStatus, ...(issueMove ? { movedTo: issueMove.to } : {}), ...(errors.length ? { errors } : {}) });
+    console.log(`[issue] ${id} => ${issueDrawingStatus}${noClientApproval ? " (no client approval — complete)" : ""}${issueMove ? ` · moved to ${issueMove.to}` : ""}`);
+    res.json({ ok: true, issuedDate, drawingStatus: issueDrawingStatus, noClientApproval,
+               ...(issueMove ? { movedTo: issueMove.to } : {}), ...(errors.length ? { errors } : {}) });
   });
 
   // POST /api/df/stage-upload

@@ -379,6 +379,18 @@ main {
 }
 .modal-working .spinner { width: 14px; height: 14px; margin: 0; }
 
+/* A no-approval issue is terminal, so it gets a warning tone rather than body text. */
+.issue-nca {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--warning);
+  border-radius: var(--radius);
+  background: rgba(245, 158, 11, 0.08);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text);
+}
+
 /* ─── Batch grade modal ──────────────────────────────────────────────── */
 /* The list is what makes one grade applied to many drawings safe: you can see exactly
    what you are about to grade before you press anything. */
