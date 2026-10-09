@@ -15,12 +15,29 @@ const { useState, useEffect, useRef, useCallback } = React;
 // it was actually signed off; AB the date the status changed. Leaving these to default to
 // today quietly post-dated anything logged a few days late — and for A4.5 that date is
 // `C01 Sign Off`, which the programme reads.
+// Mirrors STAGE_LOG_STATUS_MAP in drawing-flow.js. Kept here rather than derived from the
+// card so both modals offer exactly what the backend will accept.
+//   QA Rejected — the client's document controller bounced it on paperwork before anyone
+//                 reviewed it. Offered wherever a drawing goes to the client for review.
+//   S3          — coordination, not approval: an outcome, not a grade.
+const STAGE_GRADES = {
+  "S3":   ["Revise", "No Action"],
+  "S4":   ["A", "B", "C", "NA", "QA Rejected"],
+  "S5":   ["A", "B", "C", "NA", "QA Rejected"],
+  "A4.5": ["Approved", "Rejected", "QA Rejected"],
+  "PRD":  ["Approved", "Rejected"],
+  "AB":   ["Approved", "Rejected"],
+};
+// Grades reach CSS as class names, and two of them have a space in them.
+const gradeClass = (g) => String(g).replace(/[^A-Za-z0-9]+/g, "-");
+
 const STATUS_DATE_LABEL = {
   "S4":   "Return date (as filed on project system)",
   "S5":   "Return date (as filed on project system)",
   "A4.5": "Sign-off date (contractor)",
   "PRD":  "Sign-off date (factory)",
   "AB":   "Status date",
+  "S3":   "Date comments received",
 };
 // One stage gives its own label; a batch spanning A4.5/PRD/AB falls back to the neutral
 // one rather than naming a party that is wrong for half the set.
@@ -141,11 +158,13 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
   // Only S4/S5/A4.5 carry a `{stage} Comments` property on the MDS. A note typed against
   // PRD or AB still reaches the submission and the DT's email, it just has no MDS home.
   const commentsTracked = ["S4", "S5", "A4.5"].includes(submission.stage);
-  const grades = (isAB || isSignOff) ? ["Approved", "Rejected"] : ["A", "B", "C", "NA"];
-  const hint   = isAB  ? "Approved = As Built accepted · Rejected = revision required"
+  const isS3   = submission.stage === "S3";
+  const grades = STAGE_GRADES[submission.stage] || ["A", "B", "C", "NA"];
+  const hint   = isS3  ? "Revise = sketch goes back to the DT · No Action = coordination closed"
+               : isAB  ? "Approved = As Built accepted · Rejected = revision required"
                : isPRD ? "Approved = Factory sign-off · Rejected = revision required"
-               : isA45 ? "Approved = Contractor sign-off · Rejected = revision required"
-               : "A = accepted · B = minor revision · C = major revision · NA = not applicable";
+               : isA45 ? "Approved = Contractor sign-off · Rejected = revision required · QA Rejected = bounced by client document control"
+               : "A = accepted · B = minor revision · C = major revision · NA = not applicable · QA Rejected = bounced by client document control";
 
   const select = async (grade) => {
     if (!returnDate) {
@@ -206,7 +225,7 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
         </div>
         <div className="grade-buttons" style={{ marginTop: 16 }}>
           {grades.map((g) => (
-            <button key={g} className={`grade-btn ${g}${chosen === g ? " is-selected" : ""}`}
+            <button key={g} className={`grade-btn ${gradeClass(g)}${chosen === g ? " is-selected" : ""}`}
               onClick={() => select(g)} disabled={busy} aria-busy={busy && chosen === g}>
               {g}
             </button>
@@ -244,10 +263,14 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
 
 const IssueModal = ({ submission, onConfirm, onClose }) => {
   const [busy, setBusy] = useState(false);
+  // Reached from an Approved card: the DT has uploaded no DWGs and the DM is saying there
+  // are none coming. An S3 coordination sketch is the usual case — the PDF is the whole
+  // deliverable, so waiting for a DWG parks it forever.
+  const forcing = submission.status === "Approved";
 
   const submit = async () => {
     setBusy(true);
-    await onConfirm(submission.id);
+    await onConfirm(submission.id, forcing);
     setBusy(false);
     onClose();
   };
@@ -268,6 +291,12 @@ const IssueModal = ({ submission, onConfirm, onClose }) => {
             : <>Confirm you have issued the drawings to the client. The PDF moves from <code>03_Ready For Issue</code> to{" "}
                <code>04_Issued</code> (DWGs stay put), Notion and the MDS are updated, and the DT is notified.</>}
         </p>
+        {forcing && (
+          <p className="issue-nca">
+            <strong>No DWGs uploaded</strong> — this drawing has not reached Awaiting Issue. Issue it
+            anyway only if the PDF is the whole deliverable, as it is for an S3 coordination sketch.
+          </p>
+        )}
         {submission.noClientApproval && (
           <p className="issue-nca">
             <strong>No client approval</strong> — this drawing goes straight to the supplier, so issuing it
@@ -277,7 +306,10 @@ const IssueModal = ({ submission, onConfirm, onClose }) => {
         <div className="modal-actions">
           <button className="btn btn-ghost" onClick={onClose} disabled={busy}>Cancel</button>
           <button className="btn btn-issue" onClick={submit} disabled={busy}>
-            {busy ? "Issuing…" : submission.noClientApproval ? "Issue & Complete" : "Confirm Issue"}
+            {busy ? "Issuing…"
+              : submission.noClientApproval ? "Issue & Complete"
+              : forcing ? "Issue anyway"
+              : "Confirm Issue"}
           </button>
         </div>
       </div>
@@ -300,7 +332,10 @@ const BatchGradeModal = ({ submissions, onConfirm, onClose }) => {
 
   const stages    = [...new Set(submissions.map((s) => s.stage))];
   const isSignOff = stages.every((st) => ["A4.5", "PRD", "AB"].includes(st));
-  const grades    = isSignOff ? ["Approved", "Rejected"] : ["A", "B", "C", "NA"];
+  // Only outcomes every selected stage accepts — a mixed A4.5/PRD batch loses QA Rejected,
+  // which PRD does not have, rather than offering a button half of them would reject.
+  const grades    = stages.map((st) => STAGE_GRADES[st] || [])
+    .reduce((common, g) => common.filter((x) => g.includes(x)), STAGE_GRADES[stages[0]] || []);
   const dateLabel = statusDateLabel(stages);
   const commentsTracked = stages.every((st) => ["S4", "S5", "A4.5"].includes(st));
   // PRD is graded by the factory, every other stage by the client. A set spanning both
@@ -376,7 +411,7 @@ const BatchGradeModal = ({ submissions, onConfirm, onClose }) => {
         {!done && (
           <div className="grade-buttons" style={{ marginTop: 16 }}>
             {grades.map((g) => (
-              <button key={g} className={`grade-btn ${g}${chosen === g ? " is-selected" : ""}`}
+              <button key={g} className={`grade-btn ${gradeClass(g)}${chosen === g ? " is-selected" : ""}`}
                 onClick={() => select(g)} disabled={busy} aria-busy={busy && chosen === g}>
                 {g}
               </button>
@@ -956,10 +991,13 @@ const Cockpit = () => {
     }
   };
 
-  const handleIssue = async (id) => {
+  const handleIssue = async (id, force = false) => {
     setBusy(id);
     try {
-      const res = await fetch(`/api/df/submissions/${id}/issue`, { method: "PATCH" });
+      const res = await fetch(`/api/df/submissions/${id}/issue`, {
+        method: "PATCH",
+        ...(force ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify({ force: true }) } : {}),
+      });
       if (!res.ok) {
         const body = await res.json();
         alert(`Issue failed: ${body.error || res.statusText}${body.detail ? `\n(${body.detail})` : ""}`);
@@ -1297,10 +1335,12 @@ const Cockpit = () => {
     );
     else if (colId === "approved") {
       const ready = s.status === "Awaiting Issue"; // DWGs uploaded → Issue enabled (blue)
+      // Not-ready cards stay secondary rather than disabled: some drawings have no DWGs
+      // coming at all, and the modal is where the DM confirms that.
       primary = (
-        <button className={`k-act${ready ? " go" : ""}`} disabled={isBusy || !ready}
+        <button className={`k-act${ready ? " go" : ""}`} disabled={isBusy}
           onClick={(e) => { e.stopPropagation(); setIssueTarget(s); }}
-          title={!ready ? "Awaiting DT to upload DWGs"
+          title={!ready ? "No DWGs uploaded yet — open to issue anyway if none are coming"
                : s.noClientApproval ? "Issue to the supplier — no client approval, marks the drawing Complete"
                : "Issue the drawing"}>Issue</button>
       );

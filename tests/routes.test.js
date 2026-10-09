@@ -473,7 +473,87 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(updates.find((u) => u.page_id === "subMissing").properties["Status"].select.name, "Issued",
     "an unreadable drawing falls back to the client route — parking a drawing is recoverable, closing one is not");
   ok("issue: an unreadable MDS drawing falls back to the client route");
+
+  // An S3 coordination sketch has no DWGs, so it never reaches Awaiting Issue on its own.
+  // Without the override its three 052 submissions sat at Approved indefinitely.
+  submissions = [{ id: "subS3i", properties: { "Status": sel("Approved"), "Stage": sel("S3"), "Drawing": rel("dwgNorm"), "Item": rel(),
+    "Submission": title(`24-367-052_${DWG}_S3_R1`), "Revision": sel("P01"),
+    "Dropbox Path": { url: `Drawing Submissions/24-367/03_Ready For Issue/052_S3_P01_${DWG}_JE.PDF` } } }];
+  updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/issue", { params: { id: "subS3i" } });
+  assert.strictEqual(r.status, 400, "an Approved card is still refused without the override");
+  assert.match(r.json.error, /Expected Awaiting Issue/);
+  updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/issue", { params: { id: "subS3i" }, body: { force: true } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  assert.strictEqual(updates.find((u) => u.page_id === "subS3i").properties["Status"].select.name, "Issued");
+  ok("issue: force lets the DM issue an Approved card with no DWGs; without it the guard holds");
   delete env.MAKE_ISSUE_FILES_WEBHOOK;
+
+  // ── QA Rejected: the client's document controller, not their reviewer ────
+  // The drawing never reached review \u2014 it was bounced at the gate on paperwork. It is an
+  // outcome of the Awaiting Comments period, so it is logged like a grade, but it must not
+  // land in {stage} Status where an A/B/C belongs.
+  pages.dwgQA = { id: "dwgQA", properties: {} };
+  submissions = [{ id: "subQA", properties: { "Status": sel("Issued"), "Stage": sel("S4"), "Revision": sel("P01"),
+    "Submission": title(`24-367-003_${DWG}_S4_R1`), "Drawing": rel("dwgQA"), "Item": rel() } }];
+  updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/log-status",
+    { params: { id: "subQA" }, body: { grade: "QA Rejected", returnDate: "2026-10-08", comment: "Title block revision wrong" } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  const qaSub = updates.find((u) => u.page_id === "subQA").properties;
+  assert.strictEqual(qaSub["Client Grade"].select.name, "QA Rejected");
+  assert.strictEqual(qaSub["Grade Comment"].rich_text[0].text.content, "Title block revision wrong");
+  const qaDwg = updates.find((u) => u.page_id === "dwgQA").properties;
+  assert.strictEqual(qaDwg["Drawing Status"].select.name, "DT Review", "it goes back to the DT");
+  assert.ok(!qaDwg["S4 Status"], "a QA rejection is not a client grade \u2014 S4 Status stays untouched");
+  assert.ok(!qaDwg["S4 Status Date"], "nor does it stamp the client status date");
+  ok("log-status: QA Rejected returns to the DT without writing a client status");
+
+  // A4.5 QA Rejected must not be treated as a sign-off outcome: no PDF move, no deferral.
+  pages.dwgQA45 = { id: "dwgQA45", properties: {} };
+  submissions = [{ id: "subQA45", properties: { "Status": sel("Issued"), "Stage": sel("A4.5"), "Revision": sel("C01"),
+    "Submission": title(`24-367-003_${DWG}_A4.5_R1`), "Drawing": rel("dwgQA45"), "Item": rel(),
+    "Dropbox Path": { url: `Drawing Submissions/24-367/04_Issued/003_A4.5_C01_${DWG}_GF.pdf` } } }];
+  webhooks.length = 0; updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/log-status",
+    { params: { id: "subQA45" }, body: { grade: "QA Rejected", returnDate: "2026-10-08" } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  assert.strictEqual(r.json.filesMoved.length, 0, "the issued PDF stays in 04_Issued \u2014 it was issued");
+  assert.strictEqual(updates.find((u) => u.page_id === "dwgQA45").properties["Drawing Status"].select.name, "DT Review",
+    "and the status is written now, not deferred to an email that would never finalise it");
+  assert.ok(!updates.find((u) => u.page_id === "dwgQA45").properties["C01 Sign Off"], "a bounce is not a sign-off");
+  ok("log-status: A4.5 QA Rejected moves no PDF and writes DT Review immediately");
+
+  // ── S3 coordination: an outcome, not a grade ────────────────────────────
+  pages.dwgS3 = { id: "dwgS3", properties: {} };
+  const s3Sub = (id) => ({ id, properties: { "Status": sel("Issued"), "Stage": sel("S3"), "Revision": sel("P01"),
+    "Submission": title(`24-367-052_${DWG}_S3_R1`), "Drawing": rel("dwgS3"), "Item": rel() } });
+
+  submissions = [s3Sub("subS3a")];
+  updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/log-status",
+    { params: { id: "subS3a" }, body: { grade: "Revise", returnDate: "2026-10-08", comment: "Architect wants the riser moved" } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  assert.strictEqual(updates.find((u) => u.page_id === "dwgS3").properties["Drawing Status"].select.name, "DT Review");
+
+  submissions = [s3Sub("subS3b")];
+  updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/log-status", { params: { id: "subS3b" }, body: { grade: "No Action", returnDate: "2026-10-08" } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  assert.strictEqual(updates.find((u) => u.page_id === "dwgS3").properties["Drawing Status"].select.name, "Complete");
+  ok("log-status: S3 Revise \u2192 DT Review, No Action \u2192 Complete, neither writes a status field");
+
+  // cr-ingest now accepts S3, which is what lets the architect's mark-ups be tracked at all.
+  submissions = [{ id: "subS3c", properties: { "Status": sel("Issued"), "Stage": sel("S3"), "Revision": sel("P01"),
+    "Submission": title(`24-367-052_${DWG}_S3_R1`), "Drawing": rel("dwg1"), "Item": rel() } }];
+  updates.length = 0;
+  r = await call("POST /api/df/cr-ingest", { body: { filePath: `${R}/24-367/05_Client Comments/261008_AXS_052_S3_P01_${DWG}.PDF`,
+    filename: `261008_AXS_052_S3_P01_${DWG}.PDF` } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  assert.strictEqual(r.json.stage, "S3");
+  assert.ok(updates.find((u) => u.page_id === "dwg1").properties["S3 Comments"], "architect comments land in S3 Comments");
+  ok("cr-ingest: S3 coordination comments are tracked like S4/S5/A4.5");
 
   // ── Grade emails: folder per stage ─────────────────────────────────────
   submissions = [

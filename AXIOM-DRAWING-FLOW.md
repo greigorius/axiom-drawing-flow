@@ -428,3 +428,16 @@ When extending the backend, mount new routes in `drawing-flow.js` following the 
 ### Drawings with no client approval
 
 Sketches issued straight to a supplier never go out for review. Tick **No Client Approval** on the MDS drawing and Issue becomes the end of the line: the PDF still moves `03_Ready For Issue` → `04_Issued`, but the submission goes to **Complete**, Drawing Status to **Complete**, and Ball In Court is cleared — no Issued column, no grade to log. The cockpit shows these as **Issue → Supplier** before you press anything, and the Issue modal says it will complete the drawing. Without the tick nothing changes. If the MDS drawing can't be read the normal client route is used, since parking a drawing is recoverable and closing one is not.
+
+
+### QA rejection by the client's document controller
+
+A drawing can come back during the Awaiting Comments period without ever reaching the reviewer — bounced at the client's document control gate on title block, revision or file naming. **QA Rejected** is a fourth button in the grading modal on **S4, S5 and A4.5**; the date and comment box apply as normal and the reason rides out to the DT in the grade email as *"Rejected by the client's document control — correct the drawing and resubmit"*.
+
+It is logged like a grade but it is not one: `{Stage} Status` and its date are left untouched, since the client never gave a verdict. Drawing Status goes to **DT Review**, and for A4.5 the issued PDF stays in `04_Issued` — it was issued; it was the paperwork that failed. The DT corrects it and resubmits at the next revision.
+
+### S3 — coordination sketches to the architect
+
+S3 sketches carry an official drawing number but often have no DWGs, which used to park them at Approved forever because only a DWG upload reaches Awaiting Issue. The Issue button now opens from an Approved card too and offers **Issue anyway**, with a warning that no DWGs have been uploaded.
+
+S3 is in `COMMENT_STAGES`, so cr-ingest logs the architect's mark-ups into **S3 Comments** and moves the card to Review Client Comments. Closing it off records the date and comments against two outcomes rather than a grade — **Revise** sends the sketch back to the DT (Drawing Status *DT Review*), **No Action** closes the loop (*Complete*). Neither writes a status field, because coordination feedback is not an approval.

@@ -99,11 +99,24 @@ const STAGE_APPROVE_BIC = {
   "AB":   "Project Team",
 };
 
+// A QA rejection comes from the client's document controller, not their reviewer: the
+// drawing never reached review at all, it was bounced at the gate on title block, revision
+// or file naming. It happens during the Awaiting Comments period and is logged like any
+// other outcome — but it is NOT a client status, so it is never written into
+// `{stage} Status`, which would put "QA Rejected" where an A/B/C belongs.
+const QA_REJECTED = "QA Rejected";
+const isQaRejected = (grade) => grade === QA_REJECTED;
+
+// S3 is coordination, not approval: the architect marks up a sketch and the DM decides
+// whether it needs redrawing. Recording that decision is the point — there is no A/B/C to
+// give, so S3 carries outcomes rather than grades and writes no status field.
+const S3_REVISE = "Revise";
+
 const STAGE_LOG_STATUS_MAP = {
-  "S3":   { supported: false, statusField: null,        dateField: null,             grades: []                       },
-  "S4":   { supported: true,  statusField: "S4 Status", dateField: "S4 Status Date", grades: ["A","B","C","NA"]      },
-  "S5":   { supported: true,  statusField: "S5 Status", dateField: "S5 Status Date", grades: ["A","B","C","NA"]      },
-  "A4.5": { supported: true,  statusField: null,         dateField: "C01 Sign Off",    grades: ["Approved","Rejected"] },
+  "S3":   { supported: true,  statusField: null,        dateField: null,             grades: [S3_REVISE,"No Action"] },
+  "S4":   { supported: true,  statusField: "S4 Status", dateField: "S4 Status Date", grades: ["A","B","C","NA",QA_REJECTED] },
+  "S5":   { supported: true,  statusField: "S5 Status", dateField: "S5 Status Date", grades: ["A","B","C","NA",QA_REJECTED] },
+  "A4.5": { supported: true,  statusField: null,         dateField: "C01 Sign Off",    grades: ["Approved","Rejected",QA_REJECTED] },
   // PRD is graded by the factory. Rejected restarts the flow at the next revision,
   // so unlike A4.5's sign-off date, PRD Status Date is written for both outcomes.
   "PRD":  { supported: true,  statusField: "PRD Status", dateField: "PRD Status Date", grades: ["Approved","Rejected"] },
@@ -573,7 +586,7 @@ function parseClientCommentName(baseName) {
 // properties. A PRD comment PDF dropped into 05_Client Comments is rejected by cr-ingest
 // with a clear message. Add "PRD" here (and both MDS properties) if that changes.
 // PRD grade returns written by log-status are unaffected — isGradeReturnName() skips them.
-const COMMENT_STAGES = ["S4", "S5", "A4.5"];
+const COMMENT_STAGES = ["S3", "S4", "S5", "A4.5"];
 
 // Parses a submission name WITHOUT caring about the extension (so it also works for DWGs).
 //   new:    {Item}_{Stage}_{Rev}_{DrawingNo}_{DTInitials}   e.g. 003_S4_P01_EIT-TMJ-AA-B2-D-I-45120_GF
@@ -2186,7 +2199,13 @@ module.exports = function mountDrawingFlow(app, notion) {
 
         // Action label based on grade and revision
         const isProductionRev = revision.toUpperCase().startsWith("C");
-        const action = grade === "C"
+        const action = isQaRejected(grade)
+          ? "Rejected by the client's document control — correct the drawing and resubmit"
+          : stage === "S3"
+            ? (grade === S3_REVISE
+                ? "Update the sketch to the coordination comments and resubmit"
+                : "Coordination closed — no further action")
+          : grade === "C"
           ? "Review this drawing with the DM — do not revise independently"
           : grade === "NA"
             ? "Not applicable — no action required"
@@ -2337,6 +2356,8 @@ module.exports = function mountDrawingFlow(app, notion) {
       //   PRD  → Schedule — factory has signed off, the item is scheduled for production
       //                     (procurement / production supporting docs), then As Built Updates
       // Every other stage already got its Drawing Status written immediately at log-status.
+      // Only the stages that deferred their status reach here (see log-status). A QA
+      // rejection never defers, so it is already DT Review by this point.
       const gradeDrawingStatus = (stage, grade) =>
         grade !== "Approved" ? "DT Review"
         : stage === "PRD"    ? "Schedule"
@@ -2742,10 +2763,17 @@ module.exports = function mountDrawingFlow(app, notion) {
       return res.status(404).json({ ok: false, error: "Submission not found", detail: `${err?.code ?? ""}: ${err?.message ?? err}` });
     }
 
+    // A drawing normally reaches Awaiting Issue when the DT uploads its DWGs. Some never
+    // have any — an S3 coordination sketch goes to the architect as a PDF and that is the
+    // whole deliverable — so those sit at Approved forever with the Issue button greyed
+    // out. `force` is the DM saying there is nothing to wait for.
+    const { force } = req.body || {};
     const currentStatus = getProp(submissionPage, "Status", "select");
-    console.log(`[issue] page retrieved, status: ${currentStatus}`);
-    if (currentStatus !== "Awaiting Issue") {
-      return res.status(400).json({ ok: false, error: `Expected Awaiting Issue, got: ${currentStatus}` });
+    console.log(`[issue] page retrieved, status: ${currentStatus}${force ? " (forced)" : ""}`);
+    const issuableFrom = force ? ["Awaiting Issue", "Approved"] : ["Awaiting Issue"];
+    if (!issuableFrom.includes(currentStatus)) {
+      return res.status(400).json({ ok: false,
+        error: `Expected ${issuableFrom.join(" or ")}, got: ${currentStatus}` });
     }
 
     const stage         = getProp(submissionPage, "Stage",   "select");
@@ -3046,11 +3074,17 @@ module.exports = function mountDrawingFlow(app, notion) {
     // Rejected → DT Review) — not here, since BIC sits with DM until the notify email
     // fires. Skip writing Drawing Status at this step for those stages; every other stage
     // keeps the immediate write.
-    const deferDrawingStatus = movesPdfOnGrade(stage);
+    // A QA rejection moves no PDF, so there is nothing for send-grade-emails to finalise
+    // later — write the status now rather than leaving the drawing in limbo.
+    const deferDrawingStatus = movesPdfOnGrade(stage) && !isQaRejected(grade);
 
-    // Drawing Status: terminal stages override; otherwise use revision prefix
-    const drawingStatus = isTerminalAB  ? "Complete"
-                        : isProductionRev ? "Production Updates"
+    // Drawing Status: terminal stages override; otherwise use revision prefix.
+    //   QA Rejected — back to the DT to correct the paperwork, whatever the stage.
+    //   S3         — Revise sends the sketch back; No Action closes the coordination loop.
+    const drawingStatus = isTerminalAB      ? "Complete"
+                        : isQaRejected(grade) ? "DT Review"
+                        : stage === "S3"    ? (grade === S3_REVISE ? "DT Review" : "Complete")
+                        : isProductionRev   ? "Production Updates"
                         : "Approval Updates";
 
     // BIC: terminal AB → clear; graded → DM until email fired
@@ -3072,8 +3106,10 @@ module.exports = function mountDrawingFlow(app, notion) {
 
     // A4.5 / PRD: the submitted PDF itself moves — Rejected → 05_Client Comments (renamed),
     // Approved → 06_Signed Off.
+    // QA Rejected is not a sign-off outcome: the issued PDF stays in 04_Issued because it
+    // was issued — the client's document controller bounced the paperwork, not the design.
     let pdfMove = null;
-    if (movesPdfOnGrade(stage)) {
+    if (movesPdfOnGrade(stage) && !isQaRejected(grade)) {
       const pdfPath = getProp(submissionPage, "Dropbox Path", "url");
       pdfMove = grade === "Rejected"
         ? computeGradeReturnMove(pdfPath, { itemNo, stage, revision, drawingNo: logStatusDrawingNo, grade, date: gradedAt })
@@ -3121,11 +3157,13 @@ module.exports = function mountDrawingFlow(app, notion) {
             console.warn(`[log-status] could not append the note to ${commentProp} on ${drawingId}:`, err.message);
           }
         }
-        if (stageMap.statusField) mdsProps[stageMap.statusField] = { select: { name: grade } };
+        // Never for a QA rejection: `{stage} Status` holds the client's A/B/C verdict and
+        // the drawing never reached the reviewer.
+        if (stageMap.statusField && !isQaRejected(grade)) mdsProps[stageMap.statusField] = { select: { name: grade } };
         // Status Date uses the project-system return date (or today if not provided).
         // A4.5 is the exception: C01 Sign Off is a sign-off date, so it is only set when
         // Approved. PRD Status Date is a plain status date and writes on both outcomes.
-        if (stageMap.dateField && !(stage === "A4.5" && grade !== "Approved")) {
+        if (stageMap.dateField && !isQaRejected(grade) && !(stage === "A4.5" && grade !== "Approved")) {
           mdsProps[stageMap.dateField] = { date: { start: statusDate } };
         }
         if (Object.keys(mdsProps).length) {
@@ -3150,7 +3188,11 @@ module.exports = function mountDrawingFlow(app, notion) {
       source: "Drawing Flow",
       tag:    "#graded",
       author: "System",
-      entry:  `${stage === "PRD" ? "Factory" : "Client"} grade ${grade} recorded for ${logStatusDrawingNo} Rev ${revision}.`,
+      entry:  isQaRejected(grade)
+        ? `${logStatusDrawingNo} Rev ${revision} rejected by the client's document control — returned to the DT to correct.`
+        : stage === "S3"
+          ? `Coordination comments on ${logStatusDrawingNo} Rev ${revision} closed: ${grade}.`
+          : `${stage === "PRD" ? "Factory" : "Client"} grade ${grade} recorded for ${logStatusDrawingNo} Rev ${revision}.`,
     });
 
     // The DM decision this submission was queued for has been made — close the A&I row.

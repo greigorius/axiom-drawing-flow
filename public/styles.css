@@ -338,6 +338,12 @@ main {
 .grade-btn.B:hover        { border-color: var(--warning); color: var(--warning); }
 .grade-btn.C:hover        { border-color: var(--danger);  color: var(--danger);  }
 .grade-btn.NA:hover       { border-color: var(--text2);   color: var(--text2);   font-size: 13px; }
+/* Outcomes with two words: QA Rejected (client document control) and the S3 pair. They sit
+   beside single letters, so the type scales down rather than wrapping mid-button. */
+.grade-btn.QA-Rejected, .grade-btn.No-Action, .grade-btn.Revise { font-size: 13px; line-height: 1.3; }
+.grade-btn.QA-Rejected:hover { border-color: var(--danger);  color: var(--danger);  }
+.grade-btn.Revise:hover      { border-color: var(--warning); color: var(--warning); }
+.grade-btn.No-Action:hover   { border-color: var(--success); color: var(--success); }
 .grade-btn.Approved:hover { border-color: var(--success); color: var(--success); }
 .grade-btn.Rejected:hover { border-color: var(--danger);  color: var(--danger);  }
 
@@ -356,6 +362,9 @@ main {
 .grade-btn.C.is-selected,
 .grade-btn.Rejected.is-selected { background: var(--danger);  border-color: var(--danger);  }
 .grade-btn.NA.is-selected       { background: var(--text2);   border-color: var(--text2);   }
+.grade-btn.QA-Rejected.is-selected { background: var(--danger);  border-color: var(--danger);  }
+.grade-btn.Revise.is-selected      { background: var(--warning); border-color: var(--warning); }
+.grade-btn.No-Action.is-selected   { background: var(--success); border-color: var(--success); }
 
 /* The others recede rather than vanish, so the chosen one reads as the answer. */
 .grade-btn:disabled { cursor: default; }
