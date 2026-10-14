@@ -287,7 +287,8 @@ Files that don't match are rejected at ingest with a specific reason in the cock
 |----------|---------|-------------|
 | **Scenario 1 — Ingest** | New PDF in any project `01_Pending/` folder (filter: path contains `pending/`) (recursive watch on `Drawing Submissions`) | Calls `POST /api/df/ingest`; backend parses path and filename, creates Submission row |
 | **Scenario 2 — Actions Hub** | Webhook from backend (`MAKE_ACTIONS_WEBHOOK`) | Handles Dropbox file moves (approve/bounce), sends DT notification emails, triggers client review ingest |
-| **Scenario 4 — Issue Files** | Webhook from backend (`MAKE_ISSUE_FILES_WEBHOOK`), action `issue-files` | Lists the project's `03_Ready For Issue/`, moves **every** file whose name carries the issued drawing number (PDF, DWGs, anything else) into `04_Issued/`. A file that can't move is skipped, so one clash can't strand the rest. Without the env var the backend falls back to moving the PDF alone. |
+| **Scenario 3 — Client Comment Ingest** | Webhook (`MAKE_CR_INGEST_WEBHOOK`), fired by the cockpit’s Scan Comments button **and** by the `scan-comments-cron` Netlify scheduled function (08:05/12:05/16:05/20:05 UTC) | Lists `Drawing Submissions` recursively and POSTs each unreviewed comment PDF to `POST /api/df/cr-ingest`. Filtered to `client comments/` paths, non-`R_` names, and files modified in the **last 7 days** — the window keeps a long-standing unreviewed backlog from being re-POSTed on every run, which is what the operations budget actually pays for (one op per file, per run). |
+| **Scenario 4 — Issue Files** | Webhook from backend (`MAKE_ISSUE_FILES_WEBHOOK`), action `issue-files` | Lists the project’s `03_Ready For Issue/`, moves **every** file whose name carries the issued drawing number (PDF, DWGs, anything else) into `04_Issued/`. Without the env var the backend falls back to moving the PDF alone. **A file that can’t move is _not_ skipped:** the move module carries `builtin:Break` (retry 3×, 2 min apart) and the scenario is `sequential`, so a failure parks in the DLQ and every later payload queues behind it indefinitely. This stalled from 8–13 Oct 2026 — ten drawings showed as Issued in Notion while their PDFs sat in `03_Ready For Issue`. Clear the incomplete executions to release the queue. |
 
 ### Make.com Webhook Actions
 
@@ -356,9 +357,14 @@ PORT=3000
   from = "/*"
   to   = "/index.html"
   status = 200
+
+[functions."scan-comments-cron"]
+  schedule = "5 8,12,16,20 * * *"
 ```
 
 All `/api/*` requests are routed to the single Lambda function at `netlify/functions/api.js`, which wraps the Express app via `serverless-http@3.2.0`. The `public/` folder is served as static files.
+
+`netlify/functions/scan-comments-cron.js` is a **scheduled function**, not part of the Express app. It fires Scenario 3’s webhook four times a day, a few minutes after each Scenario 1 ingest poll, so client comments are picked up without anyone pressing Scan Comments. Driving the schedule from Netlify rather than from a Make scenario keeps the trigger off the Make operations budget entirely.
 
 ### Local Development
 
@@ -414,6 +420,26 @@ The backend infers the drawing type (Drawing / Sketch / Model / Schedule) from t
 
 ---
 
+### Rejected files must not fail the HTTP call
+
+`POST /api/df/ingest` and `POST /api/df/cr-ingest` both run behind Make HTTP modules configured
+with **`stopOnHttpError: true`**. On that setting a 4xx does not just fail one file — it aborts the
+whole execution, so every file queued behind it in that poll is dropped until the next run. One
+DT typo could silently stall everyone else’s submissions for four hours.
+
+So the two routes distinguish two kinds of failure:
+
+- **Per-file data problems** — unparseable filename, path not inside a project `01_Pending/`,
+  unknown item, drawing missing from the MDS — return **200** with `{ ok: true, rejected: true,
+  error, detail, received }` via the `rejectedFile()` helper. Make carries on to the next file;
+  the rejection surfaces to the DM in the ingest notification feed, which is where it belongs.
+- **Infrastructure failures** — a Notion lookup or page-create error — still return **5xx** on
+  purpose, so the bundle fails loudly and can be retried.
+
+A malformed request from Make itself (no `filePath` / no `filename`) also still returns 400: it
+would fail on the very first bundle, which makes a broken mapping obvious rather than silent.
+
+
 ## Future Development
 
 - **Workflow 2 (commercial control)** — contract hours vs allocated vs actual, variation handling — see `docs/WORKFLOW-2-BRIEFING.md`. Do not build until explicitly scoped.
@@ -427,7 +453,7 @@ When extending the backend, mount new routes in `drawing-flow.js` following the 
 
 ### Drawings with no client approval
 
-Sketches issued straight to a supplier never go out for review. Tick **No Client Approval** on the MDS drawing and Issue becomes the end of the line: the PDF still moves `03_Ready For Issue` → `04_Issued`, but the submission goes to **Complete**, Drawing Status to **Complete**, and Ball In Court is cleared — no Issued column, no grade to log. The cockpit shows these as **Issue → Supplier** before you press anything, and the Issue modal says it will complete the drawing. Without the tick nothing changes. If the MDS drawing can't be read the normal client route is used, since parking a drawing is recoverable and closing one is not.
+Tick **No Client Approval** on the MDS drawing and the drawing goes to a supplier rather than out for client approval. It is not a terminal state: Issue moves the PDF `03_Ready For Issue` → `04_Issued` as normal and the submission goes to **Issued**, but **Ball In Court becomes Supplier** and **Drawing Status becomes With Supplier** rather than Client Review, so both the board and the MDS say where the drawing actually is. The card stays on the board under Awaiting Comments reading **With Supplier**. Close it off with Revise / No Action when the supplier is done or comments come back. The cockpit shows these as **Issue → Supplier** before you press anything, and the Issue modal says it will complete the drawing. Without the tick nothing changes. If the MDS drawing can't be read the normal client route is used, since parking a drawing is recoverable and closing one is not.
 
 
 ### QA rejection by the client's document controller
@@ -441,3 +467,6 @@ It is logged like a grade but it is not one: `{Stage} Status` and its date are l
 S3 sketches carry an official drawing number but often have no DWGs, which used to park them at Approved forever because only a DWG upload reaches Awaiting Issue. The Issue button now opens from an Approved card too and offers **Issue anyway**, with a warning that no DWGs have been uploaded.
 
 S3 is in `COMMENT_STAGES`, so cr-ingest logs the architect's mark-ups into **S3 Comments** and moves the card to Review Client Comments. Closing it off records the date and comments against two outcomes rather than a grade — **Revise** sends the sketch back to the DT (Drawing Status *DT Review*), **No Action** closes the loop (*Complete*). Neither writes a status field, because coordination feedback is not an approval.
+
+
+**Sketches take coordination outcomes at any stage.** A drawing numbered `-SK-I-`, or anything at stage S3, is closed off with **Revise** / **No Action** rather than A/B/C — whatever stage it was submitted at. The drawing number is the test rather than `Dwg No. Assigned`, because only 79 of the 182 SK-I drawings are tagged *Sketch* (97 have no kind set, 6 are tagged *Drawing*). A sketch outcome never writes `{Stage} Status` or its date.

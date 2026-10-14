@@ -120,7 +120,8 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   ok("ingest v2 with initials → DT from initials");
 
   r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/004_S5_P02_${DWG}.pdf` } });
-  assert.strictEqual(r.status, 400); assert.match(feed[0].message, /initials missing/);
+  assert.strictEqual(r.status, 200); assert.strictEqual(r.json.rejected, true);
+  assert.match(feed[0].message, /initials missing/);
   ok("missing initials → rejected with rename hint");
 
   r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/003_S5_P02_${DWG}_ZZ.pdf` } });
@@ -153,15 +154,18 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   ok("legacy stage-folder ingest still works");
 
   r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/003_${DWG}_P01_GF.pdf` } });
-  assert.strictEqual(r.status, 400); assert.match(feed[0].message, /Old-style filename/);
+  assert.strictEqual(r.status, 200); assert.strictEqual(r.json.rejected, true);
+  assert.match(feed[0].message, /Old-style filename/);
   ok("old-style name in new Pending → clear error");
 
   r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/003_S6_P01_A-101_GF.pdf` } });
-  assert.strictEqual(r.status, 400); assert.match(feed[0].message, /isn't a stage/);
+  assert.strictEqual(r.status, 200); assert.strictEqual(r.json.rejected, true);
+  assert.match(feed[0].message, /isn't a stage/);
   ok("typo'd stage → clear error");
 
   r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/003_S4_P01_${DWG}_GF (Greig's conflicted copy).pdf` } });
-  assert.strictEqual(r.status, 400); assert.match(feed[0].message, /duplicate copy/);
+  assert.strictEqual(r.status, 200); assert.strictEqual(r.json.rejected, true);
+  assert.match(feed[0].message, /duplicate copy/);
   ok("conflicted copy rejected");
 
   // Drawboard save re-surfaces a still-Submitted file → skipped silently
@@ -261,7 +265,8 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   // Bad name → clear feed message
   feed.length = 0;
   r = await call("POST /api/df/cr-ingest", { body: { filePath: `${R}/24-367/05_Client Comments/260604_F&P_003_S6_P01_${DWG}.pdf` } });
-  assert.strictEqual(r.status, 400); assert.match(feed[0].message, /isn't a stage/);
+  assert.strictEqual(r.status, 200); assert.strictEqual(r.json.rejected, true);
+  assert.match(feed[0].message, /isn't a stage/);
   r = await call("POST /api/df/cr-ingest", { body: { filePath: `${R}/24-367/05_Client Comments/260604_F&P_003_AB_P01_${DWG}.pdf` } });
   assert.match(r.json.note, /aren't tracked for AB/);
   ok("cr-ingest: bad stage / untracked stage → feed explains why");
@@ -428,10 +433,11 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   delete env.MAKE_ISSUE_FILES_WEBHOOK;
   ok("issue → issue-files webhook moves every file for that drawing number");
 
-  // ── No client approval: issue is the end of the line ────────────────────
-  // Sketches go straight to a supplier. Before this, they were issued into the Awaiting
-  // Comments column to wait for a grade nobody was ever going to give — 7 of the 79 Sketch
-  // rows were sitting in Client Review when this was written.
+  // ── No client approval: issued to a supplier, not finished ──────────────
+  // The flag says the drawing goes to a supplier instead of out for client approval. It is
+  // NOT a terminal state: the DM still needs to see whether it is sitting with the supplier
+  // or has come back with comments, so the card stays on the board and the ball goes to
+  // Supplier rather than being put down.
   pages.dwgNCA = { id: "dwgNCA", properties: { "No Client Approval": { checkbox: true } } };
   pages.dwgNorm = { id: "dwgNorm", properties: { "No Client Approval": { checkbox: false } } };
   const awaitingIssueSub = (id, drawing) => ({ id, properties: {
@@ -446,13 +452,13 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(r.status, 200, JSON.stringify(r.json));
   assert.strictEqual(r.json.noClientApproval, true);
   const ncaSub = updates.find((u) => u.page_id === "subNCA").properties;
-  assert.strictEqual(ncaSub["Status"].select.name, "Complete", "issue completes a no-approval drawing");
-  assert.strictEqual(ncaSub["Ball In Court"].select, null, "nobody holds a finished drawing");
-  assert.strictEqual(ncaSub["BIC Since"].date, null);
-  assert.strictEqual(updates.find((u) => u.page_id === "dwgNCA").properties["Drawing Status"].select.name, "Complete");
-  // The files still move — it is issued, just not for approval.
+  assert.strictEqual(ncaSub["Status"].select.name, "Issued", "a supplier issue is still an issue, not a completion");
+  assert.strictEqual(ncaSub["Ball In Court"].select.name, "Supplier", "the ball is with the supplier, not put down");
+  assert.ok(ncaSub["BIC Since"].date.start, "and the clock starts, so it can be chased");
+  assert.strictEqual(updates.find((u) => u.page_id === "dwgNCA").properties["Drawing Status"].select.name, "With Supplier",
+    "the MDS says where it actually is, rather than claiming a client review that never happened");
   assert.ok(hook("issue-files"), "the PDF and DWGs still move to 04_Issued");
-  ok("issue: No Client Approval → Status Complete, ball put down, files still moved");
+  ok("issue: No Client Approval → Issued with the ball at Supplier, still on the board");
 
   submissions = [awaitingIssueSub("subNorm", "dwgNorm")];
   webhooks.length = 0; updates.length = 0;
@@ -460,7 +466,7 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(r.json.noClientApproval, false);
   const normSub = updates.find((u) => u.page_id === "subNorm").properties;
   assert.strictEqual(normSub["Status"].select.name, "Issued", "an ordinary drawing still goes to the client");
-  assert.strictEqual(normSub["Ball In Court"].select.name, "Contractor");
+  assert.strictEqual(normSub["Ball In Court"].select.name, "Contractor", "and to the stage's usual party");
   assert.strictEqual(updates.find((u) => u.page_id === "dwgNorm").properties["Drawing Status"].select.name, "Client Review");
   ok("issue: without the flag the client route is unchanged");
 
@@ -470,9 +476,33 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   r = await call("PATCH /api/df/submissions/:id/issue", { params: { id: "subMissing" } });
   assert.strictEqual(r.status, 200, JSON.stringify(r.json));
   assert.strictEqual(r.json.noClientApproval, false);
-  assert.strictEqual(updates.find((u) => u.page_id === "subMissing").properties["Status"].select.name, "Issued",
-    "an unreadable drawing falls back to the client route — parking a drawing is recoverable, closing one is not");
+  assert.strictEqual(updates.find((u) => u.page_id === "subMissing").properties["Ball In Court"].select.name, "Contractor",
+    "an unreadable drawing falls back to the client route");
   ok("issue: an unreadable MDS drawing falls back to the client route");
+
+  // ── Sketches take coordination outcomes at any stage ────────────────────
+  // The drawing number decides, not the stage: an SK-I sketch submitted at S4 is still a
+  // sketch, and 103 of the 182 SK-I drawings are not tagged "Sketch" in the MDS.
+  pages.dwgSk = { id: "dwgSk", properties: {} };
+  const SK = "EIT-TMJ-PP-02-SK-I-34005";
+  const sketchSub = (id, stage) => ({ id, properties: { "Status": sel("Issued"), "Stage": sel(stage), "Revision": sel("P01"),
+    "Submission": title(`24-367-052_${SK}_${stage}_R1`), "Drawing": rel("dwgSk"), "Item": rel() } });
+
+  submissions = [sketchSub("subSk4", "S4")];
+  updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/log-status", { params: { id: "subSk4" }, body: { grade: "B", returnDate: "2026-10-09" } });
+  assert.strictEqual(r.status, 400, "an S4 grade is refused on a sketch");
+  assert.match(r.json.error, /Valid: Revise, No Action/);
+
+  submissions = [sketchSub("subSk4b", "S4")];
+  updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/log-status", { params: { id: "subSk4b" }, body: { grade: "Revise", returnDate: "2026-10-09" } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  const skDwg = updates.find((u) => u.page_id === "dwgSk").properties;
+  assert.strictEqual(skDwg["Drawing Status"].select.name, "DT Review");
+  assert.ok(!skDwg["S4 Status"], '"Revise" is not an A/B/C, so it never reaches S4 Status');
+  assert.ok(!skDwg["S4 Status Date"]);
+  ok("log-status: an SK-I sketch takes Revise / No Action even at S4, and writes no client status");
 
   // An S3 coordination sketch has no DWGs, so it never reaches Awaiting Issue on its own.
   // Without the override its three 052 submissions sat at Approved indefinitely.

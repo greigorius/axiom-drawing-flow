@@ -112,6 +112,19 @@ const isQaRejected = (grade) => grade === QA_REJECTED;
 // give, so S3 carries outcomes rather than grades and writes no status field.
 const S3_REVISE = "Revise";
 
+// A sketch is a coordination document whatever stage it carries. It goes to the architect
+// to be marked up, or straight to a supplier — either way nobody issues an A/B/C against
+// one, so it takes the same two outcomes S3 does.
+//
+// The drawing number is the test, not `Dwg No. Assigned`: of the 182 drawings numbered
+// SK-I only 79 are tagged "Sketch", 97 have no kind set at all and 6 are tagged "Drawing".
+// Keying off the property would have missed more than half of them.
+const isSketchDrawingNo = (drawingNo) => /-SK-I-/i.test(String(drawingNo ?? ""));
+const SKETCH_GRADES     = [S3_REVISE, "No Action"];
+const usesSketchOutcomes = (stage, drawingNo) => stage === "S3" || isSketchDrawingNo(drawingNo);
+const gradesFor = (stage, drawingNo) =>
+  usesSketchOutcomes(stage, drawingNo) ? SKETCH_GRADES : (STAGE_LOG_STATUS_MAP[stage]?.grades ?? []);
+
 const STAGE_LOG_STATUS_MAP = {
   "S3":   { supported: true,  statusField: null,        dateField: null,             grades: [S3_REVISE,"No Action"] },
   "S4":   { supported: true,  statusField: "S4 Status", dateField: "S4 Status Date", grades: ["A","B","C","NA",QA_REJECTED] },
@@ -1315,6 +1328,19 @@ module.exports = function mountDrawingFlow(app, notion) {
   // POST /api/df/ingest
   // Triggered by Make Scenario 1: Make watches Dropbox /Pending/ and calls this endpoint.
 
+  // A per-file DATA problem (unparseable name, unknown item, unknown drawing) must not fail the
+  // HTTP call. Scenario 1's ingest route runs with stopOnHttpError = true, so a 4xx aborts the
+  // entire poll run and every file queued behind this one is silently dropped until the next
+  // poll. Answer 200 with rejected:true so Make carries on to the next file; the notification
+  // feed is what surfaces the rejection to the DM. Genuine infrastructure failures (Notion
+  // lookup/create errors) still return 5xx on purpose, so the bundle fails and can be retried.
+  function rejectedFile(res, { error, detail = null, received = null }) {
+    const body = { ok: true, rejected: true, error };
+    if (detail   !== null) body.detail   = detail;
+    if (received !== null) body.received = received;
+    return res.json(body);
+  }
+
   app.post("/api/df/ingest", async (req, res) => {
     const { filePath, dropboxLink, dropboxPath, shareLink } = req.body;
     if (!filePath) {
@@ -1325,7 +1351,7 @@ module.exports = function mountDrawingFlow(app, notion) {
     const pathParts = parsePath(filePath);
     if (!pathParts) {
       await addNotification({ type: "error", filename: filePath, message: "Not directly inside a project 01_Pending folder (Drawing Submissions/{Project}/01_Pending/)" });
-      return res.status(400).json({ ok: false, error: "Path does not match protocol", received: filePath });
+      return rejectedFile(res, { error: "Path does not match protocol", received: filePath });
     }
     const { projectNo, folderStage, filename, layout } = pathParts;
 
@@ -1358,13 +1384,13 @@ module.exports = function mountDrawingFlow(app, notion) {
     const fileParts = parseFilename(filename);
     if (!fileParts.ok) {
       await addNotification({ type: "error", filename, message: fileParts.error });
-      return res.status(400).json({ ok: false, error: "Filename does not match convention", detail: fileParts.error, received: filename });
+      return rejectedFile(res, { error: "Filename does not match convention", detail: fileParts.error, received: filename });
     }
     // Old-style names carry no stage, so they only work in the legacy per-stage Pending folders.
     if (fileParts.format === "legacy" && !folderStage) {
       const message = "Old-style filename — rename to {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}.pdf (e.g. 003_S4_P01_A-101_GF.pdf)";
       await addNotification({ type: "error", filename, message });
-      return res.status(400).json({ ok: false, error: "Filename does not match convention", detail: message, received: filename });
+      return rejectedFile(res, { error: "Filename does not match convention", detail: message, received: filename });
     }
     const { itemNo, drawingNo, revision, dtInitials } = fileParts;
     // Filename stage wins; the legacy folder stage is only a fallback for old-style names.
@@ -1384,7 +1410,7 @@ module.exports = function mountDrawingFlow(app, notion) {
     }
     if (!taskPage) {
       await addNotification({ type: "error", filename, message: `Task not found for item "${itemNo}" in ${projectNo}` });
-      return res.status(422).json({ ok: false, error: "Task not found", detail: `No Task for item "${itemNo}" in ${projectNo}` });
+      return rejectedFile(res, { error: "Task not found", detail: `No Task for item "${itemNo}" in ${projectNo}` });
     }
 
     try { drawingPage = await findDrawing(notion, drawingNo, taskPage.id); }
@@ -1394,7 +1420,7 @@ module.exports = function mountDrawingFlow(app, notion) {
     }
     if (!drawingPage) {
       await addNotification({ type: "error", filename, message: `Drawing not found in MDS for "${drawingNo}"` });
-      return res.status(422).json({ ok: false, error: "Drawing not found in MDS", detail: `No MDS row for "${drawingNo}"` });
+      return rejectedFile(res, { error: "Drawing not found in MDS", detail: `No MDS row for "${drawingNo}"` });
     }
 
     // DT: the initials in the (required) 5th filename section set the DT. If they don't match
@@ -1807,8 +1833,10 @@ module.exports = function mountDrawingFlow(app, notion) {
         // Sketches issued straight to a supplier never go out for client approval. The flag
         // lives on the MDS drawing, and the card needs it *before* Issue is pressed, since
         // for these Issue is the end of the line rather than the start of a review.
+        // Needed before Issue (the card says where it is going) and after it (the card says
+        // it is with a supplier rather than awaiting client comments).
         let noClientApproval = false;
-        if (statusFilter === "Awaiting Issue") {
+        if (statusFilter === "Awaiting Issue" || statusFilter === "Issued") {
           const drawingIds = getProp(page, "Drawing", "relation");
           if (drawingIds?.length) {
             try {
@@ -2201,7 +2229,7 @@ module.exports = function mountDrawingFlow(app, notion) {
         const isProductionRev = revision.toUpperCase().startsWith("C");
         const action = isQaRejected(grade)
           ? "Rejected by the client's document control — correct the drawing and resubmit"
-          : stage === "S3"
+          : usesSketchOutcomes(stage, drawingNo)
             ? (grade === S3_REVISE
                 ? "Update the sketch to the coordination comments and resubmit"
                 : "Coordination closed — no further action")
@@ -2478,7 +2506,7 @@ module.exports = function mountDrawingFlow(app, notion) {
       const parsed = parseClientCommentName(name.replace(/\.pdf$/i, ""));
       if (!parsed.ok) {
         await addNotification({ type: "error", filename: name, message: parsed.error });
-        return res.status(400).json({ ok: false, error: `Could not parse filename: ${name} — ${parsed.error}` });
+        return rejectedFile(res, { error: `Could not parse filename: ${name} — ${parsed.error}`, received: name });
       }
       const { drawingNo, revision, itemNo } = parsed;
       const clientAcronym = parsed.commenter;
@@ -2789,11 +2817,12 @@ module.exports = function mountDrawingFlow(app, notion) {
     // Everything for this drawing moves 03_Ready For Issue/ → 04_Issued/, filenames unchanged:
     // the PDF (which Notion tracks) plus the DWGs and anything else the DT uploaded alongside it.
     // The PDF's new path is written in the same Notion call; Make matches the rest by drawing number.
-    // Drawings marked `No Client Approval` on the MDS — sketches that go straight to a
-    // supplier — are finished the moment they are issued. There is no client review to
-    // wait for, so they must not land in the Issued columns waiting for a grade that is
-    // never coming. (Until now nothing read this property at all, which is exactly how
-    // sketches ended up parked in Client Review.)
+    // `No Client Approval` on the MDS means the drawing goes to a supplier rather than out
+    // for client approval. It does NOT mean the drawing is finished: issuing it is the
+    // start of a wait, not the end of one, and the DM still needs to see where it sits —
+    // out with the supplier, or back with comments. So the card stays on the board and is
+    // closed off with Revise / No Action like any other sketch. What the flag changes is
+    // who holds it: the ball goes to the Supplier instead of the stage's usual party.
     let noClientApproval = false;
     if (drawingIds?.[0]) {
       try {
@@ -2805,8 +2834,11 @@ module.exports = function mountDrawingFlow(app, notion) {
         console.warn(`[issue] could not read No Client Approval for ${drawingIds[0]}:`, err.message);
       }
     }
-    const issueStatus        = noClientApproval ? "Complete" : "Issued";
-    const issueDrawingStatus = noClientApproval ? "Complete" : drawingStatus;
+    const issueBIC = noClientApproval ? "Supplier" : bicValue;
+    // "Client Review" would be a lie on a drawing that never went to the client. The MDS
+    // now carries `With Supplier` for exactly this, so the schedule reads true on its own
+    // rather than relying on Ball In Court to carry the distinction.
+    const issueDrawingStatus = noClientApproval ? "With Supplier" : drawingStatus;
 
     const issueMove       = computeIssueMove(getProp(submissionPage, "Dropbox Path", "url"));
     const issueFilesHook  = process.env.MAKE_ISSUE_FILES_WEBHOOK;
@@ -2814,12 +2846,11 @@ module.exports = function mountDrawingFlow(app, notion) {
 
     try {
       await notion.pages.update({ page_id: id, properties: {
-        "Status":        { select: { name: issueStatus } },
+        "Status":        { select: { name: "Issued"   } },
         "DM Action":     { select: { name: "Approve"   } },
         "Issued":        { date:   { start: issuedDate } },
-        // Nobody holds a finished drawing, so the ball is put down rather than handed on.
-        "Ball In Court": noClientApproval ? { select: null } : { select: { name: bicValue    } },
-        "BIC Since":     noClientApproval ? { date:   null } : { date:   { start: issuedDate } },
+        "Ball In Court": { select: { name: issueBIC    } },
+        "BIC Since":     { date:   { start: issuedDate } },
         ...(issueMove ? { "Dropbox Path": { url: toShortDropboxPath(issueMove.to) } } : {}),
       }});
     } catch (err) {
@@ -2855,7 +2886,6 @@ module.exports = function mountDrawingFlow(app, notion) {
       try {
         await notion.pages.update({ page_id: drawingId, properties: {
           "Drawing Status":     { select: { name: issueDrawingStatus } },
-          // The submit date is still real and still worth recording, approval or not.
           [stageMap.dateField]: { date:   { start: issuedDate  } },
         }});
       } catch (err) {
@@ -2873,7 +2903,7 @@ module.exports = function mountDrawingFlow(app, notion) {
       tag:    "#issued",
       author: "DM",
       entry:  noClientApproval
-        ? `Drawing ${issueDrawingNo} Rev ${revision} issued to supplier — no client approval required, drawing complete.`
+        ? `Drawing ${issueDrawingNo} Rev ${revision} issued to supplier — no client approval required.`
         : `Drawing ${issueDrawingNo} Rev ${revision} issued to client.`,
     });
 
@@ -2881,8 +2911,8 @@ module.exports = function mountDrawingFlow(app, notion) {
     await resolveActionRow(notion, getProp(submissionPage, "A&I Row", "rich_text"));
 
     // DT email is batched via POST /api/df/send-dt-emails
-    console.log(`[issue] ${id} => ${issueDrawingStatus}${noClientApproval ? " (no client approval — complete)" : ""}${issueMove ? ` · moved to ${issueMove.to}` : ""}`);
-    res.json({ ok: true, issuedDate, drawingStatus: issueDrawingStatus, noClientApproval,
+    console.log(`[issue] ${id} => ${issueDrawingStatus}${issueMove ? ` · moved to ${issueMove.to}` : ""}`);
+    res.json({ ok: true, issuedDate, drawingStatus: issueDrawingStatus, noClientApproval, ballInCourt: issueBIC,
                ...(issueMove ? { movedTo: issueMove.to } : {}), ...(errors.length ? { errors } : {}) });
   });
 
@@ -3057,8 +3087,14 @@ module.exports = function mountDrawingFlow(app, notion) {
     if (!stageMap || !stageMap.supported) {
       return res.status(400).json({ ok: false, error: `Log Status not supported for stage: ${stage}` });
     }
-    if (!stageMap.grades.includes(grade)) {
-      return res.status(400).json({ ok: false, error: `Invalid grade "${grade}" for ${stage}. Valid: ${stageMap.grades.join(", ")}` });
+    // The drawing number decides whether this is a sketch, so parse the title before
+    // validating rather than trusting the stage alone.
+    const titleForGrades = getProp(submissionPage, "Submission", "title");
+    const dwgNoForGrades = parseSubmissionTitle(titleForGrades, stage).drawingNo;
+    const sketchFlow     = usesSketchOutcomes(stage, dwgNoForGrades);
+    const validGrades    = gradesFor(stage, dwgNoForGrades);
+    if (!validGrades.includes(grade)) {
+      return res.status(400).json({ ok: false, error: `Invalid grade "${grade}" for ${stage}. Valid: ${validGrades.join(", ")}` });
     }
 
     const drawingIds       = getProp(submissionPage, "Drawing", "relation");
@@ -3083,7 +3119,7 @@ module.exports = function mountDrawingFlow(app, notion) {
     //   S3         — Revise sends the sketch back; No Action closes the coordination loop.
     const drawingStatus = isTerminalAB      ? "Complete"
                         : isQaRejected(grade) ? "DT Review"
-                        : stage === "S3"    ? (grade === S3_REVISE ? "DT Review" : "Complete")
+                        : sketchFlow        ? (grade === S3_REVISE ? "DT Review" : "Complete")
                         : isProductionRev   ? "Production Updates"
                         : "Approval Updates";
 
@@ -3159,11 +3195,15 @@ module.exports = function mountDrawingFlow(app, notion) {
         }
         // Never for a QA rejection: `{stage} Status` holds the client's A/B/C verdict and
         // the drawing never reached the reviewer.
-        if (stageMap.statusField && !isQaRejected(grade)) mdsProps[stageMap.statusField] = { select: { name: grade } };
+        // Nor for a sketch outcome: "Revise" is not an A/B/C and has no business in the
+        // stage's client-status column, even when the sketch carries an S4 number.
+        if (stageMap.statusField && !isQaRejected(grade) && !sketchFlow) {
+          mdsProps[stageMap.statusField] = { select: { name: grade } };
+        }
         // Status Date uses the project-system return date (or today if not provided).
         // A4.5 is the exception: C01 Sign Off is a sign-off date, so it is only set when
         // Approved. PRD Status Date is a plain status date and writes on both outcomes.
-        if (stageMap.dateField && !isQaRejected(grade) && !(stage === "A4.5" && grade !== "Approved")) {
+        if (stageMap.dateField && !isQaRejected(grade) && !sketchFlow && !(stage === "A4.5" && grade !== "Approved")) {
           mdsProps[stageMap.dateField] = { date: { start: statusDate } };
         }
         if (Object.keys(mdsProps).length) {
@@ -3190,7 +3230,7 @@ module.exports = function mountDrawingFlow(app, notion) {
       author: "System",
       entry:  isQaRejected(grade)
         ? `${logStatusDrawingNo} Rev ${revision} rejected by the client's document control — returned to the DT to correct.`
-        : stage === "S3"
+        : sketchFlow
           ? `Coordination comments on ${logStatusDrawingNo} Rev ${revision} closed: ${grade}.`
           : `${stage === "PRD" ? "Factory" : "Client"} grade ${grade} recorded for ${logStatusDrawingNo} Rev ${revision}.`,
     });

@@ -20,6 +20,16 @@ const { useState, useEffect, useRef, useCallback } = React;
 //   QA Rejected — the client's document controller bounced it on paperwork before anyone
 //                 reviewed it. Offered wherever a drawing goes to the client for review.
 //   S3          — coordination, not approval: an outcome, not a grade.
+// A sketch is a coordination document whatever stage it carries — the architect marks it
+// up or it goes straight to a supplier, and nobody issues an A/B/C against one. The drawing
+// number is the test: most SK-I drawings are not tagged "Sketch" in the MDS.
+const SKETCH_GRADES = ["Revise", "No Action"];
+const isSketchDrawingNo = (drawingNo) => /-SK-I-/i.test(String(drawingNo ?? ""));
+const gradesFor = (stage, drawingNo) =>
+  (stage === "S3" || isSketchDrawingNo(drawingNo))
+    ? SKETCH_GRADES
+    : (STAGE_GRADES[stage] || ["A", "B", "C", "NA"]);
+
 const STAGE_GRADES = {
   "S3":   ["Revise", "No Action"],
   "S4":   ["A", "B", "C", "NA", "QA Rejected"],
@@ -158,8 +168,8 @@ const LogStatusModal = ({ submission, onConfirm, onClose }) => {
   // Only S4/S5/A4.5 carry a `{stage} Comments` property on the MDS. A note typed against
   // PRD or AB still reaches the submission and the DT's email, it just has no MDS home.
   const commentsTracked = ["S4", "S5", "A4.5"].includes(submission.stage);
-  const isS3   = submission.stage === "S3";
-  const grades = STAGE_GRADES[submission.stage] || ["A", "B", "C", "NA"];
+  const isS3   = submission.stage === "S3" || isSketchDrawingNo(submission.drawingNo);
+  const grades = gradesFor(submission.stage, submission.drawingNo);
   const hint   = isS3  ? "Revise = sketch goes back to the DT · No Action = coordination closed"
                : isAB  ? "Approved = As Built accepted · Rejected = revision required"
                : isPRD ? "Approved = Factory sign-off · Rejected = revision required"
@@ -299,16 +309,17 @@ const IssueModal = ({ submission, onConfirm, onClose }) => {
         )}
         {submission.noClientApproval && (
           <p className="issue-nca">
-            <strong>No client approval</strong> — this drawing goes straight to the supplier, so issuing it
-            marks it <strong>Complete</strong>. It leaves the board now; there is no grade to log afterwards.
+            <strong>No client approval</strong> — this goes to the supplier rather than out for approval.
+            The ball moves to <strong>Supplier</strong> and the card stays on the board under Awaiting
+            Comments, so you can see where it sits. Close it off later with Revise or No Action.
           </p>
         )}
         <div className="modal-actions">
           <button className="btn btn-ghost" onClick={onClose} disabled={busy}>Cancel</button>
           <button className="btn btn-issue" onClick={submit} disabled={busy}>
             {busy ? "Issuing…"
-              : submission.noClientApproval ? "Issue & Complete"
               : forcing ? "Issue anyway"
+              : submission.noClientApproval ? "Issue to Supplier"
               : "Confirm Issue"}
           </button>
         </div>
@@ -334,8 +345,8 @@ const BatchGradeModal = ({ submissions, onConfirm, onClose }) => {
   const isSignOff = stages.every((st) => ["A4.5", "PRD", "AB"].includes(st));
   // Only outcomes every selected stage accepts — a mixed A4.5/PRD batch loses QA Rejected,
   // which PRD does not have, rather than offering a button half of them would reject.
-  const grades    = stages.map((st) => STAGE_GRADES[st] || [])
-    .reduce((common, g) => common.filter((x) => g.includes(x)), STAGE_GRADES[stages[0]] || []);
+  const perSub  = submissions.map((sub) => gradesFor(sub.stage, sub.drawingNo));
+  const grades  = perSub.reduce((common, g) => common.filter((x) => g.includes(x)), perSub[0] || []);
   const dateLabel = statusDateLabel(stages);
   const commentsTracked = stages.every((st) => ["S4", "S5", "A4.5"].includes(st));
   // PRD is graded by the factory, every other stage by the client. A set spanning both
@@ -1277,7 +1288,7 @@ const Cockpit = () => {
         onClick: () => handleSendDTEmails(reviewedSelectedIds) } },
     { id: "approved", title: "Approved — Awaiting Issue", accent: "var(--ok)", sub: "DT notified · awaiting DWG upload, then issue", items: approvedItems,
       action: { label: scanUploadsLabel, onClick: handleScanPending, disabled: scanning } },
-    { id: "awaiting-comments", title: "Issued — Awaiting Comments", accent: "var(--info)", sub: "Issued to client, awaiting comments", items: awaitingComments },
+    { id: "awaiting-comments", title: "Issued — Awaiting Comments", accent: "var(--info)", sub: "Out with the client or supplier, awaiting comments", items: awaitingComments },
     { id: "comments", title: "Issued — Review Client Comments", accent: "var(--grade)", sub: "Review in Drawboard, then grade", items: commentItems,
       action: { label: scanCommentsLabel, onClick: handleScanComments, disabled: scanCommentsBusy, count: commentItems.length } },
     { id: "signoff", title: "Issued — Awaiting Sign-Off", accent: "var(--warn)", sub: "A4.5 with client · PRD with factory", items: signoffItems },
@@ -1308,7 +1319,11 @@ const Cockpit = () => {
       case "approved":          return s.status !== "Awaiting Issue" ? { cls: "warn", txt: "Awaiting DT Upload" }
                                      : s.noClientApproval            ? { cls: "ok",   txt: "Issue → Supplier" }
                                      :                                 { cls: "ok",   txt: "Ready to Issue" };
-      case "awaiting-comments": return { cls: "info",  txt: "Issued" };
+      // A supplier issue is not waiting on client comments — it is sitting with the
+      // supplier. Same column, different thing, so the pill says which.
+      case "awaiting-comments": return s.noClientApproval
+        ? { cls: "info", txt: "With Supplier" }
+        : { cls: "info", txt: "Issued" };
       case "comments":          return { cls: "grade", txt: "Review Comments" };
       case "signoff":           return { cls: "warn",  txt: "Sign-Off" };
       case "graded":            return { cls: "grade", txt: "Grade " + (s.clientGrade || "—") };
@@ -1355,7 +1370,9 @@ const Cockpit = () => {
       <button className={`k-act${colId === "awaiting-comments" ? "" : " go"}`}
         onClick={(e) => { e.stopPropagation(); setLogStatusTarget(s); }}
         title={colId === "comments" ? "Review the comment PDF in Drawboard, then grade"
-             : colId === "awaiting-comments" ? "Log the client grade (no comments received — e.g. Status A)"
+             : colId === "awaiting-comments" ? (s.noClientApproval
+                 ? "Close it off — issued to the supplier, no comments expected"
+                 : "Log the client grade (no comments received — e.g. Status A)")
              : "Log the client grade"}>Grade</button>
     );
     return (<>{primary}{hold}</>);
