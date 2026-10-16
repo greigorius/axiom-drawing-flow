@@ -440,6 +440,37 @@ A malformed request from Make itself (no `filePath` / no `filename`) also still 
 would fail on the very first bundle, which makes a broken mapping obvious rather than silent.
 
 
+### A drawing filed in the wrong project folder
+
+The filename is `{Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}` and carries **no project code**, so
+the Dropbox path is the only thing that says which project a submission belongs to. Suffix
+numbers are effectively unique across projects, so `findTask` returned its single candidate
+without ever consulting the project, and the submission was filed under whatever folder the
+PDF happened to be dropped in — right Item, right MDS drawing, wrong project in the title and
+`Dropbox Path`. It happened twice in eight days, silently both times: `97564` S5_R5 under
+24-354, and `27221`/`27229` S5_R3 under 24-367.
+
+For EIT the drawing number does encode the project — `AA` is the Auditorium (24-354), `PP` the
+Observation Hall (24-367) — which is what makes these obvious to a human reading the filename.
+The code does not rely on that mapping, since it only holds for EIT. Instead ingest resolves
+the Task's `Projects` relation and compares the project code against the folder:
+
+- Codes come from `Project Name` (`"24-367 - EIT Observation Hall"` → `24-367`) and are
+  compared **exactly**. The PCSA projects are superseded, but their Items are still in the
+  Tasks DB under `Suffix NNN (PCSA)` names and remain `findTask` candidates — suffix 003 alone
+  resolves to four projects (24-354, 24-354_1, 24-334, 24-367). Treating `24-354_1` as a match
+  for a file in `24-354/` would let live work bind to a superseded item.
+- A mismatch is a **per-file rejection**, not an error: 200 with `rejected: true` and a feed
+  message naming both projects, so the rest of the poll continues.
+- A Task with no resolvable project yields `[]`, which **never blocks** — a false rejection
+  stops legitimate work, which is worse than the mis-filing being guarded against.
+
+`findTask`'s own disambiguation was also broken: it read `Projects` as a **rollup** when it is a
+**relation**, so the lookup always returned `undefined`, the project test never matched, and it
+fell through to `candidates[0]` — picking an arbitrary project's item whenever a suffix was
+shared. It now resolves the relation, and returns no match rather than guessing.
+
+
 ## Future Development
 
 - **Workflow 2 (commercial control)** — contract hours vs allocated vs actual, variation handling — see `docs/WORKFLOW-2-BRIEFING.md`. Do not build until explicitly scoped.

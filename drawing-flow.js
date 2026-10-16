@@ -818,6 +818,54 @@ function now() {
 
 // --- Notion lookups ---
 
+// ── Project ownership ────────────────────────────────────────────────────────────────────
+// The Dropbox path is the ONLY thing that says which project a submission belongs to: the
+// filename is {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials} and carries no project code. So a
+// PDF dropped in the wrong project's 01_Pending still resolves to the right Task — suffix
+// numbers are effectively unique, so findTask returns its single candidate without ever
+// consulting the project — and the submission is then recorded under the WRONG project in
+// its title and Dropbox Path. That happened twice in eight days, silently both times:
+// 97564 S5_R5 filed under 24-354, and 27221/27229 S5_R3 filed under 24-367.
+//
+// Project Name reads "24-367 - EIT Observation Hall", so the code is the part before " - ".
+// Codes are compared EXACTLY, never by substring: "24-354" is a prefix of "24-354_1" (the
+// PCSA project), and an `includes` test would call that a match.
+function projectCodeFromName(name) {
+  const text = String(name ?? "").trim();
+  if (!text) return null;
+  const dash = text.indexOf(" - ");
+  return (dash > 0 ? text.slice(0, dash) : text).trim() || null;
+}
+
+// Compared EXACTLY. The PCSA projects ("24-354_1 - EIT Auditorium (PCSA)") are superseded by
+// their main project, but their Items still sit in the Tasks DB under "Suffix NNN (PCSA)"
+// names, so they remain findTask candidates. Suffix 003 alone resolves to four projects:
+// 24-354, 24-354_1 (PCSA), 24-334 and 24-367. Treating "24-354_1" as a match for a file in
+// 24-354/ would let a live submission bind to the superseded PCSA item depending on the order
+// Notion happened to return candidates. An exact comparison keeps PCSA items out entirely,
+// which is what "superseded" should mean.
+const sameProjectCode = (a, b) => {
+  const left  = String(a ?? "").trim().toLowerCase();
+  const right = String(b ?? "").trim().toLowerCase();
+  return Boolean(left) && left === right;
+};
+
+// The project codes a Task actually belongs to. Returns [] when the relation is empty or a
+// lookup fails — callers must read that as "unknown" and NOT block, because a false
+// rejection stops a legitimate submission at the door, which is worse than the mis-filing
+// this guards against.
+async function taskProjectCodes(notion, taskPage) {
+  const ids = getProp(taskPage, "Projects", "relation");
+  if (!ids?.length) return [];
+  const codes = await Promise.all(ids.map(async (pid) => {
+    try {
+      const page = await withNotionRetry(() => notion.pages.retrieve({ page_id: pid }));
+      return projectCodeFromName(getProp(page, "Project Name", "title"));
+    } catch { return null; }
+  }));
+  return codes.filter(Boolean);
+}
+
 async function findTask(notion, projectNo, itemNo) {
   // "Item No." is a formula property — cannot be used as a query filter.
   // Search for "Suffix NNN" to avoid false matches (e.g. "CLG-111" would match a search for "111").
@@ -844,12 +892,17 @@ async function findTask(notion, projectNo, itemNo) {
   if (!candidates.length) return null;
   if (candidates.length === 1) return candidates[0];
 
+  // Several items share this suffix across projects — the folder's project decides which one.
+  // "Projects" is a RELATION on Tasks, not a rollup: this asked for a rollup, always got
+  // undefined, and so fell through to candidates[0] every time, picking an arbitrary
+  // project's item. Resolve the relation properly instead.
   for (const page of candidates) {
-    const roll  = getProp(page, "Projects", "rollup");
-    const names = roll?.array?.map((r) => r.rich_text?.[0]?.plain_text) ?? [];
-    if (names.some((n) => n?.includes(projectNo))) return page;
+    const codes = await taskProjectCodes(notion, page);
+    if (codes.some((c) => sameProjectCode(c, projectNo))) return page;
   }
-  return candidates[0] ?? null;
+  // Nothing matched the folder's project. Guessing is how a submission ends up filed against
+  // another project's item, so report no match and let the caller reject the file.
+  return null;
 }
 
 // Email subjects only ever give us an item number, never a project — unlike findTask()
@@ -1411,6 +1464,18 @@ module.exports = function mountDrawingFlow(app, notion) {
     if (!taskPage) {
       await addNotification({ type: "error", filename, message: `Task not found for item "${itemNo}" in ${projectNo}` });
       return rejectedFile(res, { error: "Task not found", detail: `No Task for item "${itemNo}" in ${projectNo}` });
+    }
+
+    // The Task exists — but does it belong to the project whose folder this file sits in?
+    // An empty result means "unknown", which never blocks (see taskProjectCodes).
+    let taskProjects = [];
+    try { taskProjects = await taskProjectCodes(notion, taskPage); }
+    catch (err) { console.warn("[ingest] project check skipped:", err.message); }
+    if (taskProjects.length && !taskProjects.some((c) => sameProjectCode(c, projectNo))) {
+      const belongsTo = taskProjects.join(" / ");
+      const message = `Wrong project folder — item ${padItemNo(itemNo)} belongs to ${belongsTo}, but this file is in ${projectNo}. Move it to ${taskProjects[0]}/01_Pending and the next scan will pick it up.`;
+      await addNotification({ type: "error", filename, message });
+      return rejectedFile(res, { error: "Wrong project folder", detail: message, received: filePath });
     }
 
     try { drawingPage = await findDrawing(notion, drawingNo, taskPage.id); }

@@ -37,6 +37,18 @@ const pages = {
   // Real pair from the Tasks DB: a base item and its derivative, whose Item No. formula reads the same.
   task200:  { id: "task200",  properties: { "Item Name": title("Suffix 200 - LIN-804 Soft Cell Wall Panelling"), "Item No.": { formula: { type: "string", string: "200" } }, "Person": rel("dtAI") } },
   task200d: { id: "task200d", properties: { "Item Name": title("Suffix 200_1 - LIN-804 Soft Cell Wall Panelling - Lobby"), "Item No.": { formula: { type: "string", string: "200" } }, "Person": rel("dtAI") } },
+  // Projects. The PCSA variants are superseded by their main project, but their Items are
+  // still in the Tasks DB under "Suffix NNN (PCSA)" names, so they stay findTask candidates.
+  proj354:     { id: "proj354",     properties: { "Project Name": title("24-354 - EIT Auditorium") } },
+  proj367:     { id: "proj367",     properties: { "Project Name": title("24-367 - EIT Observation Hall") } },
+  proj354pcsa: { id: "proj354pcsa", properties: { "Project Name": title("24-354_1 - EIT Auditorium (PCSA)") } },
+  // Suffix 109 lives in 24-354. Its drawings carry AA (Auditorium); a PP/Observation Hall
+  // drawing landing here, or this one landing in 24-367/, is the mis-filing to catch.
+  task109: { id: "task109", properties: { "Item Name": title("Suffix 109 - B2 IWS604 Glazed Curved Blinds"), "Item No.": { formula: { type: "string", string: "109" } }, "Person": rel("dtAI"), "Projects": rel("proj354") } },
+  // Same suffix in the live project and its superseded PCSA twin — PCSA deliberately first,
+  // so a pass that picked candidates[0] would bind to the wrong one.
+  task777:     { id: "task777",     properties: { "Item Name": title("Suffix 777 - Live item"),            "Item No.": { formula: { type: "string", string: "777" } }, "Person": rel("dtAI"), "Projects": rel("proj354") } },
+  task777pcsa: { id: "task777pcsa", properties: { "Item Name": title("Suffix 777 - Superseded (PCSA)"),    "Item No.": { formula: { type: "string", string: "777" } }, "Person": rel("dtAI"), "Projects": rel("proj354pcsa") } },
   dwg1:  { id: "dwg1", properties: { "Drawing Number": title("EIT-TMJ-AA-B2-D-I-45120"), "Dwg No. Assigned": sel(null) } },
   dtGF:  { id: "dtGF", properties: { "Name": title("Greig Fensome"), "Email": { email: "g@x.com" } } },
   dtAI:  { id: "dtAI", properties: { "Name": title("Andrew Isted"), "Email": { email: "a@x.com" } } },
@@ -70,6 +82,8 @@ const notion = {
       // Notion's "contains" returns the derivative too — order deliberately puts it first.
       : f.includes("Suffix 200_1") ? [pages.task200d]
       : f.includes("Suffix 200")   ? [pages.task200d, pages.task200]
+      : f.includes("Suffix 109")   ? [pages.task109]
+      : f.includes("Suffix 777")   ? [pages.task777pcsa, pages.task777]
       : [] };
     if (database_id === "DWGS")  return { results: [pages.dwg1] };
     if (database_id === "TEAM")  return { results: [pages.dtGF, pages.dtAI] };
@@ -143,6 +157,36 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(pi.Submission.title[0].text.content, `24-367-200_1_${DWG}_S4_R1`);
   assert.strictEqual(pi.Stage.select.name, "S4"); assert.strictEqual(pi.Revision.select.name, "P01");
   ok("ingest: 200 → Suffix 200, 200_1 → Suffix 200_1 (derivative items kept apart)");
+
+  // ---- Wrong project folder -----------------------------------------------
+  // The filename carries {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials} and no project code, so
+  // the Dropbox path is the only thing saying which project a submission belongs to. Suffix
+  // numbers are effectively unique, so findTask returns its one candidate without consulting
+  // the project, and the submission used to be filed under whatever folder it was dropped in.
+  const AA = "EIT-TMJ-AA-B2-D-I-27229";
+  r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-354/01_Pending/109_S5_P02_${AA}_AI.pdf` } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  assert.ok(!r.json.rejected, "a correctly filed drawing is not rejected");
+  assert.strictEqual(created[created.length - 1].properties.Item.relation[0].id, "task109");
+  ok("wrong-project: suffix 109 in its own 24-354 folder ingests normally");
+
+  feed.length = 0;
+  const createdBeforeMisfile = created.length;
+  r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/01_Pending/109_S5_P02_${AA}_AI.pdf` } });
+  assert.strictEqual(r.status, 200, "a rejection must not fail the HTTP call — stopOnHttpError would abort the whole poll");
+  assert.strictEqual(r.json.rejected, true);
+  assert.match(r.json.error, /Wrong project folder/);
+  assert.match(r.json.detail, /24-354/);
+  assert.match(r.json.detail, /24-367/);
+  assert.strictEqual(created.length, createdBeforeMisfile, "no submission is created for a mis-filed drawing");
+  assert.match(feed[0].message, /Wrong project folder/);
+  ok("wrong-project: suffix 109 dropped in 24-367 is rejected, not filed under the wrong project");
+
+  r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-354/01_Pending/777_S4_P01_${AA}_AI.pdf` } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  assert.strictEqual(created[created.length - 1].properties.Item.relation[0].id, "task777",
+    "must bind to the live item, not its superseded PCSA twin listed first");
+  ok("wrong-project: a suffix shared with a superseded PCSA item binds to the live project");
 
 
   r = await call("POST /api/df/ingest", { body: { filePath: `${R}/24-367/Pending/004_S5_P02_${DWG}_ZZ.pdf` } });
