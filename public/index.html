@@ -17,6 +17,9 @@
   <script src="/vendor/react.production.min.js"></script>
   <script src="/vendor/react-dom.production.min.js"></script>
   <script src="/vendor/babel.min.js"></script>
+  <!-- Lane rules, loaded before the components so the cockpit and the Netlify functions
+       share one definition of where a drawing sits (see public/lanes.js). -->
+  <script src="/lanes.js"></script>
 
   <!-- Components loaded before app shell -->
   <script type="text/babel" src="/cockpit.jsx"></script>

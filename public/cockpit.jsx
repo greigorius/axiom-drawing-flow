@@ -66,10 +66,47 @@ function stageBadgeClass(stage) {
   return "badge-a45";
 }
 
+// lanes.js is loaded ahead of this file in index.html and is the single definition of
+// which lane a submission sits in — shared with the summary endpoint so the board and the
+// client card can never disagree about where a drawing is.
+const DFLanes = typeof window !== "undefined" ? window.DFLanes : null;
+if (!DFLanes) console.error("[cockpit] lanes.js did not load — the With DT column will be empty");
+
 function daysSince(dateStr) {
   if (!dateStr) return null;
   const diff = Date.now() - new Date(dateStr).getTime();
   return Math.floor(diff / 86400000);
+}
+
+// Whole days until a due date; negative means overdue. Both sides are floored to local
+// midnight so "due today" reads 0 rather than a fraction of a day in either direction.
+function daysUntil(dateStr) {
+  if (!dateStr) return null;
+  const midnight = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); return x.getTime(); };
+  const t = midnight(dateStr);
+  return isNaN(t) ? null : Math.round((t - midnight(Date.now())) / 86400000);
+}
+
+function shortDate(dateStr) {
+  if (!dateStr) return "—";
+  const d = new Date(dateStr);
+  return isNaN(d.getTime()) ? "—" : d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+}
+
+// Due-date chip for a drawing sitting with a DT. The date comes off the Item's programme,
+// so it is the same for every drawing in that item and does not move as QA rounds go by —
+// a chase date, not a per-drawing deadline.
+function dueCls(dateStr) {
+  const d = daysUntil(dateStr);
+  return d == null ? "info" : d < 0 ? "danger" : d <= 3 ? "warn" : "info";
+}
+
+function dueLabel(dateStr) {
+  const d = daysUntil(dateStr);
+  if (d == null) return "";
+  if (d < 0)     return `Due ${shortDate(dateStr)} · ${-d}d late`;
+  if (d === 0)   return "Due today";
+  return `Due ${shortDate(dateStr)}`;
 }
 
 function formatBicSince(dateStr) {
@@ -744,7 +781,7 @@ const Cockpit = () => {
   const [scanError,            setScanError]            = useState(null);
   const [scanCommentsBusy,     setScanCommentsBusy]     = useState(false);
   const [scanCommentsResult,   setScanCommentsResult]   = useState(null);  // "ok" | "error" | null
-  const [bounced,              setBounced]              = useState([]);
+  const [withDT,               setWithDT]               = useState([]);
   const [graded,               setGraded]               = useState([]);
   const [sendGradeEmailsBusy,  setSendGradeEmailsBusy]  = useState(false);
   const [sendGradeResult,      setSendGradeResult]      = useState(null);  // "ok" | "error" | null
@@ -846,24 +883,21 @@ const Cockpit = () => {
       if (newOnes.length && knownIds.current.size > 0) notify(newOnes.length);
       subs.forEach((s) => knownIds.current.add(s.id));
 
-      // For each drawing, find the highest QA Round seen across all submissions.
-      // A bounced submission only shows if it's still the latest round (no resubmission yet).
-      const maxQaByDrawing = {};
-      for (const s of [...subs, ...bounced_, ...approved_, ...await_, ...iss, ...graded_]) {
-        for (const did of (s.drawingIds || [])) {
-          if ((s.qaRound ?? 0) > (maxQaByDrawing[did] ?? 0)) maxQaByDrawing[did] = s.qaRound ?? 0;
-        }
-      }
+      // Column 1 is "what is with the DT": every drawing whose CURRENT submission hands it
+      // back to them — a QA bounce, or a client grade of B / C / Rejected / QA Rejected.
+      // Both clear themselves the moment the new rev lands, because a resubmission becomes
+      // the current submission for that drawing and moves it to Awaiting Review.
+      //
+      // Superseding has to rank stage before QA round, which is why this defers to
+      // latestPerDrawing() rather than comparing rounds: a drawing graded at S4 R2 and
+      // resubmitted at S5 R1 is no longer with the DT even though 1 < 2. A submission with
+      // no Drawing relation keys on its own id there, so it survives as itself.
+      const current = DFLanes
+        ? DFLanes.latestPerDrawing([...subs, ...bounced_, ...approved_, ...await_, ...iss, ...graded_])
+        : [];
 
       setSubmitted(subs);
-      setBounced(
-        bounced_.filter((s) => {
-          if (!s.dtNotified) return false;
-          const ids = s.drawingIds || [];
-          if (!ids.length) return true; // no drawing link — show it
-          return ids.every((did) => (s.qaRound ?? 0) >= (maxQaByDrawing[did] ?? 0));
-        })
-      );
+      setWithDT(current.filter((s) => DFLanes.laneOf(s) === "resubmission"));
       setAwaitingIssue([...approved_, ...await_]);
       setIssued(iss);
       setPendingNotification(pending);
@@ -1280,7 +1314,8 @@ const Cockpit = () => {
   const sendGradeLabel    = sendGradeEmailsBusy ? "Sending…" : "✉ Send DT Email";
 
   const COLS = [
-    { id: "bounced", title: "Bounced — With DT", accent: "var(--danger)", sub: "Returned to DT · awaiting revised resubmission", items: bounced },
+    { id: "resubmission", title: "Resubmission — With DT", accent: "var(--danger)",
+      sub: "Awaiting a new revision · bounced at QA or graded back by the client", items: withDT },
     { id: "submitted", title: "Submitted — Awaiting Review", accent: "var(--info)", sub: "Review in Drawboard · sync before Approve / Bounce", items: submitted,
       action: { label: scanPendingLabel, onClick: handleScanPending, disabled: scanning } },
     { id: "reviewed", title: "Reviewed — Notify DT", accent: "var(--ok)", sub: "Approved / bounced — awaiting DT email", items: reviewedNotify,
@@ -1311,7 +1346,11 @@ const Cockpit = () => {
 
   const statusPill = (colId, s) => {
     switch (colId) {
-      case "bounced":           return { cls: "danger", txt: `R${s.qaRound ?? "?"} Bounced` };
+      // Same column, two routes in — the pill says which, so it is obvious whether the DT
+      // is reworking a QA bounce or incorporating the client's comments.
+      case "resubmission":      return s.status === "Graded"
+        ? { cls: "grade",  txt: `Grade ${s.clientGrade || "—"} · rev due` }
+        : { cls: "danger", txt: `R${s.qaRound ?? "?"} Bounced` };
       case "submitted":         return { cls: "info",  txt: "Submitted" };
       case "reviewed":          return s.status === "Rejected" ? { cls: "danger", txt: "Bounced" } : { cls: "ok", txt: "Approved" };
       // A no-approval drawing is issued to a supplier and completed in the same press, so
@@ -1405,9 +1444,16 @@ const Cockpit = () => {
           <span className={`k-pill ${pill.cls}`}>{pill.txt}</span>
           {s.hasComments && <span className="k-pill danger">New ✦</span>}
           {s.blocked && <span className="k-pill warn">On Hold</span>}
+          {colId === "resubmission" && s.dueDate && (
+            <span className={`k-pill ${dueCls(s.dueDate)}`}
+              title={`Next submission due ${shortDate(s.dueDate)} (item programme date)`}>
+              {dueLabel(s.dueDate)}
+            </span>
+          )}
         </div>
         <div className="k-card-foot">
-          <span className={`k-age ${ageCls}`} title={age == null ? "" : `${age} days in stage`}>{age == null ? "—" : age + "d"}</span>
+          <span className={`k-age ${ageCls}`}
+            title={age == null ? "" : `${age} days ${colId === "resubmission" ? "with the DT" : "in stage"}`}>{age == null ? "—" : age + "d"}</span>
           <span className="k-ava" style={{ background: personColor(s.dtName) }} title={s.dtName || ""}>{initials}</span>
           <span className="k-cardact">{cardActions(colId, s)}</span>
         </div>

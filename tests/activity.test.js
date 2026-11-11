@@ -477,7 +477,7 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(col(r190, "signoff"), 1);
   // The whole point of the lane count: the bounce is superseded, so the cell is empty
   // rather than reporting a drawing that came back weeks ago.
-  assert.ok(col(r190, "bounced") == null, "a superseded bounce leaves the cell empty");
+  assert.ok(col(r190, "resubmission") == null, "a superseded bounce leaves the cell empty");
   ok("export: superseded rounds do not reach the client's spreadsheet");
 
   for (const laneId of LANES.LANE_ORDER) {
@@ -782,8 +782,8 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   const byCode = Object.fromEntries(r.json.items.map((i) => [i.taskCode, i]));
 
   // d1: R1 Rejected superseded by R2 Issued. This is the 24-354-190 case — the naive row
-  // count says "Bounced — With DT 8" where the truthful answer is zero.
-  assert.strictEqual(laneMap(byCode["24-354-190"]).bounced, undefined,
+  // count says "Resubmission — With DT 8" where the truthful answer is zero.
+  assert.strictEqual(laneMap(byCode["24-354-190"]).resubmission, undefined,
     "a bounce with a later round on the same drawing is not current state");
   assert.strictEqual(laneMap(byCode["24-354-190"])["awaiting-comments"], 1,
     "the drawing counts once, at the round it actually sits on");
@@ -903,6 +903,54 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
     console.log("\n" + grid.map((r) => r.map((c, i) => (c || "").padEnd(w[i])).join(" | ")).join("\n"));
     console.log("\nwrote sample-summary.xlsx and sample-combined.xlsx");
   }
+
+  // ── Lane 1: "Resubmission — With DT" ───────────────────────────────────────
+  // The column answers one question: is the ball with the DT? Two routes get it there —
+  // a QA bounce, and a client grade that asks for a new revision — and the lane must not
+  // depend on which.
+  const lane = (s) => LANES.laneOf(s);
+
+  assert.strictEqual(lane({ status: "Rejected", dtNotified: true }), "resubmission",
+    "a notified QA bounce is with the DT");
+  assert.strictEqual(lane({ status: "Rejected", dtNotified: false }), "reviewed",
+    "a bounce the DT has not been told about is still the DM's to send, not theirs to fix");
+  ok("lane 1: a QA bounce reaches the DT only once they have been notified");
+
+  for (const grade of ["B", "C", "Rejected", "QA Rejected"]) {
+    assert.strictEqual(lane({ status: "Graded", dtNotified: true, clientGrade: grade }), "resubmission",
+      `grade ${grade} asks for a new rev, so it is with the DT`);
+  }
+  for (const grade of ["A", "NA"]) {
+    assert.strictEqual(lane({ status: "Graded", dtNotified: true, clientGrade: grade }), "closed",
+      `grade ${grade} asks for nothing further, so it closes`);
+  }
+  assert.strictEqual(lane({ status: "Graded", dtNotified: true, clientGrade: null }), "closed",
+    "an ungraded Graded row closes rather than inventing work for the DT");
+  assert.strictEqual(lane({ status: "Graded", dtNotified: false, clientGrade: "C" }), "graded",
+    "a grade still awaiting its email is the DM's to send");
+  ok("lane 1: B / C / Rejected / QA Rejected go to the DT, A / NA close");
+
+  // The behaviour Greig asked for in so many words: the card disappears when the rev lands.
+  // Both halves are checked — same stage, higher round; and a later stage at a lower round,
+  // which a QA-round comparison alone would get wrong.
+  const s = (o) => Object.assign({ id: o.id, drawingIds: ["dw1"], taskIds: ["t1"], taskCode: "24-354-191" }, o);
+  const gradedBack = s({ id: "g1", stage: "S5", status: "Graded", clientGrade: "C", dtNotified: true, qaRound: 2, submitted: "2026-03-01" });
+
+  let only = LANES.summarise([gradedBack]).byItem["t1"];
+  assert.deepStrictEqual(only.lanes.map((l) => l.id), ["resubmission"],
+    "on its own, a graded-back drawing sits with the DT");
+  assert.strictEqual(only.lanes[0].title, "Resubmission — With DT", "and reads under the new name");
+
+  const resubmitted = s({ id: "g2", stage: "S5", status: "Submitted", qaRound: 3, submitted: "2026-03-20" });
+  only = LANES.summarise([gradedBack, resubmitted]).byItem["t1"];
+  assert.deepStrictEqual(only.lanes.map((l) => l.id), ["submitted"],
+    "the resubmission supersedes it, so the With DT cell clears itself");
+
+  const nextStage = s({ id: "g3", stage: "A4.5", status: "Submitted", qaRound: 1, submitted: "2026-04-01" });
+  only = LANES.summarise([gradedBack, nextStage]).byItem["t1"];
+  assert.deepStrictEqual(only.lanes.map((l) => l.id), ["submitted"],
+    "a later stage clears it too, even though its QA round is lower");
+  ok("lane 1: clears the moment the revision lands, by round or by stage");
 
   console.log(`\n${n} activity tests passed`);
 })().catch((e) => { console.error("FAIL", e); process.exit(1); });

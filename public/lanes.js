@@ -9,7 +9,7 @@
 //
 // The important thing this module knows, and a naive count does not: Submissions is an
 // EVENT LOG, not a state table. One row per submission attempt, so a drawing bounced three
-// times has three Rejected rows. Counting rows gives "Bounced — With DT 30" for 24-354-003
+// times has three Rejected rows. Counting rows gives "Resubmission — With DT 30" for 24-354-003
 // where the truthful figure is 13, and 8 for 24-354-190 where every one has been superseded
 // and the answer is 0. latestPerDrawing() is what makes the counts mean "where things stand".
 
@@ -19,10 +19,10 @@
 })(typeof self !== "undefined" ? self : this, function () {
   "use strict";
 
-  // Board order — the order badges read in, left to right. Bounced first: on a summary card
-  // the thing that needs chasing should be the first thing seen.
+  // Board order — the order badges read in, left to right. Resubmission first: on a summary
+  // card the thing that needs chasing should be the first thing seen.
   var LANES = [
-    { id: "bounced",           title: "Bounced — With DT",               short: "Bounced",           accent: "danger" },
+    { id: "resubmission",      title: "Resubmission — With DT",          short: "With DT",           accent: "danger" },
     { id: "submitted",         title: "Submitted — Awaiting Review",     short: "Submitted",         accent: "info"   },
     { id: "reviewed",          title: "Reviewed — Notify DT",            short: "Notify DT",         accent: "ok"     },
     { id: "approved",          title: "Approved — Awaiting Issue",       short: "Awaiting Issue",    accent: "ok"     },
@@ -30,8 +30,10 @@
     { id: "comments",          title: "Issued — Review Client Comments", short: "Review Comments",   accent: "grade"  },
     { id: "signoff",           title: "Issued — Awaiting Sign-Off",      short: "Awaiting Sign-Off", accent: "warn"   },
     { id: "graded",            title: "Graded — Notify DT",              short: "Graded (notify)",   accent: "grade"  },
-    // Terminal. Never appears on the cockpit board — a graded, DT-notified submission has
-    // left the queue — but it is the whole point of the client card: "these are signed off".
+    // Terminal. Never appears on the cockpit board. Only a grade that asks for nothing
+    // further (A / NA) closes; B, C and the Rejected grades hand the drawing back to the DT
+    // and belong in "resubmission". This lane is the whole point of the client card:
+    // "these are signed off".
     { id: "closed",            title: "Graded — Signed Off",             short: "Signed Off",        accent: "ok"     },
     // Placeholder rows created ahead of a real submission. Counted separately so they are
     // never mistaken for work in flight.
@@ -49,6 +51,13 @@
   var STAGE_RANK = { S2: 1, S3: 2, S4: 3, S5: 4, "A4.5": 5, PRD: 6, AB: 7 };
   function stageRank(stage) { return STAGE_RANK[stage] || 0; }
 
+  // Grades that hand the drawing back to the DT for a new revision. A and NA ask for
+  // nothing further, so they close. "Rejected" is the A4.5/PRD outcome (contractor or
+  // factory said no); "QA Rejected" is the client's document controller bouncing the
+  // paperwork. Both mean the DT owes a new submission, exactly like a QA bounce does.
+  var REVISION_GRADES = { "B": 1, "C": 1, "Rejected": 1, "QA Rejected": 1 };
+  function needsRevision(grade) { return !!REVISION_GRADES[grade]; }
+
   function time(d) { var t = d ? Date.parse(d) : NaN; return isNaN(t) ? 0 : t; }
 
   // Which lane one submission sits in. Mirrors the COLS buckets in cockpit.jsx.
@@ -63,7 +72,7 @@
     if (st === "Schedule") return "scheduled";
     if (st === "Submitted") return "submitted";
     if ((st === "Approved" || st === "Rejected") && !notified) return "reviewed";
-    if (st === "Rejected") return "bounced";
+    if (st === "Rejected") return "resubmission";
     if (st === "Approved" || st === "Awaiting Issue") return "approved";
     if (st === "Issued") {
       if (s.hasComments) return "comments";
@@ -72,7 +81,13 @@
       if (stage === "A4.5" || stage === "PRD") return "signoff";
       return "awaiting-comments";
     }
-    if (st === "Graded") return notified ? "closed" : "graded";
+    if (st === "Graded") {
+      if (!notified) return "graded";
+      // Notified and the grade asks for a new rev: the ball is with the DT, so it belongs
+      // in column 1 rather than dropping off the board. latestPerDrawing() clears it the
+      // moment that rev lands.
+      return needsRevision(s.clientGrade) ? "resubmission" : "closed";
+    }
     return null; // unknown status — counted nowhere rather than counted wrongly
   }
 
@@ -134,6 +149,7 @@
   }
 
   return { LANES: LANES, LANE_ORDER: LANE_ORDER, LANE_TITLE: LANE_TITLE, LANE_SHORT: LANE_SHORT,
-           stageRank: stageRank, laneOf: laneOf, latestPerDrawing: latestPerDrawing,
+           stageRank: stageRank, needsRevision: needsRevision,
+           laneOf: laneOf, latestPerDrawing: latestPerDrawing,
            summarise: summarise };
 });

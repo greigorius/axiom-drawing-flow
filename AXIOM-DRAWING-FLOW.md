@@ -73,7 +73,7 @@ Accessed at the app root (`/`). Designed to sit open permanently on the DM's des
 
 | Column | Source | Description |
 |--------|--------|-------------|
-| **Bounced — With DT** | `Status = Rejected`, `DT Notified = true` | Latest bounced drawings awaiting DT resubmission. Only shows the most recent QA round per drawing (hides older bounces once resubmitted). |
+| **Resubmission — With DT** | `Status = Rejected` **or** `Status = Graded` with `Client Grade` in B / C / Rejected / QA Rejected — in both cases `DT Notified = true` | Everything awaiting a new revision from the DT, whether it was bounced at QA or graded back by the client. One card per drawing, at its current submission only, so a card clears itself as soon as the revision lands. Cards carry days-waiting (from `BIC Since`) and the item's next-delivery due date. |
 | **For Review** | `Status = Submitted` | New submissions awaiting DM QA. Longest waiting shown first (BIC Since). Grouped by task/item. |
 | **Awaiting Issue** | `Status = Approved` + `Status = Awaiting Issue` | Approved drawings waiting for DM to confirm official issue to client. |
 | **Issued** | `Status = Issued` | Drawings issued to client, awaiting client grade (A/B/C/NA). Shows comment file indicator. |
@@ -408,7 +408,18 @@ Each time a drawing is bounced, `QA Round` increments. It resets to 1 when a dra
 
 ### Bounced Column Filter
 
-The "Bounced — With DT" cockpit column only shows the latest bounced submission per drawing. If a DT resubmits (creating a new `Submitted` row with a higher QA Round), the old bounce disappears from the column automatically. Logic: a rejected submission is shown only if its `QA Round` is ≥ the highest round seen for that drawing across all statuses.
+The "Resubmission — With DT" cockpit column answers one question: is the ball with the DT? Two routes get it there — a QA bounce (`Status = Rejected`) and a client grade that asks for a new revision (`Status = Graded` with `Client Grade` B, C, Rejected or QA Rejected). Grades A and NA ask for nothing further, so they close instead.
+
+The column is built by running `DFLanes.latestPerDrawing()` over every fetched status and keeping the rows whose lane is `resubmission`, so a card clears itself the moment the revision lands. Superseding ranks **stage before QA round**: a drawing graded at S4 R2 and resubmitted at A4.5 R1 has left the DT even though `1 < 2`, which a QA-round comparison alone gets wrong. This replaced an earlier client-side `maxQaByDrawing` check that only compared rounds.
+
+Before this, `laneOf()` sent every graded, DT-notified row to the terminal `closed` lane, which never renders on the board — so a grade of B or C vanished from the cockpit the instant the grade emails went out, despite the DT still owing a new rev. That was ~39 live drawings of invisible work.
+
+Two dates appear on each card:
+
+- **Days waiting** — the existing `k-age` chip, from `BIC Since`, amber past 7 days and red past 14.
+- **Due date** — from the Item (not the drawing): `2nd DT Delivery (Adj)`, falling back to `2nd Submission Date (Plan)` then `Constr. DT Delivery (Plan)`. Red when overdue, amber within 3 days. It is a per-item programme date, so it is the same for every drawing on that item and does not advance round to round — a chase date, not a per-drawing deadline. `2nd DT Delivery (Adj)` is used first because it is the field actually maintained: it is set on ~90% of the items that currently have work with a DT, where the per-stage fields are set on under a fifth.
+
+`public/lanes.js` is now loaded in the browser too (a `<script>` in `index.html`, ahead of the components), which is what its header always claimed. Before this it was only ever required by the Netlify function bundle, and the cockpit kept its own duplicate bucket logic.
 
 ### Revision Days
 

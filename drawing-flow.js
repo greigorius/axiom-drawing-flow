@@ -1873,6 +1873,31 @@ module.exports = function mountDrawingFlow(app, notion) {
         return drawingCache.get(id);
       };
 
+      // When the next submission is due from the DT. The programme dates live on the Item,
+      // not the drawing, so this is one read per Item however many drawings hang off it.
+      //
+      // "2nd DT Delivery (Adj)" is the field actually maintained in practice — it is set on
+      // ~90% of the items that currently have work sitting with a DT, where the per-stage
+      // fields ("1st DT Delivery (Plan)", "Constr. DT Delivery (Plan)") are set on under a
+      // fifth. So it leads, with the others as fallbacks rather than as a stage lookup.
+      // It is a per-item date, not per-stage or per-round: it does not advance as QA rounds
+      // go by, so treat it as "when this item is due back", not a per-resubmission deadline.
+      const taskCache = new Map(); // itemId -> Promise<page>
+      const getTask = (id) => {
+        if (!taskCache.has(id)) taskCache.set(id, withNotionRetry(() => notion.pages.retrieve({ page_id: id })));
+        return taskCache.get(id);
+      };
+      const dueDateFor = async (itemIds) => {
+        if (!itemIds?.length) return null;
+        try {
+          const task = await getTask(itemIds[0]);
+          return getProp(task, "2nd DT Delivery (Adj)",      "date")
+              ?? getProp(task, "2nd Submission Date (Plan)", "date")
+              ?? getProp(task, "Constr. DT Delivery (Plan)", "date")
+              ?? null;
+        } catch { return null; }  // no due date is a blank cell, not a failed queue
+      };
+
       const submissions = await mapWithConcurrency(results, 4, async (page) => {
         const title = getProp(page, "Submission", "title");
         const stage = getProp(page, "Stage",      "select");
@@ -1911,8 +1936,14 @@ module.exports = function mountDrawingFlow(app, notion) {
           }
         }
 
+        // Only the two statuses that can be waiting on a DT pay for the Item read.
+        const taskIds = getProp(page, "Item", "relation");
+        const dueDate = (statusFilter === "Rejected" || statusFilter === "Graded")
+          ? await dueDateFor(taskIds)
+          : null;
+
         return {
-          id: page.id, title, taskCode, drawingNo, dtName, stage, noClientApproval,
+          id: page.id, title, taskCode, drawingNo, dtName, stage, noClientApproval, dueDate,
           revision:    getProp(page, "Revision",     "select"),
           qaRound:     getProp(page, "QA Round",     "number"),
           status:      getProp(page, "Status",       "select"),
@@ -1923,7 +1954,7 @@ module.exports = function mountDrawingFlow(app, notion) {
           dropboxPath: getProp(page, "Dropbox Path", "url"),
           shareLink:   getProp(page, "Share Link",   "url"),
           drawingIds:  getProp(page, "Drawing",      "relation"),
-          taskIds:     getProp(page, "Item",         "relation"),
+          taskIds,
           blocked:     getProp(page, "Blocked",      "checkbox") ?? false,
           clientGrade: getProp(page, "Client Grade", "select"),
           dtNotified:  getProp(page, "DT Notified",  "checkbox") ?? false,
@@ -3838,7 +3869,7 @@ module.exports = function mountDrawingFlow(app, notion) {
 
     // Most pressing first: blocked items, then most drawings needing attention.
     const attention = (e) => e.drawings
-      .filter((l) => l.id === "bounced" || l.id === "comments" || l.id === "reviewed")
+      .filter((l) => l.id === "resubmission" || l.id === "comments" || l.id === "reviewed")
       .reduce((n, l) => n + l.n, 0);
     const items = [...byItem.values()].sort((a, b) =>
       (b.blockers.length - a.blockers.length) ||
