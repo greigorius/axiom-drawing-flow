@@ -343,12 +343,32 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.match(lsUpd["Comment Paths"].rich_text[0].text.content, /05_Client Comments\/Reviewed\/R_MC_260910/);
   ok("S5 grade (was 'Review Comments') → allowed; comment PDFs → Client Comments/Reviewed/R_…");
 
+  // A grade of B hands the drawing back, so it owes a revision. The clock starts at the
+  // client's return date, not today — the DT should not lose days to a late grading.
+  assert.ok(lsUpd["Revision Due"]?.date?.start, "grade B stamps a Revision Due date");
+  assert.ok(lsUpd["Revision Due"].date.start > "2026-09-09",
+    `due date must be after the 2026-09-09 return date, got ${lsUpd["Revision Due"].date.start}`);
+  const gradeDue = new Date(lsUpd["Revision Due"].date.start);
+  assert.ok(gradeDue.getDay() !== 0 && gradeDue.getDay() !== 6, "working days only");
+  ok("log-status: grade B stamps Revision Due from the client's return date");
+
   // Re-grade: comments already in Reviewed → nothing to move
   submissions[0].properties["Comment Paths"] = rt(`Drawing Submissions/24-367/05_Client Comments/Reviewed/R_MC_260910_${DWG}_P02.pdf`);
   webhooks.length = 0;
+  updates.length = 0;
   r = await call("PATCH /api/df/submissions/:id/log-status", { params: { id: "subI" }, body: { grade: "A", returnDate: "2026-09-09" } });
   assert.strictEqual(hook("move-files"), undefined);
   ok("re-grade → no duplicate moves");
+
+  // Grade A is the client accepting as issued: nothing is owed, so any date left over from
+  // an earlier round is cleared rather than left to read as an overdue revision.
+  const aUpd = updates.find((u) => u.page_id === "subI").properties;
+  // Note: deepStrictEqual would fail here on prototype identity alone — these property
+  // objects are built inside the vm sandbox, so they are cross-realm.
+  assert.ok("Revision Due" in aUpd, "a closing grade still writes the property");
+  assert.strictEqual(aUpd["Revision Due"].date, null,
+    "a closing grade clears Revision Due instead of leaving a stale deadline");
+  ok("log-status: grade A clears Revision Due");
 
   // A4.5 Rejected → 05_Client Comments with the grade-return name
   submissions = [issued("subC", "A4.5", "C01", { "Submission": title(`24-367-003_${DWG}_A4.5_R1`),
@@ -799,33 +819,65 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(new Set(feed.map((f) => f.filename)).size, 12);
   ok("notification feed: 12 concurrent cr-ingest failures all reach the cockpit, none clobbered");
 
-  // ── DT emails: filename (with _R#) + folder link ───────────────────────
+  // ── DT emails: each filename links to its own file, never to a folder ──────
+  // The dead-link bug: Folder Link was a snapshot of where the PDF sat when Make wrote it,
+  // so every drawing from before the folder restructure mailed a link to a folder that no
+  // longer existed. A Dropbox shared link is bound to the file and survives the moves, so
+  // the link moved onto the filenames and Folder Link is no longer read here at all.
   submissions = [
     { id: "d1", properties: { "Status": sel("Approved"), "DT Notified": { checkbox: false }, "Stage": sel("S4"), "DM Action": sel("Approve"),
       "Submission": title(`24-354-003_${DWG}_S4_R2`), "DT": rel("dtAI"), "QA Round": { number: 2 },
-      "Folder Link": { url: "https://db/readyforissue" },
+      // Populated, and deliberately stale — it must not reach the email.
+      "Folder Link": { url: "https://db/DEAD-folder-from-the-old-layout" },
+      "Share Link":  { url: "https://db/file-d1" },
       "Dropbox Path": { url: `Drawing Submissions/24-354/03_Ready For Issue/003_S4_P01_${DWG}_AI_R1.PDF` } } },
+    // No Share Link — must degrade to plain text, never a dead anchor.
     { id: "d2", properties: { "Status": sel("Rejected"), "DT Notified": { checkbox: false }, "Stage": sel("S5"), "DM Action": sel("Bounce"),
       "Submission": title(`24-354-112_${DWG}_S5_R1`), "DT": rel("dtAI"), "QA Round": { number: 1 },
-      "Folder Link": { url: null },   // Make's bounce run failed, so no link was written back
+      "Folder Link": { url: null },
+      "Share Link":  { url: null },
       "Dropbox Path": { url: `Drawing Submissions/24-354/02_Rejected/112_S5_P02_${DWG}_AI_R1.PDF` } } },
-    // An older submission already in that folder carries the link the email can borrow.
-    { id: "d0", properties: { "Status": sel("Rejected"), "DT Notified": { checkbox: true }, "Stage": sel("S4"), "DM Action": sel("Bounce"),
-      "Submission": title(`24-354-003_${DWG}_S4_R1`), "DT": rel("dtAI"), "QA Round": { number: 1 },
-      "Folder Link": { url: "https://db/rejected" },
-      "Dropbox Path": { url: `Drawing Submissions/24-354/02_Rejected/003_S4_P01_${DWG}_SF_R1.PDF` } } },
   ];
   webhooks.length = 0; updates.length = 0;
   r = await call("POST /api/df/send-dt-emails", { body: {} });
   assert.strictEqual(r.status, 200, JSON.stringify(r.json));
   const dt = hook("dt-summary");
   const blocks = dt.folderBlocks.map((b) => b.folderHtml + b.drawingsHtml).join(" | ");
+
   assert.ok(blocks.includes(`003_S4_P01_${DWG}_AI_R1.PDF`), blocks);
   assert.ok(blocks.includes(`112_S5_P02_${DWG}_AI_R1.PDF`), blocks);
-  assert.ok(blocks.includes("https://db/readyforissue") && blocks.includes("https://db/rejected"), blocks);
+  // The file with a share link is clickable; the one without is bare text.
+  assert.match(blocks, new RegExp(`<a href="https://db/file-d1"[^>]*><code[^>]*>003_S4_P01_${DWG}_AI_R1\\.PDF</code></a>`), blocks);
+  assert.ok(!/<a href="[^"]*"[^>]*><code[^>]*>112_S5_P02/.test(blocks),
+    "a submission with no Share Link must not get an anchor at all");
+  // The regression itself: no folder URL in the email, stale or otherwise.
+  assert.ok(!blocks.includes("DEAD-folder-from-the-old-layout"),
+    "a stale Folder Link must never reach the DT email");
+  assert.ok(!/<a href="[^"]*"[^>]*>24-354 \//.test(blocks), "the folder heading is text, not a link");
+  // Folders are still NAMED, so the DT knows where to look and where to upload.
   assert.ok(/24-354 \/ 03_Ready For Issue/.test(blocks) && /24-354 \/ 02_Rejected/.test(blocks), blocks);
+  assert.match(blocks, /<code>24-354\/03_Ready For Issue<\/code>/);
+  assert.match(blocks, /<code>24-354\/01_Pending<\/code>/);
   assert.match(blocks, /dropping only a <code>_R1<\/code>/);
-  ok("DT email: full filename incl. _R#, links to 03_Ready For Issue / 02_Rejected (link borrowed when Make didn't write one)");
+  ok("DT email: filenames link to the files, folders are named not linked, stale Folder Link ignored");
+
+  // A bounce stamps the revision due date so the cockpit can show a real deadline.
+  submissions = [
+    { id: "b9", properties: { "Status": sel("Submitted"), "Stage": sel("S4"), "QA Round": { number: 1 },
+      "Submission": title(`24-354-003_${DWG}_S4_R1`), "DT": rel("dtAI"),
+      "Dropbox Path": { url: `Drawing Submissions/24-354/01_Pending/003_S4_P01_${DWG}_AI.pdf` } } },
+  ];
+  updates.length = 0;
+  r = await call("PATCH /api/df/submissions/:id/bounce", { params: { id: "b9" }, body: { comments: "fix the datum" } });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+  const bounceProps = updates.find((u) => u.page_id === "b9").properties;
+  assert.ok(bounceProps["Revision Due"]?.date?.start, "bounce writes a Revision Due date");
+  assert.match(bounceProps["Revision Due"].date.start, /^\d{4}-\d{2}-\d{2}$/, "as a plain date");
+  const dueAt = new Date(bounceProps["Revision Due"].date.start);
+  assert.ok(dueAt > new Date(bounceProps["Reviewed"].date.start), "and it is after the review date");
+  assert.ok(dueAt.getDay() !== 0 && dueAt.getDay() !== 6, "working days only — never lands on a weekend");
+  ok("bounce: stamps Revision Due, review date + Revision Days in working days");
+
 
   // stage-upload still finds the stage when the DWG keeps a _R# suffix
   // ── stage-upload ───────────────────────────────────────────────────────

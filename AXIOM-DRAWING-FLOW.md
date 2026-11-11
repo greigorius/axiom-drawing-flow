@@ -128,7 +128,7 @@ All routes are mounted from `drawing-flow.js` under `/api/df/`.
 
 | Method | Route | Description |
 |--------|-------|-------------|
-| `POST` | `/api/df/send-dt-emails` | Fires batch DT notification webhook to Make.com — one `dt-summary` action per DT covering all their pending items. Each row shows the file's **current filename** (bounced files keep their `_R#`) above the drawing number, grouped under a link to the folder it now sits in (`03_Ready For Issue` or `02_Rejected`). Approved blocks tell the DT to upload DWGs there under the same name, minus any `_R#`. If a submission has no `Folder Link` (its approve/bounce run failed before Make wrote one back), the link is borrowed from another submission in the same folder. |
+| `POST` | `/api/df/send-dt-emails` | Fires batch DT notification webhook to Make.com — one `dt-summary` action per DT covering all their pending items. Each row shows the file's **current filename** (bounced files keep their `_R#`) above the drawing number, **hyperlinked to that file's own `Share Link`**. Rows are grouped under the folder they sit in, named as plain text. Approved blocks tell the DT to upload DWGs to the named `03_Ready For Issue` folder under the same name, minus any `_R#`. A row with no `Share Link` degrades to plain text, never a dead anchor. |
 | `POST` | `/api/df/send-grade-emails` | Fires grade notification emails to DTs via Make.com webhook. |
 
 ### Drawings & Inputs
@@ -176,7 +176,8 @@ All routes are mounted from `drawing-flow.js` under `/api/df/`.
 | `DM Action` | select | `Approve`, `Bounce`, `Log Status` — records what the DM did |
 | `Client Grade` | select | `A`, `B`, `C`, `NA`, `Approved`, `Rejected` |
 | `Dropbox Path` | url | Relative path (from `Drawing Submissions/`) — backend reconstructs full path |
-| `Folder Link` | url | Dropbox shared folder link — required before DT can be notified of Approved/Rejected |
+| `Folder Link` | url | Dropbox shared folder link, written back by Make at approve/bounce. **No longer read by anything** — see "Why the DT emails link files, not folders" below. Kept so Make's PATCH keeps working. |
+| `Revision Due` | date | When the DT's revised submission is due back. Written at bounce and at grade (review date + the project's `Revision Days`, in working days); cleared by a grade that closes the drawing. Drives the due-date chip on cockpit column 1. |
 | `Blocked` | checkbox | Manually flag a submission as blocked (excluded from normal queue logic) |
 | `Comment Paths` | rich text | Dropbox paths of client comment PDFs logged by cr-ingest (one per line); rewritten to their `Reviewed/R_…` paths at Log Status |
 
@@ -418,6 +419,22 @@ Two dates appear on each card:
 
 - **Days waiting** — the existing `k-age` chip, from `BIC Since`, amber past 7 days and red past 14.
 - **Due date** — from the Item (not the drawing): `2nd DT Delivery (Adj)`, falling back to `2nd Submission Date (Plan)` then `Constr. DT Delivery (Plan)`. Red when overdue, amber within 3 days. It is a per-item programme date, so it is the same for every drawing on that item and does not advance round to round — a chase date, not a per-drawing deadline. `2nd DT Delivery (Adj)` is used first because it is the field actually maintained: it is set on ~90% of the items that currently have work with a DT, where the per-stage fields are set on under a fifth.
+
+### Why the DT emails link files, not folders
+
+The DT emails used to carry exactly one hyperlink per folder block, built from the submission's `Folder Link`. That property is a **snapshot of wherever the PDF sat when Make wrote it**, so every drawing actioned before the folder restructure mailed out a link to a `{Project}/{Stage}/Suffix {NNN}/` folder that no longer exists. Newer drawings linked fine, which is why the symptom looked random until it was pinned to the age of the file.
+
+A Dropbox shared link is bound to the **file**, not to a path, so it keeps working when the flow moves the PDF between `01_Pending`, `02_Rejected`, `03_Ready For Issue` and `04_Issued`. So the link moved onto the filenames — one per file, in both `dt-summary` and `grade-summary` — and the folder heading became plain text. 162 of the 186 legacy-layout submissions already have a `Share Link`.
+
+Three things went with it:
+
+- **`folderLinkFor()` and its borrow pass** — a lookup that hunted a sibling submission with a populated `Folder Link` whenever Make had not written one. Nothing to borrow now.
+- **The sibling fan-out** in `PATCH /api/df/submissions/:id/folder-link` — it copied the link onto every other submission in the Suffix so the email would find one. That was a Notion write per sibling on every approve and bounce. The endpoint still records the link on the row Make PATCHes, so Make needs no change.
+- **The `Folder Link` gate** on pending notifications. Approved and Rejected rows were withheld from the notify queue until Make had PATCHed a link back. With the link gone from the email the gate only stranded drawings whose Make run had failed — a notification the DM could never send.
+
+In `grade-summary` the link opens the **drawing the DT must revise**, not the client's mark-up: the mark-up is a separate file that only ever has a path, never a shared link. The return folder is still named in the heading so they can find it.
+
+### One source for the lanes
 
 `public/lanes.js` is now loaded in the browser too (a `<script>` in `index.html`, ahead of the components), which is what its header always claimed. Before this it was only ever required by the Netlify function bundle, and the cockpit kept its own duplicate bucket logic.
 

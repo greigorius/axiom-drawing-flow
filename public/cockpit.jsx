@@ -1444,12 +1444,21 @@ const Cockpit = () => {
           <span className={`k-pill ${pill.cls}`}>{pill.txt}</span>
           {s.hasComments && <span className="k-pill danger">New ✦</span>}
           {s.blocked && <span className="k-pill warn">On Hold</span>}
-          {colId === "resubmission" && s.dueDate && (
-            <span className={`k-pill ${dueCls(s.dueDate)}`}
-              title={`Next submission due ${shortDate(s.dueDate)} (item programme date)`}>
-              {dueLabel(s.dueDate)}
-            </span>
-          )}
+          {colId === "resubmission" && (s.revisionDue || s.dueDate) && (() => {
+            // Revision Due is written per drawing at bounce/grade, so it is the real
+            // deadline. The item programme date is only a stand-in for rows actioned before
+            // that field existed — the tooltip says which one is being quoted.
+            const exact = !!s.revisionDue;
+            const due   = s.revisionDue || s.dueDate;
+            return (
+              <span className={`k-pill ${dueCls(due)}`}
+                title={exact
+                  ? `Revision due ${shortDate(due)} — review date + the project's Revision Days`
+                  : `No revision due date on this submission; showing the item's programme date (${shortDate(due)})`}>
+                {dueLabel(due)}{exact ? "" : "?"}
+              </span>
+            );
+          })()}
         </div>
         <div className="k-card-foot">
           <span className={`k-age ${ageCls}`}

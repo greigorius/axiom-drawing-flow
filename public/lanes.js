@@ -55,7 +55,9 @@
   // nothing further, so they close. "Rejected" is the A4.5/PRD outcome (contractor or
   // factory said no); "QA Rejected" is the client's document controller bouncing the
   // paperwork. Both mean the DT owes a new submission, exactly like a QA bounce does.
-  var REVISION_GRADES = { "B": 1, "C": 1, "Rejected": 1, "QA Rejected": 1 };
+  // "Revise" is the sketch flow's own outcome (S3 and any -SK- drawing), the counterpart
+  // to "No Action" — it asks for an updated sketch, so it belongs here with the rest.
+  var REVISION_GRADES = { "B": 1, "C": 1, "Rejected": 1, "QA Rejected": 1, "Revise": 1 };
   function needsRevision(grade) { return !!REVISION_GRADES[grade]; }
 
   function time(d) { var t = d ? Date.parse(d) : NaN; return isNaN(t) ? 0 : t; }

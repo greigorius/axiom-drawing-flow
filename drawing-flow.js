@@ -1649,10 +1649,12 @@ module.exports = function mountDrawingFlow(app, notion) {
       }
 
       // ── 2. Pending-notification: 4 filter queries with 200ms gaps ──
-      const FOLDER_STATUSES  = ["Approved", "Rejected"];
-      const INSTANT_STATUSES = ["Issued",   "Graded"];
+      // Every status that can be awaiting a DT email. These were split into "folder" and
+      // "instant" groups when Approved/Rejected had to wait for a Folder Link; nothing
+      // waits now, so the split is gone and the names no longer imply a gate.
+      const NOTIFIABLE = ["Approved", "Rejected", "Issued", "Graded"];
       const pendingRaw = [];
-      for (const s of [...FOLDER_STATUSES, ...INSTANT_STATUSES]) {
+      for (const s of NOTIFIABLE) {
         const pages = await queryAll(notion, SUBMISSIONS_DB, {
           and: [
             { property: "Status",      select:   { equals: s     } },
@@ -1721,13 +1723,11 @@ module.exports = function mountDrawingFlow(app, notion) {
         issuedMapped.push(mapSub(page, { hasComments }));
       }
 
-      // Map pending-notification pages
-      const folderGated = pendingRaw.filter((page) => {
-        const status = getProp(page, "Status", "select");
-        if (FOLDER_STATUSES.includes(status)) return !!getProp(page, "Folder Link", "url");
-        return true;
-      });
-      const pending = folderGated.map((page) => {
+      // Map pending-notification pages. Approved and Rejected rows used to be withheld
+      // until Make had PATCHed a Folder Link back, because the email's only hyperlink was
+      // that folder. The email links the files themselves now, so the gate did nothing but
+      // strand drawings whose Make run failed — a notification the DM could never send.
+      const pending = pendingRaw.map((page) => {
         const dtIds      = getProp(page, "DT",         "relation");
         const title      = getProp(page, "Submission", "title");
         const stage      = getProp(page, "Stage",      "select");
@@ -1784,35 +1784,19 @@ module.exports = function mountDrawingFlow(app, notion) {
     //   Issued / Graded      → no folder involved, shown immediately (DT Notified = false).
     if (statusFilter === "pending-notification") {
       try {
-        // Approved + Rejected: gate on Folder Link being populated
-        const FOLDER_STATUSES  = ["Approved", "Rejected"];
-        // Issued + Graded: no folder, show immediately
-        const INSTANT_STATUSES = ["Issued", "Graded"];
+        // Every status that can be awaiting a DT email. Approved and Rejected used to be
+        // queried separately and then filtered on Folder Link being populated; the email
+        // links the files now, so they are fetched on the same terms as the rest.
+        const NOTIFIABLE = ["Approved", "Rejected", "Issued", "Graded"];
 
-        const [folderResults, instantResults] = await Promise.all([
-          Promise.all(FOLDER_STATUSES.map((s) =>
-            // Note: Notion API does not support is_not_empty filter on URL properties.
-            // Fetch all with DT Notified=false and filter client-side for Folder Link presence.
-            queryAll(notion, SUBMISSIONS_DB, {
-              and: [
-                { property: "Status",      select:   { equals: s     } },
-                { property: "DT Notified", checkbox: { equals: false } },
-              ]
-            }, [{ property: "BIC Since", direction: "ascending" }])
-          )).then((r) => r.flat()
-            .filter((page) => !!getProp(page, "Folder Link", "url"))  // gate: Folder Link must be populated
-          ),
-          Promise.all(INSTANT_STATUSES.map((s) =>
-            queryAll(notion, SUBMISSIONS_DB, {
-              and: [
-                { property: "Status",      select:   { equals: s     } },
-                { property: "DT Notified", checkbox: { equals: false } },
-              ]
-            }, [{ property: "BIC Since", direction: "ascending" }])
-          )).then((r) => r.flat()),
-        ]);
-
-        const results = [...folderResults, ...instantResults];
+        const results = (await Promise.all(NOTIFIABLE.map((s) =>
+          queryAll(notion, SUBMISSIONS_DB, {
+            and: [
+              { property: "Status",      select:   { equals: s     } },
+              { property: "DT Notified", checkbox: { equals: false } },
+            ]
+          }, [{ property: "BIC Since", direction: "ascending" }])
+        ))).flat();
 
         // Dedupe DT lookups — a handful of DTs may own many of these submissions.
         const resolveCached = makeDTResolver(notion);
@@ -1951,6 +1935,7 @@ module.exports = function mountDrawingFlow(app, notion) {
           bicSince:    getProp(page, "BIC Since",    "date"),
           submitted:   getProp(page, "Submitted",    "date"),
           reviewed:    getProp(page, "Reviewed",     "date"),
+          revisionDue: getProp(page, "Revision Due", "date"),
           dropboxPath: getProp(page, "Dropbox Path", "url"),
           shareLink:   getProp(page, "Share Link",   "url"),
           drawingIds:  getProp(page, "Drawing",      "relation"),
@@ -1997,33 +1982,13 @@ module.exports = function mountDrawingFlow(app, notion) {
       return res.status(500).json({ ok: false, error: "Notion update failed", detail: err.message });
     }
 
-    // Write to all siblings in the same Suffix folder:
-    // same task relation + same stage + same DM action + DT Notified = false
-    let siblingsUpdated = 0;
-    if (taskIds?.length) {
-      try {
-        const siblings = await queryAll(notion, SUBMISSIONS_DB, {
-          and: [
-            { property: "Item",        relation: { contains: taskIds[0] } },
-            { property: "Stage",       select:   { equals: stage        } },
-            { property: "DM Action",   select:   { equals: dmAction     } },
-            { property: "DT Notified", checkbox: { equals: false        } },
-          ]
-        });
-        const others = siblings.filter((p) => p.id !== id);
-        await Promise.all(others.map((p) =>
-          notion.pages.update({ page_id: p.id, properties: {
-            "Folder Link": { url: folderLink },
-          }}).catch((e) => console.warn(`[folder-link] sibling update failed ${p.id}:`, e.message))
-        ));
-        siblingsUpdated = others.length;
-      } catch (err) {
-        console.warn("[folder-link] sibling lookup failed:", err.message);
-      }
-    }
-
-    console.log(`[folder-link] ${id} + ${siblingsUpdated} sibling(s) → ${folderLink}`);
-    res.json({ ok: true, siblingsUpdated });
+    // The fan-out that used to copy this link onto every sibling in the Suffix is gone.
+    // It existed so the DT email would find a Folder Link on whichever row it rendered;
+    // the email links the files now, so the copies bought nothing and cost one Notion
+    // write per sibling on every approve and bounce. The endpoint still records the link
+    // on the submission Make PATCHed, so Make needs no change and nothing 404s.
+    console.log(`[folder-link] ${id} → ${folderLink}`);
+    res.json({ ok: true, siblingsUpdated: 0 });
   });
 
   // POST /api/df/send-dt-emails
@@ -2063,9 +2028,13 @@ module.exports = function mountDrawingFlow(app, notion) {
         const dmAction = getProp(page, "DM Action",  "select");
         const dtIds    = getProp(page, "DT",         "relation");
         const rawPath  = getProp(page, "Dropbox Path", "url");
-        // Folder Link is the Ready For Issue / Rejected link Make wrote back at approve/bounce —
-        // once a drawing is Issued its PDF has moved on to 04_Issued, so don't reuse that link.
-        const folderLink = status === "Issued" ? null : getProp(page, "Folder Link", "url");
+        // The DT gets a link to the FILE, not to its folder. A Dropbox shared link is bound
+        // to the file itself, so it keeps working when the flow moves the PDF between
+        // 01_Pending / 02_Rejected / 03_Ready For Issue / 04_Issued. Folder Link does not:
+        // it was a snapshot of wherever the file sat when Make wrote it, so every drawing
+        // from before the folder restructure mailed out a link to a folder that no longer
+        // exists. That is the dead-link bug; this is the fix.
+        const shareLink = getProp(page, "Share Link", "url");
         const { drawingNo } = parseSubmissionTitle(title, stage);
         const dt = await resolveDT(notion, dtIds);
 
@@ -2092,7 +2061,7 @@ module.exports = function mountDrawingFlow(app, notion) {
           dtEmail:   dt.email,
           folderPath,
           folderName,
-          folderLink,  // real Dropbox shared link written back by Make
+          shareLink,
           fileName,
           drawingNo,
           stage,
@@ -2117,13 +2086,14 @@ module.exports = function mountDrawingFlow(app, notion) {
         if (!byDT[dtKey].folders[folderKey]) {
           byDT[dtKey].folders[folderKey] = {
             folderName:  item.folderName || null,
-            folderLink:  item.folderLink || null,
+            folderPath:  item.folderPath || null,
             drawings:    [],
           };
         }
         byDT[dtKey].folders[folderKey].drawings.push({
           fileName:     item.fileName,
           drawingNo:    item.drawingNo,
+          shareLink:    item.shareLink,
           stage:        item.stage,
           actionLabel:  item.actionLabel,
           qaRound:      item.qaRound,
@@ -2132,67 +2102,49 @@ module.exports = function mountDrawingFlow(app, notion) {
         byDT[dtKey].pageIds.push(item.pageId);
       }
 
-      // A folder's link is written back by Make after the approve/bounce move. If that run
-      // failed (a stale path, say), the property is empty and the DT gets plain text instead of
-      // a link — so borrow the link from any other submission sitting in the same folder.
-      const folderLinkCache = new Map();
-      async function folderLinkFor(folderPath) {
-        const shortPath = toShortDropboxPath(folderPath);
-        if (!shortPath) return null;
-        if (folderLinkCache.has(shortPath)) return folderLinkCache.get(shortPath);
-        let link = null;
-        try {
-          const res = await withNotionRetry(() => notion.databases.query({
-            database_id: SUBMISSIONS_DB,
-            filter: { and: [
-              { property: "Dropbox Path", url: { contains: `${shortPath}/` } },
-              { property: "Folder Link",  url: { is_not_empty: true      } },
-            ]},
-            page_size: 1,
-          }));
-          link = res.results.length ? getProp(res.results[0], "Folder Link", "url") : null;
-        } catch (err) {
-          console.warn(`[send-dt-emails] Folder link lookup failed for ${shortPath}:`, err.message);
-        }
-        folderLinkCache.set(shortPath, link);
-        return link;
-      }
-      for (const group of Object.values(byDT)) {
-        for (const [folderPath, folder] of Object.entries(group.folders)) {
-          if (!folder.folderLink && folderPath.startsWith("/")) folder.folderLink = await folderLinkFor(folderPath);
-        }
-      }
+      // (A folder-link borrow pass used to sit here, hunting a sibling submission with a
+      // populated Folder Link whenever Make had not written one. Now that the email links
+      // the file instead of its folder, there is nothing to borrow and nothing to go stale.)
 
       // Build the folders array for each DT group, with pre-rendered folderHtml
       // and a drawingsHtml block listing all drawings under that folder.
       // All HTML is built here — the Text Aggregator receives a single folderBlockHtml token.
       for (const group of Object.values(byDT)) {
         group.folderBlocks = Object.values(group.folders).map((folder) => {
-          const linkHtml = folder.folderLink
-            ? `<a href="${folder.folderLink}" style="color:#4f7fff;font-weight:600;">${folder.folderName || "Open folder"}</a>`
-            : folder.folderName
-              ? `<strong>${folder.folderName}</strong>`
-              : "<em>No folder</em>";
+          // The heading names the folder in text. It used to be the one hyperlink in the
+          // email, which is exactly why a stale Folder Link broke the whole thing; the links
+          // now live on the filenames below, one per file, and cannot rot.
+          const linkHtml = folder.folderName
+            ? `<strong>${folder.folderName}</strong>`
+            : "<em>No folder</em>";
 
-          // Column 1 is the file as it is named in that folder (bounced files keep their _R#),
-          // with the drawing number underneath for scanning.
-          const drawingRows = folder.drawings.map((d) =>
-            `<tr>
+          // Column 1 is the file as it is named in that folder (bounced files keep their
+          // _R#), linked straight to the PDF, with the drawing number underneath for
+          // scanning. A row with no Share Link degrades to plain text rather than a dead
+          // anchor — the DT can still find it by name in the folder named above.
+          const drawingRows = folder.drawings.map((d) => {
+            const nameText = d.fileName || d.drawingNo || "—";
+            const nameCell = d.shareLink
+              ? `<a href="${d.shareLink}" style="color:#4f7fff;font-weight:600;text-decoration:none;"><code style="font-size:12px;">${nameText}</code></a>`
+              : `<code style="font-size:12px;">${nameText}</code>`;
+            return `<tr>
               <td style="padding:4px 8px;color:#333;">
-                <code style="font-size:12px;">${d.fileName || d.drawingNo || "—"}</code>
+                ${nameCell}
                 ${d.fileName && d.drawingNo ? `<div style="font-size:11px;color:#888;">${d.drawingNo}</div>` : ""}
               </td>
               <td style="padding:4px 8px;color:#555;">${d.stage}</td>
               <td style="padding:4px 8px;color:#555;">${d.actionLabel}</td>
-            </tr>`
-          ).join("");
+            </tr>`;
+          }).join("");
 
           // Instruction row — derive from the first drawing's actionLabel (all drawings in a folder share the same action)
           const firstAction = folder.drawings[0]?.actionLabel ?? "";
+          // Named folders, not "the folder link above" — the heading is no longer a link.
+          const projectFolder = (folder.folderName || "").split(" / ")[0] || "the project";
           const instruction = firstAction === "QA Approved"
-            ? "Upload the DWGs (and any other approved files) to the 03_Ready For Issue folder link above. Keep the filename exactly as listed, dropping only a <code>_R1</code>/<code>_R2</code> suffix if the drawing was bounced along the way."
+            ? `Click a filename above to open the approved PDF. Upload the DWGs (and any other approved files) to <code>${projectFolder}/03_Ready For Issue</code>, keeping the filename exactly as listed and dropping only a <code>_R1</code>/<code>_R2</code> suffix if the drawing was bounced along the way.`
             : firstAction.startsWith("Bounced")
-              ? "Your marked-up drawings are in the 02_Rejected folder link above, under the filenames listed. Revise to the DM comments and upload the revised PDF to the project's 01_Pending folder, named {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}.pdf (no _R# suffix)."
+              ? `Click a filename above to open your marked-up PDF. Revise to the DM comments and upload the revised PDF to <code>${projectFolder}/01_Pending</code>, named {Item}_{Stage}_{Rev}_{DrawingNo}_{Initials}.pdf (no _R# suffix).`
               : null;
           const instructionRow = instruction
             ? `<tr><td colspan="3" style="padding:4px 8px 10px;font-size:12px;color:#888;font-style:italic;">${instruction}</td></tr>`
@@ -2350,9 +2302,13 @@ module.exports = function mountDrawingFlow(app, notion) {
         // separate "graded date" property — this previously referenced an undefined
         // `gradedAt` variable, which threw inside Promise.all and 500'd the whole batch
         // whenever any pending submission was missing a Reviewed date).
-        const returnDate    = reviewed || now();
-        const revisionDays  = await getRevisionDays(notion, drawingIds);
-        const completionDate = addWorkingDays(returnDate, revisionDays);
+        // log-status stored this when it graded the drawing, so prefer it: the DT and the
+        // cockpit then quote the same date, and most rows skip the drawing→item→project
+        // walk entirely. Older rows graded before Revision Due existed still compute.
+        const returnDate     = reviewed || now();
+        const storedRevDue   = getProp(page, "Revision Due", "date");
+        const revisionDays   = storedRevDue ? null : await getRevisionDays(notion, drawingIds);
+        const completionDate = storedRevDue || addWorkingDays(returnDate, revisionDays);
 
         return {
           pageId: page.id,
@@ -2361,6 +2317,10 @@ module.exports = function mountDrawingFlow(app, notion) {
           returnFolder,
           returnKind,
           drawingNo,
+          // Links the DRAWING the DT has to revise, not the client's mark-up: the mark-up is
+          // a separate file (in 05_Client Comments / Reviewed) that only ever has a path, no
+          // shared link. The return folder is still named in the heading so they can find it.
+          shareLink: getProp(page, "Share Link", "url"),
           stage,
           grade,
           revision,
@@ -2409,7 +2369,9 @@ module.exports = function mountDrawingFlow(app, notion) {
 
           const drawingRows = bucket.drawings.map((d) =>
             `<tr>
-              <td style="padding:4px 8px;color:#333;">${d.drawingNo || "—"}</td>
+              <td style="padding:4px 8px;color:#333;">${d.shareLink
+                ? `<a href="${d.shareLink}" style="color:#4f7fff;font-weight:600;text-decoration:none;">${d.drawingNo || "—"}</a>`
+                : (d.drawingNo || "—")}</td>
               <td style="padding:4px 8px;color:#555;">${d.stage}</td>
               <td style="padding:4px 8px;color:#555;">${d.revision}</td>
               <td style="padding:4px 8px;font-weight:600;color:#333;">${d.grade}</td>
@@ -3102,11 +3064,20 @@ module.exports = function mountDrawingFlow(app, notion) {
     const dropboxMove = computeDropboxMove(rawPath, "bounce", qaRound);
     const bouncedAt   = now();
 
+    // When the revised drawing is due back. Same calculation the grade email has always
+    // shown: the review date plus the project's Revision Days, in working days. Storing it
+    // on the submission is what lets the cockpit show a real per-drawing deadline instead
+    // of falling back to the item's shared programme date.
+    const bounceDrawingIds = getProp(submissionPage, "Drawing", "relation");
+    const bounceRevDays    = await getRevisionDays(notion, bounceDrawingIds);
+    const bounceRevDue     = addWorkingDays(bouncedAt, bounceRevDays);
+
     try {
       await notion.pages.update({ page_id: id, properties: {
         "Status":        { select: { name: "Rejected"  } },
         "DM Action":     { select: { name: "Bounce"    } },
         "Reviewed":      { date:   { start: bouncedAt  } },
+        "Revision Due":  { date:   { start: bounceRevDue } },
         "Ball In Court": { select: { name: BIC.BOUNCED } },
         "BIC Since":     { date:   { start: bouncedAt  } },
         // Written in the same (awaited) call — Netlify freezes un-awaited promises once the
@@ -3197,6 +3168,15 @@ module.exports = function mountDrawingFlow(app, notion) {
     const gradedAt         = now();
     const statusDate       = returnDate || gradedAt;   // prefer project-system date over today
 
+    // A grade that hands the drawing back gets a revision due date, computed from the
+    // client's return date rather than today — the DT's clock starts when the comments
+    // came in. A grade that closes the drawing (A / NA / Approved / No Action) clears any
+    // date left over from an earlier round, so nothing shows as owed when it is not.
+    const gradeNeedsRevision = LANES.needsRevision(grade);
+    const gradeRevDue = gradeNeedsRevision
+      ? addWorkingDays(statusDate, await getRevisionDays(notion, drawingIds))
+      : null;
+
     const isTerminalAB     = stage === "AB"   && grade === "Approved";
     const isA45Approved    = movesPdfOnGrade(stage) && grade === "Approved";
     const isProductionRev  = revision.toUpperCase().startsWith("C");
@@ -3258,6 +3238,7 @@ module.exports = function mountDrawingFlow(app, notion) {
         "Client Grade":  { select: { name: grade            } },
         ...(gradeComment ? { "Grade Comment": { rich_text: richTextChunks(gradeComment) } } : {}),
         "Reviewed":      { date:   { start: gradedAt        } },
+        "Revision Due":  gradeRevDue ? { date: { start: gradeRevDue } } : { date: null },
         "DT Notified":   { checkbox: false                   },
         "Ball In Court": newBIC ? { select: { name: newBIC    } } : { select: null },
         "BIC Since":     newBIC ? { date:   { start: gradedAt } } : { date:   null },
