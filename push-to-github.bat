@@ -68,12 +68,22 @@ git status --short
 echo.
 
 :: ---- Commit ----------------------------------------------------------------
-echo  Committing: "%COMMIT_MSG%"
-git commit -m "%COMMIT_MSG%"
+:: "Nothing to commit" is not a failure. It happens whenever the work was already
+:: committed - by hand, or by Claude - and bailing out here meant this script would
+:: refuse to push commits that were sitting ready to go. So test whether anything is
+:: actually staged, and fall through to the push either way. A commit that is attempted
+:: and fails is still a hard stop.
+git diff --cached --quiet
 if errorlevel 1 (
-    echo  Nothing to commit, or commit failed.
-    pause
-    exit /b 1
+    echo  Committing: "%COMMIT_MSG%"
+    git commit -m "%COMMIT_MSG%"
+    if errorlevel 1 (
+        echo  ERROR: commit failed. Nothing was pushed.
+        pause
+        exit /b 1
+    )
+) else (
+    echo  Nothing new to stage - pushing the commits already made.
 )
 
 :: ---- Branch ----------------------------------------------------------------
