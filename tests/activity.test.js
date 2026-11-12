@@ -952,5 +952,37 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
     "a later stage clears it too, even though its QA round is lower");
   ok("lane 1: clears the moment the revision lands, by round or by stage");
 
+  // ── Blocked is its own lane ────────────────────────────────────────────────
+  // A drawing can be parked at any stage, so "blocked" is not a position in the pipeline —
+  // it overrides whatever lane the drawing would otherwise sit in. The point is that a
+  // parked drawing stops inflating a queue that reads as "someone owes us this".
+  for (const [status, extra] of [
+    ["Rejected",       { dtNotified: true }],
+    ["Submitted",      {}],
+    ["Issued",         {}],
+    ["Approved",       { dtNotified: true }],
+    ["Graded",         { dtNotified: true, clientGrade: "C" }],
+  ]) {
+    assert.strictEqual(lane(Object.assign({ status, blocked: true }, extra)), "blocked",
+      `a blocked ${status} drawing belongs in the blocked lane, not ${status}`);
+  }
+  // A placeholder row was never in flight, so it stays scheduled.
+  assert.strictEqual(lane({ status: "Schedule", blocked: true }), "scheduled",
+    "a Schedule placeholder is not work that can be blocked");
+  ok("blocked: overrides every in-flight lane, leaves placeholders alone");
+
+  // It must come OUT of the lane it was parked from — counted once, in one place.
+  const parked  = s({ id: "p1", stage: "S5", status: "Rejected", dtNotified: true, qaRound: 1, submitted: "2026-03-01", blocked: true });
+  const running = s({ id: "p2", stage: "S5", status: "Rejected", dtNotified: true, qaRound: 1, submitted: "2026-03-01" });
+  running.drawingIds = ["dw2"];
+
+  let both = LANES.summarise([parked, running]).byItem["t1"];
+  assert.deepStrictEqual(both.lanes.map((l) => l.id).sort(), ["blocked", "resubmission"],
+    "the parked one and the running one land in different lanes");
+  assert.strictEqual(both.lanes.find((l) => l.id === "resubmission").n, 1,
+    "the blocked drawing does not inflate the With DT count");
+  assert.strictEqual(both.lanes.find((l) => l.id === "blocked").title, "Blocked — Awaiting Info");
+  ok("blocked: comes out of the With DT count rather than being counted twice");
+
   console.log(`\n${n} activity tests passed`);
 })().catch((e) => { console.error("FAIL", e); process.exit(1); });

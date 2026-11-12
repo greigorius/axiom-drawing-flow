@@ -782,6 +782,7 @@ const Cockpit = () => {
   const [scanCommentsBusy,     setScanCommentsBusy]     = useState(false);
   const [scanCommentsResult,   setScanCommentsResult]   = useState(null);  // "ok" | "error" | null
   const [withDT,               setWithDT]               = useState([]);
+  const [blockedItems,         setBlockedItems]         = useState([]);
   const [graded,               setGraded]               = useState([]);
   const [sendGradeEmailsBusy,  setSendGradeEmailsBusy]  = useState(false);
   const [sendGradeResult,      setSendGradeResult]      = useState(null);  // "ok" | "error" | null
@@ -898,6 +899,9 @@ const Cockpit = () => {
 
       setSubmitted(subs);
       setWithDT(current.filter((s) => DFLanes.laneOf(s) === "resubmission"));
+      // Parked work, at whatever stage it was parked. Same current-state basis as column 1,
+      // so a blocked drawing that has since been superseded does not linger here either.
+      setBlockedItems(current.filter((s) => DFLanes.laneOf(s) === "blocked"));
       setAwaitingIssue([...approved_, ...await_]);
       setIssued(iss);
       setPendingNotification(pending);
@@ -1313,23 +1317,30 @@ const Cockpit = () => {
   const sendDtLabel       = sendEmailBusy ? "Sending…" : "✉ Send DT Email";
   const sendGradeLabel    = sendGradeEmailsBusy ? "Sending…" : "✉ Send DT Email";
 
+  // A blocked drawing has its own column, so it must not also sit in the pipeline column it
+  // was parked from — otherwise it is counted twice and still reads as someone's to action.
+  // withDT and blockedItems already come from laneOf, which routes blocked first.
+  const unparked = (arr) => arr.filter((s) => !s.blocked);
+
   const COLS = [
     { id: "resubmission", title: "Resubmission — With DT", accent: "var(--danger)",
       sub: "Awaiting a new revision · bounced at QA or graded back by the client", items: withDT },
-    { id: "submitted", title: "Submitted — Awaiting Review", accent: "var(--info)", sub: "Review in Drawboard · sync before Approve / Bounce", items: submitted,
+    { id: "submitted", title: "Submitted — Awaiting Review", accent: "var(--info)", sub: "Review in Drawboard · sync before Approve / Bounce", items: unparked(submitted),
       action: { label: scanPendingLabel, onClick: handleScanPending, disabled: scanning } },
-    { id: "reviewed", title: "Reviewed — Notify DT", accent: "var(--ok)", sub: "Approved / bounced — awaiting DT email", items: reviewedNotify,
+    { id: "reviewed", title: "Reviewed — Notify DT", accent: "var(--ok)", sub: "Approved / bounced — awaiting DT email", items: unparked(reviewedNotify),
       action: { label: sendDtLabel, disabled: sendEmailBusy, count: reviewedSelectedIds.length || reviewedNotify.length,
         onClick: () => handleSendDTEmails(reviewedSelectedIds) } },
-    { id: "approved", title: "Approved — Awaiting Issue", accent: "var(--ok)", sub: "DT notified · awaiting DWG upload, then issue", items: approvedItems,
+    { id: "approved", title: "Approved — Awaiting Issue", accent: "var(--ok)", sub: "DT notified · awaiting DWG upload, then issue", items: unparked(approvedItems),
       action: { label: scanUploadsLabel, onClick: handleScanPending, disabled: scanning } },
-    { id: "awaiting-comments", title: "Issued — Awaiting Comments", accent: "var(--info)", sub: "Out with the client or supplier, awaiting comments", items: awaitingComments },
-    { id: "comments", title: "Issued — Review Client Comments", accent: "var(--grade)", sub: "Review in Drawboard, then grade", items: commentItems,
+    { id: "awaiting-comments", title: "Issued — Awaiting Comments", accent: "var(--info)", sub: "Out with the client or supplier, awaiting comments", items: unparked(awaitingComments) },
+    { id: "comments", title: "Issued — Review Client Comments", accent: "var(--grade)", sub: "Review in Drawboard, then grade", items: unparked(commentItems),
       action: { label: scanCommentsLabel, onClick: handleScanComments, disabled: scanCommentsBusy, count: commentItems.length } },
-    { id: "signoff", title: "Issued — Awaiting Sign-Off", accent: "var(--warn)", sub: "A4.5 with client · PRD with factory", items: signoffItems },
-    { id: "graded", title: "Graded — Notify DT", accent: "var(--accent)", sub: "Notion · DT Notified unchecked", items: graded,
+    { id: "signoff", title: "Issued — Awaiting Sign-Off", accent: "var(--warn)", sub: "A4.5 with client · PRD with factory", items: unparked(signoffItems) },
+    { id: "graded", title: "Graded — Notify DT", accent: "var(--accent)", sub: "Notion · DT Notified unchecked", items: unparked(graded),
       action: { label: sendGradeLabel, disabled: sendGradeEmailsBusy, count: gradedSelectedIds.length || graded.length,
         onClick: () => handleSendGradeEmails(gradedSelectedIds) } },
+    { id: "blocked", title: "Blocked — Awaiting Info", accent: "var(--warn)",
+      sub: "Parked by Hold · not waiting on the DT or the DM", items: blockedItems },
   ];
 
   const q = search.trim().toLowerCase();
@@ -1366,6 +1377,8 @@ const Cockpit = () => {
       case "comments":          return { cls: "grade", txt: "Review Comments" };
       case "signoff":           return { cls: "warn",  txt: "Sign-Off" };
       case "graded":            return { cls: "grade", txt: "Grade " + (s.clientGrade || "—") };
+      // The column no longer tells you where it was parked from, so the pill does.
+      case "blocked":           return { cls: "warn",  txt: "On Hold · " + (s.status || "—") };
       default:                  return { cls: "info",  txt: "" };
     }
   };
@@ -1443,7 +1456,7 @@ const Cockpit = () => {
           {s.revision && <span className="k-tag">{s.revision}</span>}
           <span className={`k-pill ${pill.cls}`}>{pill.txt}</span>
           {s.hasComments && <span className="k-pill danger">New ✦</span>}
-          {s.blocked && <span className="k-pill warn">On Hold</span>}
+          {s.blocked && colId !== "blocked" && <span className="k-pill warn">On Hold</span>}
           {colId === "resubmission" && (s.revisionDue || s.dueDate) && (() => {
             // Revision Due is written per drawing at bounce/grade, so it is the real
             // deadline. The item programme date is only a stand-in for rows actioned before

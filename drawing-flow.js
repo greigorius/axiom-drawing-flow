@@ -2273,6 +2273,17 @@ module.exports = function mountDrawingFlow(app, notion) {
           }
         }
 
+        // Comment Paths has already been rewritten to the Reviewed/ paths by log-status, so
+        // these are the names as they now stand in Dropbox, not as the client sent them.
+        const returnFiles = returnKind === "reviewed"
+          ? readPathList(page, "Comment Paths")
+              .filter((pth) => /\/reviewed\//i.test(pth))
+              .map((pth) => pth.split("/").pop())
+              .filter(Boolean)
+          : returnKind
+            ? [(toFullDropboxPath(rawPath) || "").split("/").pop()].filter(Boolean)
+            : [];
+
         // Action label based on grade and revision
         const isProductionRev = revision.toUpperCase().startsWith("C");
         const action = isQaRejected(grade)
@@ -2317,10 +2328,12 @@ module.exports = function mountDrawingFlow(app, notion) {
           returnFolder,
           returnKind,
           drawingNo,
-          // Links the DRAWING the DT has to revise, not the client's mark-up: the mark-up is
-          // a separate file (in 05_Client Comments / Reviewed) that only ever has a path, no
-          // shared link. The return folder is still named in the heading so they can find it.
-          shareLink: getProp(page, "Share Link", "url"),
+          // The exact file(s) the DT has to open, named in full. NOT a link to the drawing's
+          // own PDF — that is the original they submitted, with none of the client's mark-up
+          // on it, so linking it sends them to the wrong document. For a reviewed set these
+          // are the R_-prefixed comment PDFs; for an A4.5/PRD return it is the renamed PDF
+          // that log-status moved into 05_Client Comments.
+          returnFiles,
           stage,
           grade,
           revision,
@@ -2357,21 +2370,25 @@ module.exports = function mountDrawingFlow(app, notion) {
             : null;
           const folderHtml  = shortFolder ? `<strong>${shortFolder}</strong>` : "<strong>No return file</strong>";
 
+          // The filename under each drawing number is the file to open, in the folder named
+          // above. No hyperlink: the only link we could mint here pointed at the drawing's
+          // own PDF, which carries none of the client's mark-up.
           const note = bucket.returnKind === "grade-returns"
-            ? "Returned C01 drawings sit with the client comments, named <code>{Item}_{Stage}_{Rev}_{DrawingNo}_{Grade}_{YYMMDD}.pdf</code>"
+            ? "Open the file named under each drawing number, in the folder above."
             : bucket.returnKind === "signed-off"
-            ? "Signed-off C01 drawings — filename unchanged"
+            ? "Signed-off C01 drawings — filename unchanged, in the folder above."
             : bucket.returnKind === "reviewed"
-              ? "Client comments reviewed by the DM — files prefixed <code>R_</code>, named <code>R_{YYMMDD}_{Commenter}_{Item}_{Stage}_{Rev}_{DrawingNo}.pdf</code>"
+              ? "Open the file named under each drawing number, in the folder above. These are the client's mark-ups, prefixed <code>R_</code> once reviewed."
               : "No marked-up file for these — see the grade and action.";
           const filenameFormatNote =
             `<tr><td colspan="6" style="padding:4px 8px 10px;font-size:11px;color:#888;font-style:italic;">${note}</td></tr>`;
 
           const drawingRows = bucket.drawings.map((d) =>
             `<tr>
-              <td style="padding:4px 8px;color:#333;">${d.shareLink
-                ? `<a href="${d.shareLink}" style="color:#4f7fff;font-weight:600;text-decoration:none;">${d.drawingNo || "—"}</a>`
-                : (d.drawingNo || "—")}</td>
+              <td style="padding:4px 8px;color:#333;">${d.drawingNo || "—"}${
+                (d.returnFiles || []).map((f) =>
+                  `<div style="font-size:11px;color:#888;font-family:monospace;">${escapeHtml(f)}</div>`
+                ).join("")}</td>
               <td style="padding:4px 8px;color:#555;">${d.stage}</td>
               <td style="padding:4px 8px;color:#555;">${d.revision}</td>
               <td style="padding:4px 8px;font-weight:600;color:#333;">${d.grade}</td>
@@ -2692,12 +2709,12 @@ module.exports = function mountDrawingFlow(app, notion) {
       dtEmail:      req.body?.testEmail || "test@example.com",
       folderBlocks: [
         {
-          folderHtml:   "<a href=\"https://www.dropbox.com/sh/test\" style=\"color:#4f7fff;font-weight:600;\">24-367 / Approved</a>",
+          folderHtml:   "<strong>24-367 / 03_Ready For Issue</strong>",
           drawingsHtml: "<tr><td style=\"padding:4px 8px;color:#333;\">A-101</td><td style=\"padding:4px 8px;color:#555;\">S4</td><td style=\"padding:4px 8px;color:#555;\">QA Approved</td></tr><tr><td style=\"padding:4px 8px;color:#333;\">A-102</td><td style=\"padding:4px 8px;color:#555;\">S4</td><td style=\"padding:4px 8px;color:#555;\">QA Approved</td></tr>",
           drawingCount: 2,
         },
         {
-          folderHtml:   "<a href=\"https://www.dropbox.com/sh/test2\" style=\"color:#4f7fff;font-weight:600;\">24-367 / Rejected</a>",
+          folderHtml:   "<strong>24-367 / 02_Rejected</strong>",
           drawingsHtml: "<tr><td style=\"padding:4px 8px;color:#333;\">A-103</td><td style=\"padding:4px 8px;color:#555;\">S5</td><td style=\"padding:4px 8px;color:#555;\">Bounced — returned for revision</td></tr>",
           drawingCount: 1,
         },

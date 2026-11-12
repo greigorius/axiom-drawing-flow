@@ -30,6 +30,11 @@
     { id: "comments",          title: "Issued — Review Client Comments", short: "Review Comments",   accent: "grade"  },
     { id: "signoff",           title: "Issued — Awaiting Sign-Off",      short: "Awaiting Sign-Off", accent: "warn"   },
     { id: "graded",            title: "Graded — Notify DT",              short: "Graded (notify)",   accent: "grade"  },
+    // Orthogonal to the pipeline: a drawing can be blocked at any stage. It sits at the end
+    // of the active lanes rather than among them, because the board reads left to right as
+    // the flow and parked work is not part of that flow — but it stays visible, since a
+    // blocked drawing is the one most easily forgotten.
+    { id: "blocked",           title: "Blocked — Awaiting Info",         short: "Blocked",           accent: "warn"   },
     // Terminal. Never appears on the cockpit board. Only a grade that asks for nothing
     // further (A / NA) closes; B, C and the Rejected grades hand the drawing back to the DT
     // and belong in "resubmission". This lane is the whole point of the client card:
@@ -72,6 +77,10 @@
   function laneOf(s) {
     var st = s.status, stage = s.stage, notified = !!s.dtNotified;
     if (st === "Schedule") return "scheduled";
+    // Checked before everything except the placeholder rows: a blocked drawing is waiting on
+    // information, not on the DT or the DM, so it must not inflate any queue that reads as
+    // "someone owes us this". Cleared by Unblock in the cockpit.
+    if (s.blocked) return "blocked";
     if (st === "Submitted") return "submitted";
     if ((st === "Approved" || st === "Rejected") && !notified) return "reviewed";
     if (st === "Rejected") return "resubmission";

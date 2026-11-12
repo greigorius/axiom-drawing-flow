@@ -668,8 +668,22 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.ok(heads.includes("<strong>24-367/05_Client Comments/Reviewed</strong>"), heads.join(" | "));
   assert.ok(heads.includes("<strong>24-367/05_Client Comments</strong>"), heads.join(" | "));
   assert.ok(heads.includes("<strong>24-367/06_Signed Off</strong>"), heads.join(" | "));
-  assert.ok(gs.folderBlocks.some((f) => /R_/.test(f.drawingsHtml)) && gs.folderBlocks.some((f) => /\{Item\}_\{Stage\}/.test(f.drawingsHtml)));
   ok("grade email: S5 → 05_Client Comments/Reviewed, A4.5 Rejected → 05_Client Comments, A4.5 Approved → 06_Signed Off");
+
+  // The DT is told the exact file to open, by name. Linking the drawing's own Share Link
+  // would send them to the original submission — the document with none of the client's
+  // mark-up on it — so the grade email carries no hyperlink at all, only names.
+  const gsAll = gs.folderBlocks.map((f) => f.folderHtml + f.drawingsHtml).join(" | ");
+  assert.ok(gsAll.includes(`R_MC_260910_${DWG}_P02.pdf`),
+    "the reviewed block names the R_-prefixed mark-up as it now stands in Dropbox");
+  assert.ok(gsAll.includes(`003_A4.5_C01_${DWG}_Rejected_260910.pdf`),
+    "the A4.5 Rejected block names the renamed grade-return PDF");
+  assert.ok(gsAll.includes(`004_A4.5_C01_${DWG}_GF.pdf`),
+    "the signed-off block names the file, unchanged");
+  assert.ok(!/<a href/.test(gsAll), "the grade email carries no hyperlink, only filenames");
+  assert.ok(!/\{Item\}_\{Stage\}/.test(gsAll),
+    "a naming pattern is not a filename — the DT gets the actual name");
+  ok("grade email: names the exact return file per drawing, no links");
 
   // Drawing Status is finalised here, and Approved differs by stage:
   //   A4.5 → Production Updates (DT now draws the PRD set)

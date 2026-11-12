@@ -1432,6 +1432,7 @@ main {
 /* Deep backgrounds against white text — the same contrast approach as the tag pills, so
    both badge rows stay legible side by side. */
 .lane-resubmission      { background: #7f1d1d; color: #fff; } /* red-900    */
+.lane-blocked           { background: #78350f; color: #fff; } /* amber-900  */
 .lane-submitted         { background: #1e3a8a; color: #fff; } /* blue-900   */
 .lane-reviewed          { background: #14532d; color: #fff; } /* green-900  */
 .lane-approved          { background: #065f46; color: #fff; } /* emerald-900 */

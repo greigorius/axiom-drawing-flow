@@ -420,6 +420,14 @@ Two dates appear on each card:
 - **Days waiting** — the existing `k-age` chip, from `BIC Since`, amber past 7 days and red past 14.
 - **Due date** — from the Item (not the drawing): `2nd DT Delivery (Adj)`, falling back to `2nd Submission Date (Plan)` then `Constr. DT Delivery (Plan)`. Red when overdue, amber within 3 days. It is a per-item programme date, so it is the same for every drawing on that item and does not advance round to round — a chase date, not a per-drawing deadline. `2nd DT Delivery (Adj)` is used first because it is the field actually maintained: it is set on ~90% of the items that currently have work with a DT, where the per-stage fields are set on under a fifth.
 
+### Blocked is its own lane
+
+A drawing can be parked at any stage, so `blocked` is not a position in the pipeline — `laneOf()` checks it before everything except `Schedule` placeholders and overrides whatever lane the drawing would otherwise sit in. The point is that a parked drawing stops inflating a queue that reads as "someone owes us this": it leaves the pipeline column it was parked from and is counted once, in "Blocked — Awaiting Info".
+
+It sits at the end of the active lanes rather than among them, because the board reads left to right as the flow and parked work is not part of that flow. It stays visible (rather than going terminal like `closed`) because a blocked drawing is the one most easily forgotten.
+
+The flag is the `Blocked` checkbox on the submission, set and cleared by Hold / Unblock in the cockpit. **It only works if Hold is actually used** — at the time this landed it was set on 1 of the 72 drawings in column 1, so drawings genuinely waiting on information were reading as chases.
+
 ### Why the DT emails link files, not folders
 
 The DT emails used to carry exactly one hyperlink per folder block, built from the submission's `Folder Link`. That property is a **snapshot of wherever the PDF sat when Make wrote it**, so every drawing actioned before the folder restructure mailed out a link to a `{Project}/{Stage}/Suffix {NNN}/` folder that no longer exists. Newer drawings linked fine, which is why the symptom looked random until it was pinned to the age of the file.
@@ -432,7 +440,15 @@ Three things went with it:
 - **The sibling fan-out** in `PATCH /api/df/submissions/:id/folder-link` — it copied the link onto every other submission in the Suffix so the email would find one. That was a Notion write per sibling on every approve and bounce. The endpoint still records the link on the row Make PATCHes, so Make needs no change.
 - **The `Folder Link` gate** on pending notifications. Approved and Rejected rows were withheld from the notify queue until Make had PATCHed a link back. With the link gone from the email the gate only stranded drawings whose Make run had failed — a notification the DM could never send.
 
-In `grade-summary` the link opens the **drawing the DT must revise**, not the client's mark-up: the mark-up is a separate file that only ever has a path, never a shared link. The return folder is still named in the heading so they can find it.
+`grade-summary` is the exception, and it carries **no hyperlink at all**. Linking the drawing's own `Share Link` there sends the DT to the original submission — the document with none of the client's mark-up on it — which is worse than no link. Instead each drawing row names **the exact file to open**, in full, under the folder named in the heading:
+
+| Return kind | Filename shown | Source |
+|---|---|---|
+| `reviewed` (S3/S4/S5) | the `R_`-prefixed mark-up as it now stands | `Comment Paths`, already rewritten to the Reviewed paths by log-status |
+| `grade-returns` (A4.5/PRD Rejected) | the renamed grade-return PDF | basename of `Dropbox Path` after the log-status move |
+| `signed-off` (A4.5/PRD Approved) | the file, name unchanged | basename of `Dropbox Path` |
+
+A real link to the Reviewed *folder* would need Make to mint a Dropbox shared link for it and PATCH it back, which is a Scenario 2 change and a new property. Not done — the filename plus the folder name was judged enough.
 
 ### One source for the lanes
 
