@@ -1848,39 +1848,40 @@ module.exports = function mountDrawingFlow(app, notion) {
         [{ property: "BIC Since", direction: "ascending" }]
       );
 
-      // Dedupe DT + drawing lookups across this status group — several submissions
-      // can share the same DT or the same MDS drawing (multiple stages/revisions).
       const resolveCached = makeDTResolver(notion);
-      const drawingCache  = new Map(); // drawingId -> Promise<page>
-      const getDrawing = (id) => {
-        if (!drawingCache.has(id)) drawingCache.set(id, withNotionRetry(() => notion.pages.retrieve({ page_id: id })));
-        return drawingCache.get(id);
-      };
 
-      // When the next submission is due from the DT. The programme dates live on the Item,
-      // not the drawing, so this is one read per Item however many drawings hang off it.
-      //
-      // "2nd DT Delivery (Adj)" is the field actually maintained in practice — it is set on
-      // ~90% of the items that currently have work sitting with a DT, where the per-stage
-      // fields ("1st DT Delivery (Plan)", "Constr. DT Delivery (Plan)") are set on under a
-      // fifth. So it leads, with the others as fallbacks rather than as a stage lookup.
-      // It is a per-item date, not per-stage or per-round: it does not advance as QA rounds
-      // go by, so treat it as "when this item is due back", not a per-resubmission deadline.
-      const taskCache = new Map(); // itemId -> Promise<page>
-      const getTask = (id) => {
-        if (!taskCache.has(id)) taskCache.set(id, withNotionRetry(() => notion.pages.retrieve({ page_id: id })));
-        return taskCache.get(id);
-      };
-      const dueDateFor = async (itemIds) => {
-        if (!itemIds?.length) return null;
+      // The two MDS facts this queue needs used to be one pages.retrieve PER DRAWING —
+      // ~97 requests for the Issued queue alone, every 30-second poll, against Notion's
+      // ~3/sec limit. That is what 429'd the cockpit into 500s. Both are now fetched as
+      // SETS: ask the MDS once which drawings carry comments and which are supplier-only,
+      // then look each submission up in memory. ~125 retrieves become ~4 queries, with no
+      // cache and so no staleness. Each set is small enough to fit one page (the largest,
+      // S4 Comments, is under 60 rows).
+      const stagesPresent = [...new Set(results.map((pg) => getProp(pg, "Stage", "select")).filter(Boolean))];
+
+      const commentedDrawings = new Set();
+      if (statusFilter === "Issued" && DRAWINGS_DB) {
+        for (const st of stagesPresent.filter((x) => COMMENT_STAGES.includes(x))) {
+          try {
+            (await queryAll(notion, DRAWINGS_DB, { property: `${st} Comments`, rich_text: { is_not_empty: true } }))
+              .forEach((d) => commentedDrawings.add(d.id));
+          } catch (err) {
+            // A failed lookup means no badge on those cards, not a failed queue.
+            console.warn(`[submissions] ${st} Comments lookup failed:`, err.message);
+          }
+        }
+      }
+
+      const supplierOnlyDrawings = new Set();
+      if ((statusFilter === "Awaiting Issue" || statusFilter === "Issued") && DRAWINGS_DB) {
         try {
-          const task = await getTask(itemIds[0]);
-          return getProp(task, "2nd DT Delivery (Adj)",      "date")
-              ?? getProp(task, "2nd Submission Date (Plan)", "date")
-              ?? getProp(task, "Constr. DT Delivery (Plan)", "date")
-              ?? null;
-        } catch { return null; }  // no due date is a blank cell, not a failed queue
-      };
+          (await queryAll(notion, DRAWINGS_DB, { property: "No Client Approval", checkbox: { equals: true } }))
+            .forEach((d) => supplierOnlyDrawings.add(d.id));
+        } catch (err) {
+          // Fall through to the normal client route rather than mislabelling a drawing.
+          console.warn("[submissions] No Client Approval lookup failed:", err.message);
+        }
+      }
 
       const submissions = await mapWithConcurrency(results, 4, async (page) => {
         const title = getProp(page, "Submission", "title");
@@ -1889,45 +1890,25 @@ module.exports = function mountDrawingFlow(app, notion) {
         const { taskCode, drawingNo } = parseSubmissionTitle(title, stage);
         const dtName = (await resolveCached(dtIds)).name;
 
-        // For the Issued queue, surface whether client comments have been ingested
-        // onto the related MDS drawing for this stage (drives the cockpit comment badge).
-        // Fast path: cr-ingest now flips Ball In Court -> "DM" on the submission itself
-        // when a comment lands, so most rows can skip the extra drawing lookup entirely.
-        let hasComments = getProp(page, "Ball In Court", "select") === "DM" && statusFilter === "Issued";
-        if (statusFilter === "Issued" && !hasComments) {
-          const drawingIds = getProp(page, "Drawing", "relation");
-          if (drawingIds?.length) {
-            try {
-              const dwg = await getDrawing(drawingIds[0]);
-              hasComments = !!getProp(dwg, `${stage} Comments`, "rich_text");
-            } catch { /* drawing fetch failed — leave hasComments false */ }
-          }
-        }
+        const drawingIds = getProp(page, "Drawing", "relation");
+        const taskIds    = getProp(page, "Item",    "relation");
 
-        // Sketches issued straight to a supplier never go out for client approval. The flag
-        // lives on the MDS drawing, and the card needs it *before* Issue is pressed, since
-        // for these Issue is the end of the line rather than the start of a review.
-        // Needed before Issue (the card says where it is going) and after it (the card says
-        // it is with a supplier rather than awaiting client comments).
-        let noClientApproval = false;
-        if (statusFilter === "Awaiting Issue" || statusFilter === "Issued") {
-          const drawingIds = getProp(page, "Drawing", "relation");
-          if (drawingIds?.length) {
-            try {
-              const dwg = await getDrawing(drawingIds[0]);
-              noClientApproval = getProp(dwg, "No Client Approval", "checkbox") === true;
-            } catch { /* drawing fetch failed — treat as a normal client issue */ }
-          }
-        }
+        // Whether client comments have landed on the related MDS drawing for this stage
+        // (drives the cockpit comment badge). cr-ingest flips Ball In Court to "DM" on the
+        // submission itself when a comment arrives, so most rows are answered without
+        // consulting the MDS at all; the set covers the rest.
+        const hasComments = statusFilter === "Issued" &&
+          (getProp(page, "Ball In Court", "select") === "DM" ||
+           drawingIds.some((did) => commentedDrawings.has(did)));
 
-        // Only the two statuses that can be waiting on a DT pay for the Item read.
-        const taskIds = getProp(page, "Item", "relation");
-        const dueDate = (statusFilter === "Rejected" || statusFilter === "Graded")
-          ? await dueDateFor(taskIds)
-          : null;
+        // Sketches issued straight to a supplier never go out for client approval. The card
+        // needs this *before* Issue is pressed (it says where the drawing is going) and
+        // after it (it says the drawing is with a supplier, not awaiting client comments).
+        const noClientApproval = (statusFilter === "Awaiting Issue" || statusFilter === "Issued") &&
+          drawingIds.some((did) => supplierOnlyDrawings.has(did));
 
         return {
-          id: page.id, title, taskCode, drawingNo, dtName, stage, noClientApproval, dueDate,
+          id: page.id, title, taskCode, drawingNo, dtName, stage, noClientApproval,
           revision:    getProp(page, "Revision",     "select"),
           qaRound:     getProp(page, "QA Round",     "number"),
           status:      getProp(page, "Status",       "select"),
@@ -1938,7 +1919,7 @@ module.exports = function mountDrawingFlow(app, notion) {
           revisionDue: getProp(page, "Revision Due", "date"),
           dropboxPath: getProp(page, "Dropbox Path", "url"),
           shareLink:   getProp(page, "Share Link",   "url"),
-          drawingIds:  getProp(page, "Drawing",      "relation"),
+          drawingIds,
           taskIds,
           blocked:     getProp(page, "Blocked",      "checkbox") ?? false,
           clientGrade: getProp(page, "Client Grade", "select"),
