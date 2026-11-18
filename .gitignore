@@ -3,6 +3,10 @@
 
 # Environment variables — never commit secrets
 .env
+# Anything beside .env too: a .bak/.local/.save left by an editor or a script carries
+# the same NOTION_TOKEN, and push-to-github.bat runs `git add -A`.
+.env*
+!.env.example
 node_modules/
 
 # Regenerated on demand by `node tests/activity.test.js --dump-summary` — not a source file.
