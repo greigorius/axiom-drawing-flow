@@ -932,12 +932,12 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   }
   assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage: "A4.5", clientGrade: "Approved" }), "resubmission",
     "A4.5 signed off by the contractor leaves the DT drawing the PRD set");
+  assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage: "PRD", clientGrade: "Approved" }), "resubmission",
+    "the factory signing off PRD still leaves the as-built to draw");
   ok("lane 1: a clean grade below the final stage keeps the drawing with the DT");
 
-  for (const stage of ["AB", "PRD"]) {
-    assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage, clientGrade: "Approved" }), "closed",
-      `${stage} Approved ends the drawing's journey, so it closes`);
-  }
+  assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage: "AB", clientGrade: "Approved" }), "closed",
+    "AB Approved ends the drawing's journey, so it closes");
   assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage: "S3", clientGrade: "No Action" }), "closed",
     "a coordination loop closed without a redraw owes nothing, whatever stage it sat at");
   assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage: "S4", clientGrade: "No Action" }), "closed",

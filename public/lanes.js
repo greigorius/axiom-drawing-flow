@@ -37,9 +37,9 @@
     { id: "blocked",           title: "Blocked — Awaiting Info",         short: "Blocked",           accent: "warn"   },
     // Terminal. Never appears on the cockpit board. Reaching it takes more than a grade
     // that asks for no new revision: an NA at S5 signs off S5 and hands the DT the A4.5
-    // set, so it is still DT work. Only an outcome that ends the drawing's journey closes
-    // (see isFinal). This lane is the whole point of the client card: "these are signed
-    // off".
+    // set, and even a PRD sign-off leaves the as-built to draw — all still DT work. Only
+    // an outcome that ends the drawing's journey closes (see isFinal). This lane is the
+    // whole point of the client card: "these are signed off".
     { id: "closed",            title: "Graded — Signed Off",             short: "Signed Off",        accent: "ok"     },
     // Placeholder rows created ahead of a real submission. Counted separately so they are
     // never mistaken for work in flight.
@@ -69,15 +69,16 @@
   // Asking for no new revision is not the same as being finished. A drawing climbs the
   // stages, and a clean grade below the top hands it FORWARD rather than ending it:
   // S4 A/NA means the DT now owes the S5 set, S5 A/NA the A4.5 set, A4.5 Approved the PRD
-  // set. Those are all DT work, so they belong on the board. The outcomes below are the
-  // only ones after which nothing is owed — the same ones for which log-status writes a
-  // Drawing Status of "Complete" or "Schedule" instead of another round of updates:
-  //   AB / PRD Approved — as-built and factory sign-off
-  //   No Action         — a sketch or S3 coordination loop closed without a redraw; keyed
-  //                       on the grade, not the stage, because a sketch carries these
-  //                       outcomes at whatever stage it is submitted under
+  // set, and PRD Approved the as-built set — the factory signing off is not the end of the
+  // drawing, which is why log-status writes "Schedule" there rather than "Complete", with
+  // As Built Updates still to come. All of that is DT work, so it belongs on the board.
+  // Only these outcomes leave nothing owed:
+  //   AB Approved — the as-built is signed off; log-status writes Drawing Status "Complete"
+  //   No Action   — a sketch or S3 coordination loop closed without a redraw; keyed on the
+  //                 grade, not the stage, because a sketch carries these outcomes at
+  //                 whatever stage it is submitted under
   // A Graded row with no grade on it closes as well, rather than inventing work for the DT.
-  var FINAL_STAGES = { "AB": 1, "PRD": 1 };
+  var FINAL_STAGES = { "AB": 1 };
   function isFinal(s) {
     var grade = s && s.clientGrade;
     if (!grade) return true;
