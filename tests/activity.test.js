@@ -89,6 +89,7 @@ const sub = (id, code, dwgNo, stage, status, extra = {}) => ({
     Drawing:         extra.dwg === null ? rel() : rel(extra.dwg),
     Item:            extra.item ? rel(extra.item) : rel(),
     "DT Notified":   chk(extra.notified ?? true),
+    "Client Grade":  sel(extra.grade || null),
     "Ball In Court": sel(extra.bic || null),
     "Comment Paths": rt(extra.paths || ""),
   },
@@ -99,7 +100,7 @@ const subRows = [
   sub("s2", "24-354-190", "DWG-A", "S4",   "Issued",   { dwg: "d1", item: "task1", qa: 2, on: "2026-02-10" }),
   sub("s3", "24-354-190", "DWG-B", "S4",   "Graded",   { dwg: "d2", item: "task1", qa: 1, on: "2026-01-11" }),
   sub("s4", "24-354-190", "DWG-B", "A4.5", "Issued",   { dwg: "d2", item: "task1", qa: 1, on: "2026-03-01" }),
-  sub("s5", "24-354-200", "DWG-C", "AB",   "Graded",   { dwg: "d3", item: "task2" }),
+  sub("s5", "24-354-200", "DWG-C", "AB",   "Graded",   { dwg: "d3", item: "task2", grade: "Approved" }),
   sub("s6", "24-354-200", "DWG-D", "S4",   "Rejected", { dwg: "d4", item: "task2", notified: false }),
   sub("s7", "24-354-200", "DWG-E", "S4",   "Schedule", { dwg: "d5", item: "task2" }),
   sub("s8", "24-354-200", "DWG-F", "S5",   "Issued",   { dwg: "d6", item: "task2", bic: "DM" }),
@@ -920,15 +921,32 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
     assert.strictEqual(lane({ status: "Graded", dtNotified: true, clientGrade: grade }), "resubmission",
       `grade ${grade} asks for a new rev, so it is with the DT`);
   }
-  for (const grade of ["A", "NA"]) {
-    assert.strictEqual(lane({ status: "Graded", dtNotified: true, clientGrade: grade }), "closed",
-      `grade ${grade} asks for nothing further, so it closes`);
+  // A clean grade asks for no new revision, but below the final stage it does not finish
+  // the drawing either — it hands it forward, and the next stage is the DT's to draw.
+  // This is the 34320 case: S5 NA, signed off at S5, DT now owes the A4.5 set.
+  for (const stage of ["S4", "S5"]) {
+    for (const grade of ["A", "NA"]) {
+      assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage, clientGrade: grade }), "resubmission",
+        `${stage} ${grade} signs off ${stage} and hands the next stage to the DT`);
+    }
   }
-  assert.strictEqual(lane({ status: "Graded", dtNotified: true, clientGrade: null }), "closed",
+  assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage: "A4.5", clientGrade: "Approved" }), "resubmission",
+    "A4.5 signed off by the contractor leaves the DT drawing the PRD set");
+  ok("lane 1: a clean grade below the final stage keeps the drawing with the DT");
+
+  for (const stage of ["AB", "PRD"]) {
+    assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage, clientGrade: "Approved" }), "closed",
+      `${stage} Approved ends the drawing's journey, so it closes`);
+  }
+  assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage: "S3", clientGrade: "No Action" }), "closed",
+    "a coordination loop closed without a redraw owes nothing, whatever stage it sat at");
+  assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage: "S4", clientGrade: "No Action" }), "closed",
+    "a sketch carries its outcomes at whatever stage it was submitted under");
+  assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage: "S5", clientGrade: null }), "closed",
     "an ungraded Graded row closes rather than inventing work for the DT");
   assert.strictEqual(lane({ status: "Graded", dtNotified: false, clientGrade: "C" }), "graded",
     "a grade still awaiting its email is the DM's to send");
-  ok("lane 1: B / C / Rejected / QA Rejected go to the DT, A / NA close");
+  ok("lane 1: only an outcome that ends the drawing reaches the signed-off lane");
 
   // The behaviour Greig asked for in so many words: the card disappears when the rev lands.
   // Both halves are checked — same stage, higher round; and a later stage at a lower round,

@@ -360,15 +360,20 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(hook("move-files"), undefined);
   ok("re-grade → no duplicate moves");
 
-  // Grade A is the client accepting as issued: nothing is owed, so any date left over from
-  // an earlier round is cleared rather than left to read as an overdue revision.
+  // Grade A is the client accepting as issued — but accepting S5 does not finish the
+  // drawing, it hands the DT the A4.5 set. Work is still owed, so the date is stamped on
+  // the same working-day rule a B gets rather than cleared. Only an outcome that ends the
+  // drawing clears it (see the S3 No Action case below).
   const aUpd = updates.find((u) => u.page_id === "subI").properties;
   // Note: deepStrictEqual would fail here on prototype identity alone — these property
   // objects are built inside the vm sandbox, so they are cross-realm.
-  assert.ok("Revision Due" in aUpd, "a closing grade still writes the property");
-  assert.strictEqual(aUpd["Revision Due"].date, null,
-    "a closing grade clears Revision Due instead of leaving a stale deadline");
-  ok("log-status: grade A clears Revision Due");
+  assert.ok(aUpd["Revision Due"]?.date?.start,
+    "S5 grade A still owes the A4.5 set, so it carries a due date");
+  assert.ok(aUpd["Revision Due"].date.start > "2026-09-09",
+    `due date must be after the 2026-09-09 return date, got ${aUpd["Revision Due"].date.start}`);
+  const aDue = new Date(aUpd["Revision Due"].date.start);
+  assert.ok(aDue.getDay() !== 0 && aDue.getDay() !== 6, "working days only");
+  ok("log-status: S5 grade A stamps Revision Due for the next stage");
 
   // A4.5 Rejected → 05_Client Comments with the grade-return name
   submissions = [issued("subC", "A4.5", "C01", { "Submission": title(`24-367-003_${DWG}_A4.5_R1`),
@@ -637,6 +642,16 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(r.status, 200, JSON.stringify(r.json));
   assert.strictEqual(updates.find((u) => u.page_id === "dwgS3").properties["Drawing Status"].select.name, "Complete");
   ok("log-status: S3 Revise \u2192 DT Review, No Action \u2192 Complete, neither writes a status field");
+
+  // No Action ends the coordination loop outright — nothing follows it, so any date left
+  // over from an earlier round is cleared rather than left to read as an overdue revision.
+  // This is the counterpart to the S5 grade A case above: closing is about the outcome
+  // ending the drawing, not merely about asking for no new revision.
+  const naUpd = updates.find((u) => u.page_id === "subS3b").properties;
+  assert.ok("Revision Due" in naUpd, "a closing grade still writes the property");
+  assert.strictEqual(naUpd["Revision Due"].date, null,
+    "a closing grade clears Revision Due instead of leaving a stale deadline");
+  ok("log-status: No Action clears Revision Due");
 
   // cr-ingest now accepts S3, which is what lets the architect's mark-ups be tracked at all.
   submissions = [{ id: "subS3c", properties: { "Status": sel("Issued"), "Stage": sel("S3"), "Revision": sel("P01"),

@@ -1357,11 +1357,16 @@ const Cockpit = () => {
 
   const statusPill = (colId, s) => {
     switch (colId) {
-      // Same column, two routes in — the pill says which, so it is obvious whether the DT
-      // is reworking a QA bounce or incorporating the client's comments.
-      case "resubmission":      return s.status === "Graded"
-        ? { cls: "grade",  txt: `Grade ${s.clientGrade || "—"} · rev due` }
-        : { cls: "danger", txt: `R${s.qaRound ?? "?"} Bounced` };
+      // Same column, three routes in — the pill says which, so it is obvious whether the DT
+      // is reworking a QA bounce, incorporating the client's comments, or drawing the next
+      // stage after a clean grade. The third is not rework: an NA at S5 signs S5 off and
+      // hands over the A4.5 set, so labelling it "rev due" would read as a drawing that
+      // came back when it did not.
+      case "resubmission":      return s.status !== "Graded"
+        ? { cls: "danger", txt: `R${s.qaRound ?? "?"} Bounced` }
+        : (DFLanes && DFLanes.needsRevision(s.clientGrade))
+          ? { cls: "grade", txt: `Grade ${s.clientGrade || "—"} · rev due` }
+          : { cls: "ok",    txt: `Grade ${s.clientGrade || "—"} · next stage` };
       case "submitted":         return { cls: "info",  txt: "Submitted" };
       case "reviewed":          return s.status === "Rejected" ? { cls: "danger", txt: "Bounced" } : { cls: "ok", txt: "Approved" };
       // A no-approval drawing is issued to a supplier and completed in the same press, so

@@ -35,10 +35,11 @@
     // the flow and parked work is not part of that flow — but it stays visible, since a
     // blocked drawing is the one most easily forgotten.
     { id: "blocked",           title: "Blocked — Awaiting Info",         short: "Blocked",           accent: "warn"   },
-    // Terminal. Never appears on the cockpit board. Only a grade that asks for nothing
-    // further (A / NA) closes; B, C and the Rejected grades hand the drawing back to the DT
-    // and belong in "resubmission". This lane is the whole point of the client card:
-    // "these are signed off".
+    // Terminal. Never appears on the cockpit board. Reaching it takes more than a grade
+    // that asks for no new revision: an NA at S5 signs off S5 and hands the DT the A4.5
+    // set, so it is still DT work. Only an outcome that ends the drawing's journey closes
+    // (see isFinal). This lane is the whole point of the client card: "these are signed
+    // off".
     { id: "closed",            title: "Graded — Signed Off",             short: "Signed Off",        accent: "ok"     },
     // Placeholder rows created ahead of a real submission. Counted separately so they are
     // never mistaken for work in flight.
@@ -64,6 +65,25 @@
   // to "No Action" — it asks for an updated sketch, so it belongs here with the rest.
   var REVISION_GRADES = { "B": 1, "C": 1, "Rejected": 1, "QA Rejected": 1, "Revise": 1 };
   function needsRevision(grade) { return !!REVISION_GRADES[grade]; }
+
+  // Asking for no new revision is not the same as being finished. A drawing climbs the
+  // stages, and a clean grade below the top hands it FORWARD rather than ending it:
+  // S4 A/NA means the DT now owes the S5 set, S5 A/NA the A4.5 set, A4.5 Approved the PRD
+  // set. Those are all DT work, so they belong on the board. The outcomes below are the
+  // only ones after which nothing is owed — the same ones for which log-status writes a
+  // Drawing Status of "Complete" or "Schedule" instead of another round of updates:
+  //   AB / PRD Approved — as-built and factory sign-off
+  //   No Action         — a sketch or S3 coordination loop closed without a redraw; keyed
+  //                       on the grade, not the stage, because a sketch carries these
+  //                       outcomes at whatever stage it is submitted under
+  // A Graded row with no grade on it closes as well, rather than inventing work for the DT.
+  var FINAL_STAGES = { "AB": 1, "PRD": 1 };
+  function isFinal(s) {
+    var grade = s && s.clientGrade;
+    if (!grade) return true;
+    if (grade === "No Action") return true;
+    return !!FINAL_STAGES[s && s.stage] && grade === "Approved";
+  }
 
   function time(d) { var t = d ? Date.parse(d) : NaN; return isNaN(t) ? 0 : t; }
 
@@ -97,7 +117,10 @@
       // Notified and the grade asks for a new rev: the ball is with the DT, so it belongs
       // in column 1 rather than dropping off the board. latestPerDrawing() clears it the
       // moment that rev lands.
-      return needsRevision(s.clientGrade) ? "resubmission" : "closed";
+      if (needsRevision(s.clientGrade)) return "resubmission";
+      // Clean, but not the end of the road: the next stage is the DT's to draw, so the
+      // card stays in column 1 instead of being filed as signed off.
+      return isFinal(s) ? "closed" : "resubmission";
     }
     return null; // unknown status — counted nowhere rather than counted wrongly
   }
@@ -160,7 +183,7 @@
   }
 
   return { LANES: LANES, LANE_ORDER: LANE_ORDER, LANE_TITLE: LANE_TITLE, LANE_SHORT: LANE_SHORT,
-           stageRank: stageRank, needsRevision: needsRevision,
+           stageRank: stageRank, needsRevision: needsRevision, isFinal: isFinal,
            laneOf: laneOf, latestPerDrawing: latestPerDrawing,
            summarise: summarise };
 });

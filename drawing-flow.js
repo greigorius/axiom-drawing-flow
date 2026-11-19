@@ -3166,12 +3166,16 @@ module.exports = function mountDrawingFlow(app, notion) {
     const gradedAt         = now();
     const statusDate       = returnDate || gradedAt;   // prefer project-system date over today
 
-    // A grade that hands the drawing back gets a revision due date, computed from the
-    // client's return date rather than today — the DT's clock starts when the comments
-    // came in. A grade that closes the drawing (A / NA / Approved / No Action) clears any
-    // date left over from an earlier round, so nothing shows as owed when it is not.
+    // A grade that leaves work with the DT gets a due date, computed from the client's
+    // return date rather than today — the DT's clock starts when the comments came in.
+    // Two kinds of grade leave work behind: one that asks for a new revision (B / C /
+    // Rejected), and a clean one below the final stage, which does not end the drawing but
+    // hands it forward for the DT to draw the next stage. Only an outcome that finishes the
+    // drawing (AB / PRD Approved, or a sketch's No Action) clears any date left over from
+    // an earlier round, so nothing shows as owed when it is not.
     const gradeNeedsRevision = LANES.needsRevision(grade);
-    const gradeRevDue = gradeNeedsRevision
+    const gradeOwesWork      = gradeNeedsRevision || !LANES.isFinal({ stage, clientGrade: grade });
+    const gradeRevDue = gradeOwesWork
       ? addWorkingDays(statusDate, await getRevisionDays(notion, drawingIds))
       : null;
 
