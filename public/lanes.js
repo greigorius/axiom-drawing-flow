@@ -77,11 +77,13 @@
   //   No Action   — a sketch or S3 coordination loop closed without a redraw; keyed on the
   //                 grade, not the stage, because a sketch carries these outcomes at
   //                 whatever stage it is submitted under
-  // A Graded row with no grade on it closes as well, rather than inventing work for the DT.
+  // A Graded row with no grade recorded stays on the board rather than closing. In practice
+  // a blank is an NA — the architect reviewed something non-aesthetic and issued no status —
+  // which amounts to an A, and the DT still has to carry the drawing into the next revision.
+  // Filing it as signed off would hide live work, which is the failure that matters here.
   var FINAL_STAGES = { "AB": 1 };
   function isFinal(s) {
     var grade = s && s.clientGrade;
-    if (!grade) return true;
     if (grade === "No Action") return true;
     return !!FINAL_STAGES[s && s.stage] && grade === "Approved";
   }

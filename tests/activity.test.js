@@ -812,6 +812,23 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   assert.strictEqual(t200.scheduled, 1, "placeholder rows are counted apart from work in flight");
   ok("summary: terminal and placeholder rows have lanes of their own");
 
+  // Regression: the summary mapper once omitted Client Grade entirely, so every Graded row
+  // reached laneOf with an undefined grade and was filed as signed off — the client card
+  // reported drawings that were sitting with the DT as complete. Flip the one graded
+  // fixture's grade and the lane must follow it; if the grade is not being read, it will
+  // not. s5 is restored afterwards so the assertions above keep their meaning.
+  const s5Grade = subRows.find((x) => x.id === "s5").properties["Client Grade"];
+  subRows.find((x) => x.id === "s5").properties["Client Grade"] = sel("Rejected");
+  r = await call("GET /api/df/activity-summary");
+  const t200Rejected = laneMap(Object.fromEntries(r.json.items.map((i) => [i.taskCode, i]))["24-354-200"]);
+  assert.strictEqual(t200Rejected.closed, undefined,
+    "a rejected drawing is not signed off — the grade must reach laneOf");
+  assert.strictEqual(t200Rejected.resubmission, 1,
+    "AB Rejected hands the drawing back, so the client card says so");
+  subRows.find((x) => x.id === "s5").properties["Client Grade"] = s5Grade;
+  r = await call("GET /api/df/activity-summary");
+  ok("summary: the client card reads the grade, so a bounce is never reported as signed off");
+
   assert.strictEqual(r.json.unlinked.drawings, 1,
     "a submission with no Item is surfaced as unlinked, not folded onto another card");
   assert.ok(!r.json.items.some((i) => i.taskCode === null && i.drawingTotal > 0));
@@ -942,8 +959,8 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
     "a coordination loop closed without a redraw owes nothing, whatever stage it sat at");
   assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage: "S4", clientGrade: "No Action" }), "closed",
     "a sketch carries its outcomes at whatever stage it was submitted under");
-  assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage: "S5", clientGrade: null }), "closed",
-    "an ungraded Graded row closes rather than inventing work for the DT");
+  assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage: "S5", clientGrade: null }), "resubmission",
+    "a blank grade is an NA in practice — effectively an A, still to be carried into the next rev");
   assert.strictEqual(lane({ status: "Graded", dtNotified: false, clientGrade: "C" }), "graded",
     "a grade still awaiting its email is the DM's to send");
   ok("lane 1: only an outcome that ends the drawing reaches the signed-off lane");

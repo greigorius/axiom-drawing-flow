@@ -3794,6 +3794,10 @@ module.exports = function mountDrawingFlow(app, notion) {
             drawingIds:  getProp(page, "Drawing",      "relation"),
             taskIds:     getProp(page, "Item",         "relation"),
             dtNotified:  getProp(page, "DT Notified",  "checkbox") ?? false,
+            // laneOf needs the grade to tell a drawing that came back from one that is
+            // signed off. Omitting it sent every Graded row to "closed", so the client card
+            // reported B and C grades — drawings sitting with the DT — as signed off.
+            clientGrade: getProp(page, "Client Grade",  "select"),
             hasComments: getProp(page, "Ball In Court", "select") === "DM" || unreviewed,
           };
         }));
