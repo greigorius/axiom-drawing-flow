@@ -701,8 +701,8 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   ok("grade email: names the exact return file per drawing, no links");
 
   // Drawing Status is finalised here, and Approved differs by stage:
-  //   A4.5 → Production Updates (DT now draws the PRD set)
-  //   PRD  → Schedule (factory signed off; item goes for production scheduling)
+  //   A4.5 → Schedule (signed off; the Production tab decides what comes next)
+  //   PRD  → In Production (factory signed the sketch off; no as-built)
   // Rejected → DT Review for both.
   submissions = [
     { id: "g4", properties: { "Status": sel("Graded"), "DT Notified": { checkbox: false }, "Stage": sel("A4.5"), "Client Grade": sel("Approved"), "Revision": sel("C01"),
@@ -719,10 +719,10 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
   r = await call("POST /api/df/send-grade-emails", { body: {} });
   assert.strictEqual(r.status, 200, JSON.stringify(r.json));
   const dsOf = (id) => updates.find((u) => u.page_id === id)?.properties?.["Drawing Status"]?.select?.name;
-  assert.strictEqual(dsOf("dwgA45"),    "Production Updates");
-  assert.strictEqual(dsOf("dwgPRD"),    "Schedule");
+  assert.strictEqual(dsOf("dwgA45"),    "Schedule");
+  assert.strictEqual(dsOf("dwgPRD"),    "In Production");
   assert.strictEqual(dsOf("dwgPRDrej"), "DT Review");
-  ok("grade email finalises Drawing Status: A4.5 Approved → Production Updates, PRD Approved → Schedule, Rejected → DT Review");
+  ok("grade email finalises Drawing Status: A4.5 Approved → Schedule, PRD Approved → In Production, Rejected → DT Review");
 
   // Grade A = client accepted as issued (no mark-ups came back, so no comment PDF and no
   // revision). Only B asks for the next revision. A used to fall through to B's label.

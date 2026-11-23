@@ -545,3 +545,16 @@ S3 is in `COMMENT_STAGES`, so cr-ingest logs the architect's mark-ups into **S3 
 
 
 **Sketches take coordination outcomes at any stage.** A drawing numbered `-SK-I-`, or anything at stage S3, is closed off with **Revise** / **No Action** rather than A/B/C — whatever stage it was submitted at. The drawing number is the test rather than `Dwg No. Assigned`, because only 79 of the 182 SK-I drawings are tagged *Sketch* (97 have no kind set, 6 are tagged *Drawing*). A sketch outcome never writes `{Stage} Status` or its date.
+
+## Production tab (20 Nov 2026)
+Toolbar toggle **Design | Production**. A4.5 drawings are the client-facing manufacturing drawings; PRD drawings are separate supporting sketches that go through the normal flow. Rules: `phaseOf` / `productionLaneOf` / `supplyDoneFor` in `public/lanes.js`; tests in `tests/production-lanes.test.js`.
+- Where a drawing is after sign-off lives on its MDS row: **Production Stage** (Awaiting Supply Drawings / To Be Scheduled / In Production / Awaiting As Built / Complete) plus **Production Log** (one line per move).
+- Columns: A4.5 signed off — decide → Awaiting supply drawings → To be scheduled → In production → Awaiting install → Awaiting as-built → As-built review.
+- **Contract Route** (Tasks DB, set per item from the card or in batch) decides the moves offered on a signed-off A4.5: In-house / Supply Only → Supply dwgs or To schedule; Supply & Install → To supplier (In production); Install Only (also site-only drawings) → Awaiting install. Cards drawn by an Outsourced / By Supplier DT show an Outsourced badge.
+- **Scheduled…** asks for the date the WO was raised: written to the drawing's Schedule Production (Actual) and the item's WO Raised (previous value kept in the log for Move back). Then **Installed** (from In production or Awaiting install), **Complete**, **Move back**.
+- Batch bar on the Production tab: Move to (any stage), Scheduled (one WO date for all ticked To be scheduled cards), Set route, Move back. Runs one card at a time; failures listed at the end.
+- Awaiting supply drawings moves itself to To be scheduled once every PRD on the item is signed off.
+- PRD signed off (factory / supplier) → In production, **Complete** closes it; no as-built.
+- Sign-off Drawing Status at send-grade-emails: A4.5 Approved → Schedule, PRD Approved → In Production. AB Approved also sets Production Stage Complete.
+- `GET /api/df/production-stages` (stages + routes), `POST /api/df/drawings/:drawingId/production {to, woDate?}`, `POST /api/df/items/:itemId/route {route}`. `/api/df/submissions` also serves `Schedule` and `Complete`.
+- The Submissions **Manual Move** checkbox from the first version is unused and can be deleted.

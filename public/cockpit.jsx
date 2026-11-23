@@ -151,6 +151,32 @@ function projectColor(taskCode) {
 
 // ─── Modals ───────────────────────────────────────────────────────────────────
 
+// Scheduled: asks for the date the works order was raised. Written to the drawing's
+// Schedule Production (Actual) and the item's WO Raised. One date for every card passed in.
+const ScheduleModal = ({ cards, onConfirm, onClose }) => {
+  const [woDate, setWoDate] = useState(new Date().toISOString().slice(0, 10));
+  const [busy, setBusy] = useState(false);
+  const submit = async () => { setBusy(true); await onConfirm(cards, woDate); setBusy(false); onClose(); };
+  const items = [...new Set(cards.map((c) => c.taskCode).filter(Boolean))];
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h3>Scheduled — {cards.length === 1 ? (cards[0].drawingNo || cards[0].title) : `${cards.length} drawings`}</h3>
+        <div className="modal-sub">{items.join(" · ")}</div>
+        <label style={{ display: "block", fontSize: 13, color: "var(--text2)", margin: "16px 0 6px" }}>Date the WO was raised</label>
+        <input type="date" value={woDate} onChange={(e) => setWoDate(e.target.value)} className="k-search" style={{ maxWidth: 200 }} aria-label="Date the WO was raised" />
+        <p style={{ fontSize: 12, color: "var(--muted)", margin: "10px 0 0" }}>
+          Written to each drawing's Schedule Production (Actual) and the item's WO Raised. Move back puts the previous WO Raised back.
+        </p>
+        <div className="modal-actions">
+          <button className="btn btn-ghost" onClick={onClose} disabled={busy}>Cancel</button>
+          <button className="btn btn-approve" onClick={submit} disabled={busy || !woDate}>{busy ? "Saving…" : "Scheduled"}</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const BounceModal = ({ submission, onConfirm, onClose }) => {
   const [busy, setBusy] = useState(false);
 
@@ -783,6 +809,15 @@ const Cockpit = () => {
   const [scanCommentsResult,   setScanCommentsResult]   = useState(null);  // "ok" | "error" | null
   const [withDT,               setWithDT]               = useState([]);
   const [blockedItems,         setBlockedItems]         = useState([]);
+  // Production tab: drawings past A4.5 sign-off, current submission only (lanes.js phaseOf).
+  const [production,           setProduction]           = useState([]);
+  // MDS Production Stage per drawing id (GET /api/df/production-stages).
+  const [prodStages,           setProdStages]           = useState({});
+  const [prodRoutes,           setProdRoutes]           = useState({});   // itemId → Contract Route
+  const [scheduleTargets,      setScheduleTargets]      = useState(null); // cards for the WO date modal
+  const [prodBatch,            setProdBatch]            = useState({ to: "", route: "" });
+  const [view, setViewState] = useState(() => { try { return localStorage.getItem("df.view") || "design"; } catch { return "design"; } });
+  const setView = (v) => { setViewState(v); try { localStorage.setItem("df.view", v); } catch { /* private mode */ } };
   const [graded,               setGraded]               = useState([]);
   const [sendGradeEmailsBusy,  setSendGradeEmailsBusy]  = useState(false);
   const [sendGradeResult,      setSendGradeResult]      = useState(null);  // "ok" | "error" | null
@@ -840,6 +875,7 @@ const Cockpit = () => {
 
   // ── Fetch ────────────────────────────────────────────────────────────────
   const consecutiveErrors = React.useRef(0);
+  const prodStagesRef = React.useRef(null);
 
   // Chunked fetch — one small request per status group instead of a single monolithic
   // /api/df/queue call. The old approach ran ~10-15 sequential Notion queries inside one
@@ -847,8 +883,10 @@ const Cockpit = () => {
   // ran past Netlify's function timeout and came back as a 502. Splitting into per-status
   // requests keeps each Lambda invocation short; a small stagger on kickoff (rather than
   // firing all 7 at once) keeps the aggregate Notion call rate reasonable.
+  // Schedule and Complete only matter to the Production tab: old-flow A4.5 sign-offs were
+  // written as Schedule, and Complete rows are what close a drawing (and supersede older rows).
   const STATUS_FETCHES = [
-    "Submitted", "Rejected", "Approved", "Awaiting Issue", "Issued", "Graded",
+    "Submitted", "Rejected", "Approved", "Awaiting Issue", "Issued", "Graded", "Schedule", "Complete",
   ];
 
   const fetchQueue = useCallback(async (silent = false) => {
@@ -875,7 +913,8 @@ const Cockpit = () => {
         return fetchWithRetry("/api/df/submissions?status=pending-notification", "pending");
       };
 
-      const [subs, bounced_, approved_, await_, iss, graded_, pending] = await Promise.all([
+      const stagesP = fetch("/api/df/production-stages").then((r) => (r.ok ? r.json() : { stages: null })).catch(() => ({ stages: null }));
+      const [subs, bounced_, approved_, await_, iss, graded_, sched_, complete_, pending] = await Promise.all([
         ...STATUS_FETCHES.map((s, i) => fetchStatus(s, i)),
         fetchPending(STATUS_FETCHES.length),
       ]);
@@ -894,8 +933,24 @@ const Cockpit = () => {
       // resubmitted at S5 R1 is no longer with the DT even though 1 < 2. A submission with
       // no Drawing relation keys on its own id there, so it survives as itself.
       const current = DFLanes
-        ? DFLanes.latestPerDrawing([...subs, ...bounced_, ...approved_, ...await_, ...iss, ...graded_])
+        ? DFLanes.latestPerDrawing([...subs, ...bounced_, ...approved_, ...await_, ...iss, ...graded_, ...sched_, ...complete_])
         : [];
+      // A failed stage lookup keeps the last good set rather than emptying the tab.
+      const stagesRes = await stagesP;
+      const stages = stagesRes.stages || prodStagesRef.current || {};
+      prodStagesRef.current = stages;
+      setProdStages(stages);
+      if (stagesRes.routes) setProdRoutes(stagesRes.routes);
+      const stageOf = (s) => (stages[(s.drawingIds || [])[0]] || {}).stage || null;
+      setProduction(current
+        .filter((s) => DFLanes.phaseOf(s, stageOf(s)) === "production")
+        .map((s) => {
+          const ps = stageOf(s), itemId = (s.taskIds || [])[0];
+          const supplyDone = ps === "Awaiting Supply Drawings" && itemId ? DFLanes.supplyDoneFor(itemId, current, stageOf) : false;
+          return { ...s, prodStage: ps, prodLog: (stages[(s.drawingIds || [])[0]] || {}).log || "",
+                   supplyDone, prodLane: DFLanes.productionLaneOf(s, ps, { supplyDone }) };
+        })
+        .filter((s) => s.prodLane));
 
       setSubmitted(subs);
       setWithDT(current.filter((s) => DFLanes.laneOf(s) === "resubmission"));
@@ -1082,20 +1137,48 @@ const Cockpit = () => {
   };
 
   // ── Batch actions ────────────────────────────────────────────────────────
+  // What each batch action leaves behind. A refusal naming exactly that state is not a
+  // failure, it is the same work arriving twice — the row is already where the click was
+  // trying to put it. Reporting that as an error sends you looking for damage that is not
+  // there, which is how a successful bounce came to look like a broken one.
+  const SETTLED_STATE = { bounce: "Rejected", approve: "Approved", issue: "Issued" };
+
   const runBatch = async (ids, apiPath, method = "PATCH", body = null) => {
+    if (!ids.length) return;
     setBatchBusy(true);
     try {
       const results = await Promise.allSettled(
-        ids.map((id) =>
-          fetch(`/api/df/submissions/${id}/${apiPath}`, {
+        ids.map(async (id) => {
+          const res = await fetch(`/api/df/submissions/${id}/${apiPath}`, {
             method,
             headers: body ? { "Content-Type": "application/json" } : undefined,
             body:    body ? JSON.stringify(body) : undefined,
-          })
-        )
+          });
+          if (res.ok) return null;
+          // The routes answer a refusal with { error } naming the state the row was in.
+          // Carrying that out of here is the difference between "something failed" and
+          // "this drawing was already Rejected".
+          const detail = await res.json().catch(() => ({}));
+          const msg    = detail.error || res.statusText || `HTTP ${res.status}`;
+          const settled = SETTLED_STATE[apiPath];
+          if (settled && new RegExp(`\\b${settled}\\b`).test(msg)) return "already";
+          throw new Error(msg);
+        })
       );
-      const failed = results.filter((r) => r.status === "rejected" || (r.value && !r.value.ok));
-      if (failed.length) alert(`${failed.length} of ${ids.length} actions failed. Check console.`);
+      // Name what went wrong per drawing rather than a count and "check console". A batch
+      // is partly-applied by nature — the rows that were in the right state have already
+      // gone through — so the message has to say which ones did not and why.
+      const failed = results
+        .map((r, i) => (r.status === "rejected" ? { id: ids[i], why: r.reason?.message || "Failed" } : null))
+        .filter(Boolean);
+      if (failed.length) {
+        const cards = BOARD.flatMap((c) => c.items);
+        const name  = (id) => { const c = cards.find((x) => x.id === id); return (c && (c.drawingNo || c.title)) || id; };
+        alert(`${ids.length - failed.length} of ${ids.length} went through.\n\nThese did not:\n` +
+              failed.map((f) => `\u2022 ${name(f.id)} — ${f.why}`).join("\n"));
+      }
+      // Rows that were already in the target state are counted as done and raise nothing:
+      // the board refreshes below and shows them where they belong.
       clearSelection();
       await fetchQueue(true);
     } catch (err) {
@@ -1207,6 +1290,62 @@ const Cockpit = () => {
       setSendGradeEmailsBusy(false);
       setTimeout(() => setSendGradeResult(null), 4000);
     }
+  };
+
+  // Production-tab moves. Each writes the drawing's MDS Production Stage (and the dates
+  // that go with it) via POST /api/df/drawings/:id/production. Complete and Move back ask first.
+  const PROD_CONFIRM = {
+    "Complete": "Mark this drawing Complete? It drops off the Production tab.",
+    "back":     "Move this drawing back to where it was before the last move?",
+  };
+  const moveOne = async (s, to, extra = {}) => {
+    const drawingId = (s.drawingIds || [])[0];
+    if (!drawingId) return { ok: false, error: "no drawing linked" };
+    const res  = await fetch(`/api/df/drawings/${drawingId}/production`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ to, ...extra }),
+    });
+    const body = await res.json().catch(() => ({}));
+    return res.ok ? { ok: true } : { ok: false, error: body.error || res.statusText };
+  };
+  const handleProduction = async (s, to) => {
+    if (PROD_CONFIRM[to] && !window.confirm(`${s.drawingNo || s.title}: ${PROD_CONFIRM[to]}`)) return;
+    setBusy(s.id);
+    try {
+      const r = await moveOne(s, to);
+      if (!r.ok) alert(`Not moved: ${r.error}`);
+      await fetchQueue(true);
+    } catch (err) {
+      alert(`Not moved: ${err.message}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+  // One after another, so Notion's rate limit is never hit; failures are listed at the end.
+  const runProdBatch = async (cards, fn, label) => {
+    setBatchBusy(true);
+    const failed = [];
+    for (const s of cards) {
+      try { const r = await fn(s); if (r && r.ok === false) failed.push(`${s.drawingNo || s.title}: ${r.error}`); }
+      catch (err) { failed.push(`${s.drawingNo || s.title}: ${err.message}`); }
+    }
+    setBatchBusy(false);
+    setSelectedIds(new Set());
+    await fetchQueue(true);
+    if (failed.length) alert(`${label}: ${cards.length - failed.length} of ${cards.length} done.\n\n${failed.join("\n")}`);
+  };
+  const scheduleCards = (cards, woDate) => runProdBatch(cards, (s) => moveOne(s, "In Production", { woDate }), "Scheduled");
+  const setRoute = async (itemIds, route) => {
+    const ids = [...new Set(itemIds.filter(Boolean))];
+    if (!ids.length) { alert("No item linked."); return; }
+    setBatchBusy(true);
+    const failed = [];
+    for (const id of ids) {
+      const res = await fetch(`/api/df/items/${id}/route`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ route }) });
+      if (!res.ok) failed.push(id);
+    }
+    setBatchBusy(false);
+    setProdRoutes((m) => { const n = { ...m }; ids.forEach((id) => { if (!failed.includes(id)) n[id] = route || undefined; }); return n; });
+    if (failed.length) alert(`Route not saved on ${failed.length} item(s).`);
   };
 
   const handleHold = async (id, currentBlocked) => {
@@ -1343,17 +1482,57 @@ const Cockpit = () => {
       sub: "Parked by Hold · not waiting on the DT or the DM", items: blockedItems },
   ];
 
+  // The main board is design only: a drawing past A4.5 sign-off lives on the Production tab.
+  const stageOfCard = (s) => (prodStages[(s.drawingIds || [])[0]] || {}).stage || null;
+  if (DFLanes) COLS.forEach((c) => { c.items = c.items.filter((s) => DFLanes.phaseOf(s, stageOfCard(s)) !== "production"); });
+
+  // Production tab. Each card keeps the action its submission would have on the main board
+  // (Approve / Bounce / Issue / Grade), found from its main-board lane; emails are sent from
+  // the column head, scoped to that column's cards so nothing else goes out.
+  const nativeLane = (s) => (DFLanes ? DFLanes.laneOf(s) : null);
+  const prodIn = (id) => production.filter((s) => s.prodLane === id);
+  const PROD_COLS = DFLanes ? DFLanes.PRODUCTION_LANES.map((l) => {
+    const items = prodIn(l.id);
+    const toNotify = items.filter((s) => nativeLane(s) === "reviewed").map((s) => s.id);
+    const toGrade  = items.filter((s) => nativeLane(s) === "graded").map((s) => s.id);
+    return {
+      id: l.id, title: l.title, sub: l.sub, items, accent: `var(--${l.accent})`, production: true,
+      action: toNotify.length ? { label: sendDtLabel, disabled: sendEmailBusy, count: toNotify.length, onClick: () => handleSendDTEmails(toNotify) } : null,
+      action2: toGrade.length ? { label: sendGradeLabel, disabled: sendGradeEmailsBusy, count: toGrade.length, onClick: () => handleSendGradeEmails(toGrade) } : null,
+    };
+  }) : [];
+  const BOARD = view === "production" ? PROD_COLS : COLS;
+  const productionCount = production.length;
+
+  // The bulk bar floats over the whole board, so one selection can span columns — and these
+  // actions are not interchangeable. Firing every one of them at everything selected is
+  // what produced a 409 from the rows that were never in the right state, after the
+  // eligible ones had already moved: the batch half-worked and the alert only said a count.
+  // Each action is now scoped to the cards it actually applies to — the same care the Grade
+  // button already takes — and its button carries the count, so what will move is visible
+  // before the click. The server-side status guards stay as the backstop.
+  const selectedCards = BOARD.flatMap((c) => c.items).filter((s) => selectedIds.has(s.id));
+  const idsOf         = (arr) => arr.map((s) => s.id);
+  // Approve and Bounce are the two outcomes of reviewing a submission, so both want the
+  // same pool: a drawing that is actually sitting in review, and not parked on hold.
+  const reviewableSel = idsOf(selectedCards.filter((s) => s.status === "Submitted" && !s.blocked));
+  // Issue needs the DWGs uploaded first, which is exactly what Awaiting Issue means — an
+  // Approved card still waiting on the DT is not ready and the route refuses it.
+  const issuableSel   = idsOf(selectedCards.filter((s) => s.status === "Awaiting Issue" && !s.blocked));
+  // Hold parks a card; one already parked has nothing to do.
+  const holdableSel   = idsOf(selectedCards.filter((s) => !s.blocked));
+
   const q = search.trim().toLowerCase();
   const matchSearch = (s) => !q || `${s.drawingNo || ""} ${s.title || ""} ${s.taskCode || ""} ${s.dtName || ""}`.toLowerCase().includes(q);
 
   // Every DT with something on the board, plus a bucket for cards with no DT set.
   const UNASSIGNED = "— No DT —";
   const dtNames = Array.from(new Set(
-    COLS.flatMap((c) => c.items).map((s) => s.dtName || UNASSIGNED)
+    BOARD.flatMap((c) => c.items).map((s) => s.dtName || UNASSIGNED)
   )).sort((a, b) => (a === UNASSIGNED ? 1 : b === UNASSIGNED ? -1 : a.localeCompare(b)));
   const matchDT = (s) => !dtFilter || (s.dtName || UNASSIGNED) === dtFilter;
   const matches = (s) => matchSearch(s) && matchDT(s);
-  const dtTotal = dtFilter ? COLS.reduce((n, c) => n + c.items.filter(matches).length, 0) : 0;
+  const dtTotal = dtFilter ? BOARD.reduce((n, c) => n + c.items.filter(matches).length, 0) : 0;
 
   const statusPill = (colId, s) => {
     switch (colId) {
@@ -1435,11 +1614,63 @@ const Cockpit = () => {
     return (<>{primary}{hold}</>);
   };
 
-  const renderCard = (s, colId) => {
+  // Production cards: the pill says where in the cycle the drawing is; the AB review column
+  // borrows the main-board pill, since those cards are moving through the normal flow.
+  const routeOf = (s) => prodRoutes[(s.taskIds || [])[0]] || null;
+  const prodPill = (colId, s) => {
+    switch (colId) {
+      case "signed-off":        return { cls: "ok", txt: DFLanes.isLegacySignOff(s) ? "A4.5 signed off (old flow)" : "A4.5 signed off" };
+      case "awaiting-supply":   return { cls: "warn", txt: "Supply drawings in flow" };
+      case "to-schedule":       return s.supplyDone ? { cls: "ok", txt: "Supply drawings signed off" } : { cls: "info", txt: "To schedule" };
+      case "in-production":     return s.stage === "PRD" ? { cls: "grade", txt: "PRD signed off" }
+                                     : { cls: "grade", txt: routeOf(s) === "Supply & Install" ? "With supplier (S&I)" : routeOf(s) === "Supply Only" ? "With supplier" : "In production" };
+      case "awaiting-install":  return { cls: "info", txt: "Install only" };
+      case "awaiting-as-built": return s.stage === "AB" ? { cls: "danger", txt: "As-built rejected · rev due" } : { cls: "warn", txt: "As-built owed" };
+      default:                  return statusPill(nativeLane(s), s);
+    }
+  };
+  const MOVE_LABEL = {
+    "Awaiting Supply Drawings": ["Supply dwgs", "Supply drawings (PRD / sketches) are needed first"],
+    "To Be Scheduled":          ["To schedule", "No supply drawings needed: ready to schedule"],
+    "In Production":            ["To supplier", "Supply & Install: straight to the supplier, no factory"],
+    "Awaiting Install":         ["Await install", "Install only (or a site drawing): waiting to be fitted"],
+  };
+  const prodActions = (colId, s) => {
+    const isBusy = busy === s.id;
+    const btn = (to, label, title, go) => (
+      <button key={to + label} className={`k-act${go ? " go" : ""}`} disabled={isBusy || batchBusy} title={title}
+        onClick={(e) => { e.stopPropagation(); handleProduction(s, to); }}>{isBusy ? "…" : label}</button>
+    );
+    const isPrd = s.stage === "PRD";
+    const route = routeOf(s);
+    return (
+      <>
+        {colId === "signed-off" && (
+          <select className="k-act" value={route || ""} disabled={batchBusy} title="Contract route for this item"
+            onClick={(e) => e.stopPropagation()} onChange={(e) => setRoute([(s.taskIds || [])[0]], e.target.value)}>
+            <option value="">Route…</option>
+            {DFLanes.ROUTES.map((r) => <option key={r} value={r}>{r}</option>)}
+          </select>
+        )}
+        {colId === "signed-off" && route && DFLanes.ROUTE_MOVES[route].map((to, i) => btn(to, MOVE_LABEL[to][0], MOVE_LABEL[to][1], i === DFLanes.ROUTE_MOVES[route].length - 1))}
+        {colId === "awaiting-supply" && btn("To Be Scheduled", "Supply done", "Supply drawings are done: ready to schedule", true)}
+        {colId === "to-schedule" && (
+          <button className="k-act go" disabled={isBusy || batchBusy} title="Enter the date the WO was raised"
+            onClick={(e) => { e.stopPropagation(); setScheduleTargets([s]); }}>Scheduled…</button>
+        )}
+        {(colId === "in-production" || colId === "awaiting-install") && !isPrd && btn("Awaiting As Built", "Installed", "Installed on site: the as-built is now owed", true)}
+        {colId === "in-production" && isPrd && btn("Complete", "Complete", "Close the PRD drawing (no as-built needed)", true)}
+        {colId === "awaiting-as-built" && s.stage !== "AB" && btn("Complete", "Complete", "Close the drawing without an as-built through Drawing Flow")}
+        {s.prodStage && s.prodLog && btn("back", "Move back", "Undo the last Production tab move")}
+      </>
+    );
+  };
+
+  const renderCard = (s, colId, prod) => {
     const age = daysSince(s.bicSince);
     const ageCls = age == null ? "" : age > 14 ? "r" : age > 7 ? "a" : "g";
     const sel = selectedIds.has(s.id);
-    const pill = statusPill(colId, s);
+    const pill = prod ? prodPill(colId, s) : statusPill(colId, s);
     const initials = (s.dtName || "").split(/\s+/).filter(Boolean).map((w) => w[0]).join("").slice(0, 2).toUpperCase() || "—";
     return (
       <div
@@ -1458,6 +1689,8 @@ const Cockpit = () => {
         </div>
         <div className="k-meta">
           {s.stage && <span className="k-tag">{s.stage}</span>}
+          {prod && routeOf(s) && <span className="k-tag" title="Contract route (item)">{routeOf(s)}</span>}
+          {prod && DFLanes.isOutsourced(s.dtName) && <span className="k-pill warn" title={`Drawn by ${s.dtName}`}>Outsourced</span>}
           {s.revision && <span className="k-tag">{s.revision}</span>}
           <span className={`k-pill ${pill.cls}`}>{pill.txt}</span>
           {s.hasComments && <span className="k-pill danger">New ✦</span>}
@@ -1478,14 +1711,14 @@ const Cockpit = () => {
           <span className={`k-age ${ageCls}`}
             title={age == null ? "" : `${age} days ${colId === "resubmission" ? "with the DT" : "in stage"}`}>{age == null ? "—" : age + "d"}</span>
           <span className="k-ava" style={{ background: personColor(s.dtName) }} title={s.dtName || ""}>{initials}</span>
-          <span className="k-cardact">{cardActions(colId, s)}</span>
+          <span className="k-cardact">{prod ? <>{cardActions(nativeLane(s), s)}{prodActions(colId, s)}</> : cardActions(colId, s)}</span>
         </div>
       </div>
     );
   };
 
   // Group a column's cards by project-suffix (taskCode), colour-coded by project.
-  const renderColumnBody = (items, colId) => {
+  const renderColumnBody = (items, colId, prod) => {
     if (items.length === 0) return <div className="k-empty">{q ? "No matches in this stage" : "Nothing here — all clear"}</div>;
     const groups = groupByTask(items);
     return Object.entries(groups).map(([taskCode, rows]) => (
@@ -1493,7 +1726,7 @@ const Cockpit = () => {
         <div className="k-group-head">
           <span className="k-group-dot" aria-hidden="true" />{taskCode}<span className="k-group-n">{rows.length}</span>
         </div>
-        {rows.map((s) => renderCard(s, colId))}
+        {rows.map((s) => renderCard(s, colId, prod))}
       </div>
     ));
   };
@@ -1514,6 +1747,11 @@ const Cockpit = () => {
       </div>
 
       <div className="k-toolbar" role="toolbar" aria-label="Cockpit actions">
+        <div className="k-seg" role="group" aria-label="Board">
+          <button aria-pressed={view === "design"} onClick={() => setView("design")}>Design</button>
+          <button aria-pressed={view === "production"} onClick={() => setView("production")}
+            title="Drawings past A4.5 sign-off: PRD, factory, production and as-built">Production · {productionCount}</button>
+        </div>
         <input className="k-search" type="search" placeholder="Search drawing ref, title, DT…"
           value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search submissions" />
         <select className="k-dt-filter" value={dtFilter} onChange={(e) => setDtFilter(e.target.value)}
@@ -1539,8 +1777,8 @@ const Cockpit = () => {
         {sendGradeResult === "error" && <span className="k-result error">Send failed</span>}
       </div>
 
-      <div className="k-board" aria-label="Submissions board">
-        {COLS.map((col) => {
+      <div className="k-board" aria-label={view === "production" ? "Production board" : "Submissions board"}>
+        {BOARD.map((col) => {
           const items = col.items.filter(matches);
           return (
             <div key={col.id} className="k-column" style={{ "--k-col-accent": col.accent }}>
@@ -1557,30 +1795,99 @@ const Cockpit = () => {
                     {col.action.count != null && col.action.count > 0 && <span className="k-count">{col.action.count}</span>}
                   </button>
                 )}
+                {col.action2 && (
+                  <button className="k-col-btn" onClick={col.action2.onClick} disabled={col.action2.disabled}>
+                    {col.action2.label}
+                    {col.action2.count > 0 && <span className="k-count">{col.action2.count}</span>}
+                  </button>
+                )}
               </div>
               <div className="k-col-body">
-                {renderColumnBody(items, col.id)}
+                {renderColumnBody(items, col.id, col.production)}
               </div>
             </div>
           );
         })}
       </div>
 
-      {selectedIds.size > 0 && (
+      {view === "production" && selectedIds.size > 0 && (() => {
+        const sel = production.filter((s) => selectedIds.has(s.id));
+        const toSchedule = sel.filter((s) => s.prodLane === "to-schedule");
+        const canBack = sel.filter((s) => s.prodStage && s.prodLog);
+        const stageOpts = ["Awaiting Supply Drawings", "To Be Scheduled", "In Production", "Awaiting Install", "Awaiting As Built", "Complete"];
+        return (
+          <div className="k-bulkbar">
+            <span className="k-bulk-n">{sel.length}</span><span className="k-bulk-lbl">selected</span>
+            {batchBusy && <span className="k-bulk-lbl" style={{ color: "var(--accent)" }}>Working…</span>}
+            <button className="k-btn" onClick={clearSelection} disabled={batchBusy}>Clear</button>
+            <select className="k-btn" value={prodBatch.to} disabled={batchBusy} aria-label="Move ticked drawings to"
+              onChange={(e) => setProdBatch((b) => ({ ...b, to: e.target.value }))}>
+              <option value="">Move to…</option>
+              {stageOpts.map((o) => <option key={o} value={o}>{o}</option>)}
+            </select>
+            <button className="k-btn" disabled={batchBusy || !prodBatch.to || !sel.length}
+              title={prodBatch.to === "In Production" ? "Cards in To be scheduled get the WO date prompt; the rest move straight across" : ""}
+              onClick={() => {
+                const to = prodBatch.to;
+                if (to === "Complete" && !window.confirm(`Mark ${sel.length} drawing(s) Complete?`)) return;
+                // Any card coming out of To be scheduled needs the WO date, so the whole selection goes through the date prompt.
+                if (to === "In Production" && toSchedule.length) { setScheduleTargets(sel); return; }
+                runProdBatch(sel, (s) => moveOne(s, to), `Move to ${to}`);
+              }}>Move</button>
+            <button className="k-btn primary" disabled={batchBusy || !toSchedule.length} onClick={() => setScheduleTargets(toSchedule)}
+              title="All ticked cards in To be scheduled, one WO date">Scheduled{toSchedule.length ? ` (${toSchedule.length})` : ""}…</button>
+            <select className="k-btn" value={prodBatch.route} disabled={batchBusy} aria-label="Contract route for the ticked drawings' items"
+              onChange={(e) => setProdBatch((b) => ({ ...b, route: e.target.value }))}>
+              <option value="">Route…</option>
+              {DFLanes.ROUTES.map((r) => <option key={r} value={r}>{r}</option>)}
+            </select>
+            <button className="k-btn" disabled={batchBusy || !prodBatch.route}
+              onClick={() => setRoute(sel.map((s) => (s.taskIds || [])[0]), prodBatch.route)}>Set route</button>
+            <button className="k-btn" disabled={batchBusy || !canBack.length}
+              onClick={() => { if (window.confirm(`Move ${canBack.length} drawing(s) back one step?`)) runProdBatch(canBack, (s) => moveOne(s, "back"), "Move back"); }}>
+              Move back{canBack.length ? ` (${canBack.length})` : ""}</button>
+          </div>
+        );
+      })()}
+
+      {scheduleTargets && scheduleTargets.length > 0 && (
+        <ScheduleModal cards={scheduleTargets} onConfirm={scheduleCards} onClose={() => setScheduleTargets(null)} />
+      )}
+
+      {view !== "production" && selectedIds.size > 0 && (
         <div className="k-bulkbar">
           <span className="k-bulk-n">{selectedIds.size}</span><span className="k-bulk-lbl">selected</span>
           {batchBusy && <span className="k-bulk-lbl" style={{ color: "var(--accent)" }}>Working…</span>}
           <button className="k-btn" onClick={clearSelection} disabled={batchBusy}>Clear</button>
-          <button className="k-btn" onClick={() => handleBatchApprove([...selectedIds])} disabled={batchBusy}>Approve</button>
-          <button className="k-btn" onClick={() => handleBatchBounce([...selectedIds])} disabled={batchBusy}>Bounce</button>
+          <button className="k-btn" onClick={() => handleBatchApprove(reviewableSel)}
+            disabled={batchBusy || !reviewableSel.length}
+            title={reviewableSel.length ? `Approve ${reviewableSel.length} drawing${reviewableSel.length === 1 ? "" : "s"} awaiting review`
+                                        : "Nothing in the selection is awaiting review"}>
+            Approve{reviewableSel.length ? ` (${reviewableSel.length})` : ""}
+          </button>
+          <button className="k-btn" onClick={() => handleBatchBounce(reviewableSel)}
+            disabled={batchBusy || !reviewableSel.length}
+            title={reviewableSel.length ? `Bounce ${reviewableSel.length} drawing${reviewableSel.length === 1 ? "" : "s"} awaiting review`
+                                        : "Nothing in the selection is awaiting review"}>
+            Bounce{reviewableSel.length ? ` (${reviewableSel.length})` : ""}
+          </button>
           <button className="k-btn" onClick={() => setBatchGradeTargets(gradeSelected)}
             disabled={batchBusy || !!batchGradeBlocked}
             title={batchGradeBlocked || `Grade ${gradeSelected.length} selected drawing${gradeSelected.length === 1 ? "" : "s"}`}>
             Grade{gradeSelected.length ? ` (${gradeSelected.length})` : ""}
           </button>
-          <button className="k-btn" onClick={() => handleBatchHold([...selectedIds])} disabled={batchBusy}
-            title="Put selected drawings on hold (RFI / Design Change)">Hold</button>
-          <button className="k-btn primary" onClick={() => handleBatchIssue([...selectedIds])} disabled={batchBusy}>Issue</button>
+          <button className="k-btn" onClick={() => handleBatchHold(holdableSel)}
+            disabled={batchBusy || !holdableSel.length}
+            title={holdableSel.length ? `Put ${holdableSel.length} drawing${holdableSel.length === 1 ? "" : "s"} on hold (RFI / Design Change)`
+                                      : "Everything in the selection is already on hold"}>
+            Hold{holdableSel.length ? ` (${holdableSel.length})` : ""}
+          </button>
+          <button className="k-btn primary" onClick={() => handleBatchIssue(issuableSel)}
+            disabled={batchBusy || !issuableSel.length}
+            title={issuableSel.length ? `Issue ${issuableSel.length} drawing${issuableSel.length === 1 ? "" : "s"}`
+                                      : "Nothing in the selection is awaiting issue — the DWGs may not be uploaded yet"}>
+            Issue{issuableSel.length ? ` (${issuableSel.length})` : ""}
+          </button>
         </div>
       )}
 

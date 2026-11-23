@@ -68,12 +68,10 @@
 
   // Asking for no new revision is not the same as being finished. A drawing climbs the
   // stages, and a clean grade below the top hands it FORWARD rather than ending it:
-  // S4 A/NA means the DT now owes the S5 set, S5 A/NA the A4.5 set, A4.5 Approved the PRD
-  // set, and PRD Approved the as-built set — the factory signing off is not the end of the
-  // drawing, which is why log-status writes "Schedule" there rather than "Complete", with
-  // As Built Updates still to come. All of that is DT work, so it belongs on the board.
-  // Only these outcomes leave nothing owed:
+  // S4 A/NA means the DT now owes the S5 set and S5 A/NA the A4.5 set. All of that is DT
+  // work, so it belongs on the board. Only these outcomes leave nothing owed by the DT now:
   //   AB Approved — the as-built is signed off; log-status writes Drawing Status "Complete"
+  //   A4.5 / PRD Approved — see FINAL_STAGES; the drawing moves to the Production tab
   //   No Action   — a sketch or S3 coordination loop closed without a redraw; keyed on the
   //                 grade, not the stage, because a sketch carries these outcomes at
   //                 whatever stage it is submitted under
@@ -81,7 +79,10 @@
   // a blank is an NA — the architect reviewed something non-aesthetic and issued no status —
   // which amounts to an A, and the DT still has to carry the drawing into the next revision.
   // Filing it as signed off would hide live work, which is the failure that matters here.
-  var FINAL_STAGES = { "AB": 1 };
+  // A4.5 Approved: client-facing manufacturing drawing signed off; what follows (scheduling,
+  // production, as-built) is tracked on the Production tab, not owed by the DT now.
+  // PRD Approved: the factory / supplier signed the sketch off; it needs no as-built.
+  var FINAL_STAGES = { "AB": 1, "A4.5": 1, "PRD": 1 };
   function isFinal(s) {
     var grade = s && s.clientGrade;
     if (grade === "No Action") return true;
@@ -99,6 +100,7 @@
   // they are classified here regardless of Folder Link.
   function laneOf(s) {
     var st = s.status, stage = s.stage, notified = !!s.dtNotified;
+    if (isLegacySignOff(s)) return "closed"; // an old-flow A4.5 sign-off; tracked on the Production tab
     if (st === "Schedule") return "scheduled";
     // Checked before everything except the placeholder rows: a blocked drawing is waiting on
     // information, not on the DT or the DM, so it must not inflate any queue that reads as
@@ -154,6 +156,101 @@
     return Object.keys(best).map(function (k) { return best[k]; });
   }
 
+  // ── Production tab ─────────────────────────────────────────────────────────
+  // A4.5 drawings are the client-facing manufacturing drawings. Once signed off they leave
+  // design and go where the item's Contract Route (Tasks DB) sends them:
+  //   In-house / Supply Only → supply drawings needed? Awaiting supply drawings (the PRD
+  //                            sketches, their own drawings in the normal flow) : To be scheduled
+  //                            → Scheduled (WO date) = In production
+  //   Supply & Install       → In production (with the supplier, no factory)
+  //   Install Only           → Awaiting install (also site-only drawings: nothing to make)
+  // In production / Awaiting install → Installed → Awaiting as-built → the AB goes through
+  // review → Approved closes it. PRD drawings, once the factory or supplier signs them off, sit in In
+  // production until marked Complete; they need no as-built.
+  // Where a drawing is lives on its MDS row (Production Stage), set by the Production tab
+  // buttons; the submission log only says where the drawing came from.
+  var PRODUCTION_LANES = [
+    { id: "signed-off",        title: "A4.5 signed off — decide",   short: "Decide",            accent: "danger",
+      sub: "Supply drawings? Outsourced? Site only?" },
+    { id: "awaiting-supply",   title: "Awaiting supply drawings",   short: "Awaiting supply",   accent: "warn",
+      sub: "PRD / sketches going through the flow · moves on when all are signed off" },
+    { id: "to-schedule",       title: "To be scheduled",            short: "To schedule",       accent: "info",
+      sub: "Ready for the factory · Scheduled writes the production date and WO Raised" },
+    { id: "in-production",     title: "In production",              short: "In production",     accent: "grade",
+      sub: "Factory, supplier or signed-off PRD · Installed when it is on site" },
+    { id: "awaiting-install",  title: "Awaiting install",           short: "Awaiting install",  accent: "info",
+      sub: "Install only (incl. site drawings) · Installed when it is fitted" },
+    { id: "awaiting-as-built", title: "Awaiting as-built",          short: "Awaiting AB",       accent: "warn",
+      sub: "Installed or site-only · with the DT for the as-built" },
+    { id: "ab-review",         title: "As-built review",            short: "AB review",         accent: "ok",
+      sub: "AB submitted → issued → graded · Approved closes the drawing" },
+  ];
+  var PRODUCTION_ORDER = PRODUCTION_LANES.map(function (l) { return l.id; });
+  var STAGE_LANE = {
+    "Awaiting Supply Drawings": "awaiting-supply", "To Be Scheduled": "to-schedule",
+    "In Production": "in-production", "Awaiting Install": "awaiting-install", "Awaiting As Built": "awaiting-as-built",
+  };
+  // Contract Route (Tasks DB) → the moves offered on a just-signed-off A4.5.
+  var ROUTES = ["In-house", "Supply Only", "Supply & Install", "Install Only"];
+  var ROUTE_MOVES = {
+    "In-house":         ["Awaiting Supply Drawings", "To Be Scheduled"],
+    "Supply Only":      ["Awaiting Supply Drawings", "To Be Scheduled"],
+    "Supply & Install": ["In Production"],
+    "Install Only":     ["Awaiting Install"],
+  };
+  // Drawn by a supplier (Team DB "Outsourced" / "By Supplier"), so likely a supply route.
+  function isOutsourced(dtName) { return /outsourced|by supplier/i.test(dtName || ""); }
+
+  // Old flow (to June 2026): an A4.5 sign-off was written as Status "Schedule" with grade
+  // Approved. Those rows are real sign-offs, not the grade-less placeholder rows "Schedule"
+  // otherwise means.
+  function isLegacySignOff(s) { return !!s && s.status === "Schedule" && s.clientGrade === "Approved" && s.stage === "A4.5"; }
+  function signedOff(s, stage) {
+    if (!s || s.stage !== stage) return false;
+    if (stage === "A4.5" && isLegacySignOff(s)) return true;
+    // Moves across once the DT has been told; until then it waits in Graded — Notify DT.
+    return s.status === "Graded" && s.clientGrade === "Approved" && !!s.dtNotified;
+  }
+
+  // ps = the drawing's MDS Production Stage. Unknown → design, so nothing ever vanishes
+  // because of a rule it fell between.
+  function phaseOf(s, ps) {
+    if (ps === "Complete") return "done";
+    if (ps) return "production";
+    if (!s) return "design";
+    if (s.stage === "AB") return isFinal(s) || s.status === "Complete" ? "done" : "production";
+    if (s.stage === "PRD" && s.status === "Complete") return "done";   // old flow
+    if (signedOff(s, "A4.5") || signedOff(s, "PRD")) return "production";
+    return "design";
+  }
+
+  // opts.supplyDone: every supply drawing (PRD) on the same item is signed off.
+  function productionLaneOf(s, ps, opts) {
+    if (phaseOf(s, ps) !== "production") return null;
+    if (s && s.stage === "AB") {
+      if (s.status === "Rejected" && s.dtNotified) return "awaiting-as-built";
+      if (s.status === "Graded" && s.dtNotified && needsRevision(s.clientGrade)) return "awaiting-as-built";
+      return "ab-review";
+    }
+    if (ps === "Awaiting Supply Drawings" && opts && opts.supplyDone) return "to-schedule";
+    if (STAGE_LANE[ps]) return STAGE_LANE[ps];
+    if (s && s.stage === "PRD") return "in-production";
+    return "signed-off";
+  }
+
+  // Supply drawings for an item = its drawings whose current submission is a PRD.
+  // Done when there is at least one and every one is signed off (or closed / in production).
+  function supplyDoneFor(itemId, current, stageOf) {
+    var prds = (current || []).filter(function (s) {
+      return s.stage === "PRD" && s.taskIds && s.taskIds.indexOf(itemId) >= 0;
+    });
+    if (!prds.length) return false;
+    return prds.every(function (s) {
+      var ps = stageOf ? stageOf(s) : null;
+      return ps === "In Production" || ps === "Complete" || signedOff(s, "PRD") || s.status === "Complete";
+    });
+  }
+
   // Per-item lane counts, zeros dropped, in board order.
   // Keyed on the Item relation page id — the string taskCode is carried for display only,
   // so a renamed submission title can never split one item into two cards.
@@ -188,5 +285,9 @@
   return { LANES: LANES, LANE_ORDER: LANE_ORDER, LANE_TITLE: LANE_TITLE, LANE_SHORT: LANE_SHORT,
            stageRank: stageRank, needsRevision: needsRevision, isFinal: isFinal,
            laneOf: laneOf, latestPerDrawing: latestPerDrawing,
-           summarise: summarise };
+           summarise: summarise,
+           PRODUCTION_LANES: PRODUCTION_LANES, PRODUCTION_ORDER: PRODUCTION_ORDER,
+           phaseOf: phaseOf, productionLaneOf: productionLaneOf, isLegacySignOff: isLegacySignOff,
+           supplyDoneFor: supplyDoneFor, STAGE_LANE: STAGE_LANE,
+           ROUTES: ROUTES, ROUTE_MOVES: ROUTE_MOVES, isOutsourced: isOutsourced };
 });

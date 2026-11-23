@@ -1839,7 +1839,8 @@ module.exports = function mountDrawingFlow(app, notion) {
     }
 
     // ── standard status filter ─────────────────────────────────────────────
-    const validStatuses = ["Submitted", "Approved", "Awaiting Issue", "Issued", "Rejected", "Graded"];
+    // Schedule and Complete feed the Production tab (old-flow sign-offs, manual moves).
+    const validStatuses = ["Submitted", "Approved", "Awaiting Issue", "Issued", "Rejected", "Graded", "Schedule", "Complete"];
     if (!validStatuses.includes(statusFilter)) return res.status(400).json({ error: `Invalid status: ${statusFilter}` });
 
     try {
@@ -2442,10 +2443,12 @@ module.exports = function mountDrawingFlow(app, notion) {
       // Every other stage already got its Drawing Status written immediately at log-status.
       // Only the stages that deferred their status reach here (see log-status). A QA
       // rejection never defers, so it is already DT Review by this point.
+      // Approved: A4.5 → Schedule (signed off; the Production tab decides what happens
+      // next), PRD → In Production (factory / supplier signed the sketch off; no as-built).
       const gradeDrawingStatus = (stage, grade) =>
         grade !== "Approved" ? "DT Review"
-        : stage === "PRD"    ? "Schedule"
-        : "Production Updates";
+        : stage === "PRD"    ? "In Production"
+        : "Schedule";
       await Promise.all(
         enriched
           .filter((item) => movesPdfOnGrade(item.stage))
@@ -2504,6 +2507,124 @@ module.exports = function mountDrawingFlow(app, notion) {
       res.json({ ok: true, blocked: !!blocked });
     } catch (err) {
       console.error("[hold]", err);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // ── Production tab: where each signed-off drawing is (MDS Production Stage) ──────────
+  // GET  /api/df/production-stages → { stages: { <drawingId>: { stage, log } } }
+  //      Only drawings with a Production Stage set, one MDS query.
+  // POST /api/df/drawings/:drawingId/production { to }
+  //      to = a Production Stage ("Awaiting Supply Drawings" | "To Be Scheduled" |
+  //      "In Production" | "Awaiting Install" | "Awaiting As Built" | "Complete"), or "back".
+  //      Writes Production Stage and the matching Drawing Status, and appends one line to
+  //      Production Log. Scheduled (To Be Scheduled → In Production) needs { woDate }: it
+  //      writes the drawing's Schedule Production (Actual) and the item's WO Raised.
+  //      "back" undoes the last line: stage, Drawing Status and any dates it wrote (WO
+  //      Raised goes back to what it was).
+  // POST /api/df/items/:itemId/route { route } — the item's Contract Route (blank clears).
+  const PRODUCTION_STAGES = ["Awaiting Supply Drawings", "To Be Scheduled", "In Production", "Awaiting Install", "Awaiting As Built", "Complete"];
+  const CONTRACT_ROUTES = ["In-house", "Supply Only", "Supply & Install", "Install Only"];
+  const STAGE_DRAWING_STATUS = {
+    "Awaiting Supply Drawings": "Schedule", "To Be Scheduled": "Schedule", "Awaiting Install": "Schedule",
+    "In Production": "In Production", "Awaiting As Built": "As Built Updates", "Complete": "Complete",
+  };
+  const isIsoDate = (d) => /^\d{4}-\d{2}-\d{2}$/.test(String(d || ""));
+  const logLines = (log) => String(log || "").split("\n").map((l) => l.trim()).filter(Boolean);
+
+  app.get("/api/df/production-stages", async (req, res) => {
+    try {
+      const pages = await queryAll(notion, DRAWINGS_DB, { property: "Production Stage", select: { is_not_empty: true } });
+      const stages = {};
+      for (const p of pages) stages[p.id] = { stage: getProp(p, "Production Stage", "select"), log: getProp(p, "Production Log", "rich_text") };
+      // Contract Route per item; a failed lookup only loses the route chips.
+      const routes = {};
+      try {
+        for (const p of await queryAll(notion, TASKS_DB, { property: "Contract Route", select: { is_not_empty: true } }))
+          routes[p.id] = getProp(p, "Contract Route", "select");
+      } catch (err) { console.warn("[production-stages] routes:", err.message); }
+      res.json({ stages, routes });
+    } catch (err) {
+      console.error("[production-stages]", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/df/drawings/:drawingId/production", async (req, res) => {
+    const { drawingId } = req.params;
+    const to = req.body?.to;
+    if (to !== "back" && !PRODUCTION_STAGES.includes(to)) return res.status(400).json({ ok: false, error: `Unknown stage: ${to}` });
+    try {
+      const dwg   = await notion.pages.retrieve({ page_id: drawingId });
+      const from  = getProp(dwg, "Production Stage", "select") || null;
+      const lines = logLines(getProp(dwg, "Production Log", "rich_text"));
+      const props = {};
+      const today = now();
+
+      if (to === "back") {
+        const last = lines.pop();
+        if (!last) return res.status(400).json({ ok: false, error: "Nothing to move back" });
+        // "2026-11-20 | To Be Scheduled → In Production | Drawing Status was: Schedule | set: Schedule Production, WO Raised"
+        const parts  = last.split("|").map((x) => x.trim());
+        const prev   = (parts[1] || "").split("→")[0].trim();
+        const was    = (parts[2] || "").replace(/^Drawing Status was:\s*/, "").trim();
+        const set    = (parts[3] || "").replace(/^set:\s*/, "").split(",").map((x) => x.trim()).filter(Boolean);
+        props["Production Stage"] = { select: prev && prev !== "—" ? { name: prev } : null };
+        props["Drawing Status"]   = { select: was && was !== "blank" ? { name: was } : null };
+        props["Production Log"]   = { rich_text: lines.length ? [{ text: { content: lines.join("\n") } }] : [] };
+        if (set.includes("Schedule Production")) props["Schedule Production (Actual)"] = { date: null };
+        await notion.pages.update({ page_id: drawingId, properties: props });
+        const wo = set.find((x) => x.startsWith("WO Raised"));
+        if (wo) {
+          const prevWo = (wo.match(/was ([0-9-]+)/) || [])[1] || null;
+          for (const itemId of getProp(dwg, "Item", "relation") || []) {
+            await notion.pages.update({ page_id: itemId, properties: { "WO Raised": { date: prevWo ? { start: prevWo } : null } } })
+              .catch((e) => console.warn(`[production:back] item ${itemId}:`, e.message));
+          }
+        }
+        return res.json({ ok: true, stage: prev && prev !== "—" ? prev : null });
+      }
+
+      const was = getProp(dwg, "Drawing Status", "select") || "blank";
+      const wrote = [];
+      props["Production Stage"] = { select: { name: to } };
+      props["Drawing Status"]   = { select: { name: STAGE_DRAWING_STATUS[to] } };
+      // Scheduled: from To be scheduled, or straight from Awaiting supply drawings once the
+      // supply drawings are all signed off (the board shows those in To be scheduled).
+      if (to === "In Production" && (from === "To Be Scheduled" || from === "Awaiting Supply Drawings")) {
+        const woDate = req.body?.woDate;
+        if (!isIsoDate(woDate)) return res.status(400).json({ ok: false, error: "Scheduled needs the date the WO was raised (woDate, YYYY-MM-DD)" });
+        props["Schedule Production (Actual)"] = { date: { start: woDate } };
+        wrote.push("Schedule Production");
+        for (const itemId of getProp(dwg, "Item", "relation") || []) {
+          try {
+            const item = await notion.pages.retrieve({ page_id: itemId });
+            const prevWo = getProp(item, "WO Raised", "date");
+            if (prevWo !== woDate) {
+              await notion.pages.update({ page_id: itemId, properties: { "WO Raised": { date: { start: woDate } } } });
+              wrote.push(`WO Raised (was ${prevWo || "blank"})`);
+            }
+          } catch (e) { console.warn(`[production] WO Raised on ${itemId}:`, e.message); }
+        }
+      }
+      lines.push(`${today} | ${from || "—"} → ${to} | Drawing Status was: ${was} | set: ${wrote.join(", ")}`);
+      props["Production Log"] = { rich_text: [{ text: { content: lines.join("\n").slice(-1900) } }] };
+      await notion.pages.update({ page_id: drawingId, properties: props });
+      res.json({ ok: true, stage: to, wrote });
+    } catch (err) {
+      console.error("[production]", err);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.post("/api/df/items/:itemId/route", async (req, res) => {
+    const route = req.body?.route || null;
+    if (route && !CONTRACT_ROUTES.includes(route)) return res.status(400).json({ ok: false, error: `Unknown route: ${route}` });
+    try {
+      await notion.pages.update({ page_id: req.params.itemId, properties: { "Contract Route": { select: route ? { name: route } : null } } });
+      res.json({ ok: true, route });
+    } catch (err) {
+      console.error("[route]", err.message);
       res.status(500).json({ ok: false, error: err.message });
     }
   });
@@ -3184,7 +3305,7 @@ module.exports = function mountDrawingFlow(app, notion) {
     const isProductionRev  = revision.toUpperCase().startsWith("C");
 
     // A4.5's and PRD's Drawing Status is finalized later, in POST /api/df/send-grade-emails,
-    // at the same moment Ball In Court actually flips to DT (Approved → Production Updates,
+    // at the same moment Ball In Court actually flips to DT (Approved → Schedule for A4.5 / In Production for PRD,
     // Rejected → DT Review) — not here, since BIC sits with DM until the notify email
     // fires. Skip writing Drawing Status at this step for those stages; every other stage
     // keeps the immediate write.
@@ -3261,6 +3382,8 @@ module.exports = function mountDrawingFlow(app, notion) {
       try {
         const mdsProps = {};
         if (!deferDrawingStatus) mdsProps["Drawing Status"] = { select: { name: drawingStatus } };
+        // The as-built is accepted: the drawing's production journey is over too.
+        if (isTerminalAB) mdsProps["Production Stage"] = { select: { name: "Complete" } };
         if (commentProp && stampedNote) {
           // Read-modify-write: the property already holds whatever cr-ingest logged, and
           // those entries carry links, so the existing runs are reused rather than rebuilt.

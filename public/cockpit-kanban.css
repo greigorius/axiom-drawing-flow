@@ -127,6 +127,7 @@
 .kanban .k-pill.warn{color:var(--warn);background:var(--warn-bg)}
 .kanban .k-pill.grade{color:var(--grade);background:var(--grade-bg)}
 .kanban .k-pill.danger{color:var(--danger);background:var(--danger-bg)}
+.kanban .k-pill.muted{color:var(--muted, #888);background:var(--surface-hi, rgba(127,127,127,.12))}
 .kanban .k-card-foot{display:flex;align-items:center;gap:8px;padding-top:7px;border-top:1px solid var(--border)}
 .kanban .k-age{display:inline-flex;align-items:center;gap:4px;font:600 11px/1 var(--mono)}
 .kanban .k-age.g{color:var(--ok)} .kanban .k-age.a{color:var(--warn)} .kanban .k-age.r{color:var(--danger)}

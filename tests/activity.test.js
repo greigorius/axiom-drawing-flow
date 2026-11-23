@@ -947,10 +947,12 @@ let n = 0; const ok = (name) => { n++; console.log("✓", name); };
         `${stage} ${grade} signs off ${stage} and hands the next stage to the DT`);
     }
   }
-  assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage: "A4.5", clientGrade: "Approved" }), "resubmission",
-    "A4.5 signed off by the contractor leaves the DT drawing the PRD set");
-  assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage: "PRD", clientGrade: "Approved" }), "resubmission",
-    "the factory signing off PRD still leaves the as-built to draw");
+  // A4.5 does not turn into PRD (PRD sketches are their own drawings) and a signed-off PRD
+  // needs no as-built: both leave the design board for the Production tab (20 Nov 2026).
+  assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage: "A4.5", clientGrade: "Approved" }), "closed",
+    "A4.5 signed off: nothing owed by the DT now, tracked on the Production tab");
+  assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage: "PRD", clientGrade: "Approved" }), "closed",
+    "PRD signed off by the factory: no as-built, tracked on the Production tab until Complete");
   ok("lane 1: a clean grade below the final stage keeps the drawing with the DT");
 
   assert.strictEqual(lane({ status: "Graded", dtNotified: true, stage: "AB", clientGrade: "Approved" }), "closed",
